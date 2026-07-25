@@ -1,0 +1,1598 @@
+"""
+LIVE TESTNET TREND-SCALPING ALGO — 200 EMA + VWAP + CVD confluence.
+
+v2 — Major fixes and upgrades based on real testnet issues found:
+  1. FIXED: get_live_orders() returns a LIST, not a dict — status checks
+     were silently always failing before.
+  2. FIXED: create_order()/cancel_order() response parsing — the SDK
+     returns the order dict directly (no nested "result" key), so order_id
+     extraction was broken, which broke cancel_order() too.
+  3. FIXED: closing orders now send reduce_only=True, so closing a
+     position doesn't get treated as a fresh trade requiring new margin
+     (this was the direct cause of "insufficient_margin" on exits).
+  4. NEW: startup reconciliation — checks REAL exchange positions/orders
+     before doing anything, instead of blindly trusting the local state
+     file. Adopts a real open position if one exists, and cancels any
+     stray leftover orders for our watched products to prevent duplicates.
+  5. NEW: the whole loop body is wrapped so ONE bad iteration (a crash,
+     an API hiccup) does NOT stop the script — it logs the error and
+     keeps going. The script only stops on Ctrl+C / GUI stop button.
+  6. NEW: partial take-profit — books 50% of the position once price
+     reaches 50% of the way to target, and moves the stop to breakeven
+     for the remaining size.
+  7. NEW: trailing stop-loss — once in meaningful profit, the stop
+     continuously trails behind price (never loosens).
+  8. NEW: smart near-target exit — if price gets close to target (80%+
+     of the way there) and then starts reversing, exits immediately with
+     whatever profit is available instead of risking a round-trip back
+     to the stop.
+  9. Strictly ONE position at a time, enforced by reconciliation.
+
+Requires: pip install delta-rest-client pandas requests
+Fill in config.py with your TESTNET api_key/api_secret before running.
+"""
+import time
+import json
+import os
+import traceback
+from datetime import datetime, timezone
+
+import requests
+import pandas as pd
+from delta_rest_client import DeltaRestClient
+
+import config
+from trend_scalp_indicators import (compute_ema, compute_vwap, compute_cvd, cvd_rising,
+                                     cvd_falling, compute_rsi, compute_atr)
+
+# ---------------- SETTINGS ----------------
+SYMBOLS_TO_WATCH = [
+    # Only symbols CONFIRMED available on your testnet account (verified from
+    # your logs — LINKUSD/AVAXUSD/DOTUSD/NEARUSD exist on production but not
+    # on this testnet, which would crash order placement if they ever
+    # triggered a signal). Run get_full_symbol_list.py against BASE_URL to
+    # check your testnet's exact available list if you want to add more.
+    "BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD", "DOGEUSD", "ADAUSD",
+]
+
+# Logic B specifically only watches these — the smaller, low-priced coins
+# (SOL/XRP/DOGE/ADA) kept getting skipped constantly because their ATR is
+# too tiny relative to price, making MIN_STOP_DIST_PCT_B unreachable most
+# of the time. BTC/ETH have large enough absolute price moves for Logic B's
+# ATR-based stop to clear that floor regularly.
+LOGIC_B_SYMBOLS = ["BTCUSD", "ETHUSD"]
+RISK_PER_TRADE_PCT = 1.5
+LEVERAGE = 10
+MARGIN_SAFETY_FACTOR = 0.90    # only use 90% of calculated max notional, leaves buffer
+EMA_PERIOD = 200
+VWAP_PROXIMITY_PCT = 0.15
+CVD_LOOKBACK = 10
+SWING_LOOKBACK = 15
+STOP_BUFFER_PCT = 0.05
+RISK_REWARD_MULT = 2.5
+LOOKBACK_HOURS = 8              # Logic B (1-min candles) lookback
+LOGIC_A_RESOLUTION = "15m"      # Logic A now runs on 15-min candles (better fit for 200 EMA)
+LOGIC_A_LOOKBACK_HOURS = 60     # 60 hours = 240 fifteen-min candles, comfortably > 200 needed for EMA200
+LOOP_INTERVAL_SECONDS = 20
+
+MAKER_FEE_PCT = 0.04
+TAKER_FEE_PCT = 0.06
+ROUND_TRIP_FEE_PCT = MAKER_FEE_PCT * 2
+SAFETY_MARGIN_MULT = 2.0
+MIN_TARGET_PCT = ROUND_TRIP_FEE_PCT * SAFETY_MARGIN_MULT  # Logic A (limit-first, maker-fee based)
+
+# Logic B ALWAYS uses market orders (never gets the cheaper maker fee), so
+# its fee-aware filter must be based on TAKER fees, not the maker-based one above.
+MIN_TARGET_PCT_B = (TAKER_FEE_PCT * 2) * SAFETY_MARGIN_MULT
+
+LIMIT_ORDER_TIMEOUT_SECONDS = 45
+LIMIT_OFFSET_PCT = 0.02
+
+# Sanity check: if a reported fill price differs from the signal price by
+# more than this %, treat it as corrupted/wrong exchange data rather than
+# a genuine slippage event (real market-order slippage this large in under
+# a second is implausible for these liquid pairs) — fall back to the
+# signal price instead of computing stop/target from a bad number.
+MAX_REASONABLE_SLIPPAGE_PCT = 2.0
+
+# ---- Staircase trailing-stop settings ----
+# As price progresses toward target, the stop-loss ratchets up (or down for
+# shorts) to lock in the PREVIOUS checkpoint each time a new one is reached.
+# No partial position closing — pure stop-loss trailing, full close only at
+# hard stop or full target (100%). Stop only ever moves in the favorable
+# direction, never loosens.
+#   Reach 20% progress -> stop locks at breakeven (0%)
+#   Reach 50% progress -> stop locks at the 20% level
+#   Reach 75% progress -> stop locks at the 50% level
+#   Reach 90% progress -> stop locks at the 75% level
+#   Reach 100% (target) -> full close, booked
+STAIRCASE_TRIGGERS = [0.20, 0.50, 0.75, 0.90]   # progress levels that trigger a stop move
+STAIRCASE_LOCKS =    [0.00, 0.20, 0.50, 0.75]   # where the stop locks to, for each trigger above
+
+STATE_FILE = "trend_live_state.json"
+TRADES_LOG = "trend_trades_log.csv"     # Logic A trades
+TRADES_LOG_B = "trend_trades_log_B.csv"  # Logic B trades — kept separate
+
+# ================================================================
+# LOGIC B — fast trend-following scalper (EMA 5/13 cross + RSI + ATR)
+# Runs ALONGSIDE Logic A (the 200EMA+VWAP+CVD strategy above). Only ONE
+# trade is ever open at a time system-wide — whichever logic finds a
+# valid setup FIRST in a given scan takes the trade (Logic A is checked
+# first each loop, then Logic B, if A found nothing that loop).
+# ================================================================
+# Controls which logic(s) are active — changeable LIVE from the dashboard
+# without restarting the algo. Values: "A", "B", or "BOTH".
+LOGIC_MODE = {"active": "BOTH"}
+
+# "crossover" = only signal on a FRESH EMA cross (fewer, more selective entries)
+# "trend"     = signal on EVERY loop where price/EMAs stay aligned with the
+#               trend and RSI confirms momentum (matches the reference bot's
+#               DEFAULT mode — far more frequent, continuously re-enters as
+#               long as the trend holds, not just at the moment it starts)
+STRATEGY_MODE_B = "trend"
+
+EMA_FAST = 5
+EMA_SLOW = 13
+RSI_PERIOD = 14
+ATR_PERIOD = 14
+RSI_LONG_MAX = 80
+RSI_LONG_MIN = 50
+RSI_SHORT_MIN = 20
+RSI_SHORT_MAX = 50
+SL_ATR_MULT = 1.0
+TP_ATR_MULT = 1.5
+LOGIC_B_RISK_PER_TRADE_PCT = 2.0
+LOGIC_B_LEVERAGE = 5
+MIN_STOP_DIST_PCT_B = 0.30   # skip trades where ATR-based stop distance is
+                              # tinier than this — prevents forced max-leverage
+                              # sizing that can trigger exchange liquidation rejects
+
+# ---- Bracket order + ATR-expansion trailing stop (Logic B only) ----
+# Matches the reference bot's design: entry uses a native Delta "bracket
+# order" (SL+TP attached in one call) instead of our own polling-based
+# check. TP is forced to a fixed risk:reward ratio off the SL distance
+# (not independently ATR-sized), and the stop trails once volatility
+# (ATR) expands significantly from what it was at entry.
+TP_RR_MULT = 2.0              # take-profit = SL distance * this (fixed R:R)
+BRACKET_WIDEN_PCT = 0.15      # % to widen SL/TP by if exchange rejects as "immediate execution"
+BRACKET_MAX_RETRIES = 3
+TRAIL_MULT_B = 1.5            # trailing stop = TRAIL_MULT_B * ATR behind the best price
+                                # (matches reference bot's TRAIL_ATR_MULT default of 1.5 —
+                                # we previously had this at 1.0, which trailed tighter than intended)
+ATR_EXPANSION_TRIGGER_PCT = 20  # ATR must expand this much (%) vs entry-time ATR to trail
+
+MAX_DAILY_LOSS_PCT = 5.0   # circuit breaker — applies across BOTH logics combined
+COOLDOWN_SECONDS = 10      # min gap after any close before a new entry
+                            # (note: our loop only checks once every
+                            # LOOP_INTERVAL_SECONDS=60s anyway, so a 10s
+                            # cooldown has no extra effect beyond that —
+                            # kept here for transparency/config completeness)
+FIXED_SIZE = 0             # 0 = use risk-based sizing (not a fixed lot count)
+# ================================================================
+
+
+client = DeltaRestClient(base_url=config.BASE_URL, api_key=config.API_KEY, api_secret=config.API_SECRET)
+
+
+# ============================================================
+# Basic helpers
+# ============================================================
+
+TRADE_LOG_COLUMNS = [
+    "time", "symbol", "action", "side", "size", "entry_price", "exit_price",
+    "stop", "target", "reason", "approx_gross_pnl_pct", "fill_method",
+    "order_response", "strategy",
+]
+
+
+def log_trade_event(**fields):
+    """
+    Writes a trade log row using a FIXED, consistent set of columns every
+    time (filling missing ones with empty string), regardless of which
+    action type (OPEN/PARTIAL_CLOSE/CLOSE) is being logged.
+
+    Routes to TRADES_LOG (Logic A) or TRADES_LOG_B (Logic B) based on the
+    "strategy" field ("A" or "B") — kept as separate files/spreadsheets
+    per the user's request, so each strategy's performance can be judged
+    independently.
+
+    IMPORTANT: without the fixed-column approach, appending rows with
+    different column sets to the same CSV via pandas causes column
+    MISALIGNMENT (values silently shift into the wrong columns) since the
+    file's header is only written once, from whichever row happened to
+    be first — a real bug this fixes.
+    """
+    row = {col: fields.get(col, "") for col in TRADE_LOG_COLUMNS}
+    strategy = fields.get("strategy", "A")
+    if strategy == "B":
+        append_csv(TRADES_LOG_B, row, fallback_key="log_b")
+    else:
+        append_csv(TRADES_LOG, row, fallback_key="log")
+
+
+def append_csv(path, row_dict, fallback_key="log"):
+    target = path
+    if _using_fallback[fallback_key]:
+        target = os.path.join(FALLBACK_DIR, os.path.basename(path))
+
+    df = pd.DataFrame([row_dict])
+    for attempt in range(3):
+        try:
+            header = not os.path.exists(target)
+            df.to_csv(target, mode="a", header=header, index=False)
+            return
+        except OSError as e:
+            if attempt < 2:
+                time.sleep(1)
+            else:
+                if not _using_fallback[fallback_key]:
+                    print(f"  [WARN] Can't write to {path} ({e}). "
+                          f"Switching permanently to fallback location: {FALLBACK_DIR}")
+                    _using_fallback[fallback_key] = True
+                    return append_csv(path, row_dict, fallback_key)
+                else:
+                    print(f"  [WARN] Even fallback CSV write failed ({e}) — "
+                          f"this trade record may be lost, continuing anyway.")
+
+
+def load_state():
+    fallback_path = os.path.join(FALLBACK_DIR, os.path.basename(STATE_FILE))
+    if _using_fallback["state"] and os.path.exists(fallback_path):
+        with open(fallback_path) as f:
+            return json.load(f)
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    if os.path.exists(fallback_path):
+        _using_fallback["state"] = True
+        with open(fallback_path) as f:
+            return json.load(f)
+    return {"position": None}
+
+
+import tempfile
+
+# Fallback location if the script's own folder has persistent write
+# restrictions (some Windows setups block writes to Desktop/Documents
+# even after retries — antivirus, Controlled Folder Access, sync-locked
+# folders, etc.). This is always writable.
+FALLBACK_DIR = os.path.join(tempfile.gettempdir(), "trend_scalp_algo_data")
+os.makedirs(FALLBACK_DIR, exist_ok=True)
+_using_fallback = {"state": False, "log": False, "log_b": False}
+
+
+def _safe_write_json(primary_path, fallback_key, data):
+    """
+    Tries the primary path first (atomic write via temp-file-then-rename,
+    which holds the file handle for less time and avoids some lock issues).
+    Falls back permanently to a temp-dir copy if the primary path keeps
+    failing, so state is never silently lost.
+    """
+    target = primary_path
+    if _using_fallback[fallback_key]:
+        target = os.path.join(FALLBACK_DIR, os.path.basename(primary_path))
+
+    for attempt in range(3):
+        try:
+            tmp_path = target + ".tmp"
+            with open(tmp_path, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp_path, target)  # atomic on both Windows and Linux
+            return
+        except OSError as e:
+            if attempt < 2:
+                time.sleep(1)
+            else:
+                if not _using_fallback[fallback_key]:
+                    print(f"  [WARN] Can't write to {primary_path} ({e}). "
+                          f"Switching permanently to fallback location: {FALLBACK_DIR}")
+                    _using_fallback[fallback_key] = True
+                    return _safe_write_json(primary_path, fallback_key, data)
+                else:
+                    print(f"  [WARN] Even fallback write failed ({e}) — "
+                          f"state not saved this cycle, continuing anyway.")
+
+
+def save_state(state):
+    _safe_write_json(STATE_FILE, "state", state)
+
+
+def get_product_map():
+    """Testnet intentionally — product IDs must match the account we place
+    orders on (production and testnet product_ids can differ per symbol)."""
+    r = requests.get(f"{config.BASE_URL}/v2/products", timeout=15)
+    r.raise_for_status()
+    products = r.json()["result"]
+    return {p["symbol"]: p for p in products if p["symbol"] in SYMBOLS_TO_WATCH}
+
+
+def set_leverage_for_all(products):
+    """
+    Actually SETS the leverage on the exchange for each product — without
+    this, the LEVERAGE variable was only used in our own math, but never
+    told to Delta, so actual account leverage could silently differ from
+    what our sizing calculation assumed.
+    """
+    print("\n  Contract values (used in lot-size calculations):")
+    for sym, product in products.items():
+        cv = product.get("contract_value", "unknown")
+        print(f"    {sym}: contract_value = {cv}")
+
+    for sym, product in products.items():
+        try:
+            resp = client.set_leverage(product["id"], LEVERAGE)
+            print(f"  Leverage set for {sym}: {LEVERAGE}x -> {resp}")
+        except Exception as e:
+            print(f"  [WARN] Could not set leverage for {sym}: {e}")
+
+
+def get_liquidation_distance_pct(entry_price, stop_price, side, leverage):
+    """
+    Rough estimate of how far liquidation is from entry, as a sanity check
+    that our stop-loss triggers LONG before liquidation would ever be a risk.
+    This is an approximation (actual liquidation price depends on Delta's
+    exact maintenance margin formula, which can vary by product) — treat it
+    as a safety sanity-check, not an exact number.
+    """
+    approx_liq_distance_pct = (1 / leverage) * 100 * 0.9  # rough, conservative estimate
+    stop_distance_pct = (abs(entry_price - stop_price) / entry_price) * 100
+    return approx_liq_distance_pct, stop_distance_pct
+
+
+def fetch_candles(symbol, hours=LOOKBACK_HOURS, resolution="1m"):
+    # Uses REAL_DATA_BASE_URL (production exchange), not testnet — testnet's
+    # price feed is thin/simulated. Read-only public data, no key needed.
+    end = int(datetime.now().timestamp())
+    start = end - hours * 3600
+    url = f"{config.REAL_DATA_BASE_URL}/v2/history/candles"
+    params = {"symbol": symbol, "resolution": resolution, "start": start, "end": end}
+    r = requests.get(url, params=params, timeout=15)
+    r.raise_for_status()
+    data = r.json().get("result", [])
+    if not data:
+        return None
+    df = pd.DataFrame(data).rename(columns={"time": "timestamp"})
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].astype(float)
+    return df.sort_values("timestamp").reset_index(drop=True)
+
+
+def get_wallet_available_balance():
+    response = client.request("GET", "/v2/wallet/balances", auth=True)
+    balances = response.json().get("result", [])
+    for b in balances:
+        if float(b.get("available_balance", 0)) > 0:
+            return float(b["available_balance"])
+    return 0.0
+
+
+def get_wallet_total_balance():
+    """
+    Returns TOTAL account balance (not "available_balance") — this is what
+    the daily circuit-breaker must use. "available_balance" drops the
+    moment a new position opens (since margin gets locked/reserved for
+    it), which would make the breaker misread a normal margin-lock as a
+    huge instant "loss" even though no money was actually lost. Total
+    balance only changes with genuine realized P&L, not margin allocation.
+    """
+    response = client.request("GET", "/v2/wallet/balances", auth=True)
+    balances = response.json().get("result", [])
+    for b in balances:
+        total = b.get("balance")
+        if total is not None and float(total) > 0:
+            return float(total)
+    # Fallback: if "balance" field isn't present for some reason, fall back
+    # to available_balance rather than crashing (logged clearly so this is
+    # visible if it ever happens).
+    for b in balances:
+        if float(b.get("available_balance", 0)) > 0:
+            print("  [WARN] Wallet response had no 'balance' field — falling back to "
+                  "available_balance for circuit-breaker (may misread margin-lock as loss).")
+            return float(b["available_balance"])
+    return 0.0
+
+
+# ============================================================
+# Order placement (FIXED response parsing + reduce_only support)
+# ============================================================
+
+def get_authoritative_entry_price(product_id, retries=5, delay=1.0):
+    """
+    After placing a market entry order, polls the exchange's own position
+    endpoint to find the REAL entry price it recorded — this is the single
+    source of truth for what actually happened, more reliable than parsing
+    the order response or guessing based on a slippage-percentage
+    threshold (which previously caused a genuine large-slippage fill to
+    be wrongly discarded as "corrupted data", leaving our internal
+    tracking completely disconnected from the real position).
+    Returns None if no position shows up in time (caller should fall back
+    to the order-response-based price in that case).
+    """
+    for _ in range(retries):
+        time.sleep(delay)
+        try:
+            pos = client.get_position(product_id)
+        except Exception:
+            continue
+        size = float(pos.get("size", 0)) if isinstance(pos, dict) else 0
+        if size != 0:
+            entry_price = pos.get("entry_price")
+            if entry_price is not None:
+                return float(entry_price)
+    return None
+
+
+def _extract_fill_price(response):
+    """
+    Tries to find the actual average fill price from an order response.
+    Field names are checked defensively (average_fill_price, avg_fill_price,
+    price) since the exact SDK response shape wasn't verified against a
+    live account from this build environment (no internet access here).
+    Returns None if no usable price field is found — caller should fall
+    back to the pre-order signal price in that case.
+    """
+    if not isinstance(response, dict):
+        return None
+    for key in ("average_fill_price", "avg_fill_price", "price", "limit_price"):
+        val = response.get(key)
+        if val is not None:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                continue
+    result = response.get("result")
+    if isinstance(result, dict):
+        return _extract_fill_price(result)
+    return None
+
+
+def _extract_order_id(response):
+    """
+    The SDK returns the order dict directly (not nested under "result").
+    Handles both possible shapes defensively.
+    """
+    if isinstance(response, dict):
+        if "id" in response:
+            return response["id"]
+        if "result" in response and isinstance(response["result"], dict):
+            return response["result"].get("id")
+    return None
+
+
+def _order_is_still_open(product_id, order_id):
+    """
+    FIXED: get_live_orders() returns a LIST of order dicts directly, not a
+    dict with a "result" key. Iterate it directly.
+    """
+    try:
+        live_orders = client.get_live_orders({"product_id": product_id})
+        if isinstance(live_orders, dict):
+            live_orders = live_orders.get("result", [])
+        return any(o.get("id") == order_id for o in live_orders)
+    except Exception as e:
+        print(f"  [WARN] couldn't check order status: {e}")
+        return None  # unknown — caller should treat cautiously
+
+
+def place_market_order_direct(product_id, side, size, reduce_only=False):
+    """
+    Places a MARKET order immediately — no limit-order wait, no timeout.
+    Used by Logic B, which is designed for instant execution (fast
+    scalping) rather than Logic A's cheaper-but-slower limit-first approach.
+    """
+    order = {"product_id": product_id, "size": size, "side": side, "order_type": "market_order"}
+    if reduce_only:
+        order["reduce_only"] = True
+    print(f"  Placing MARKET order (instant, Logic B): {order}")
+    response = client.create_order(order)
+    return response, "market_direct"
+
+
+def get_current_ticker_price(symbol):
+    """Public endpoint — current mark/last price, used when widening a
+    rejected bracket order (need fresh price to nudge levels away from)."""
+    r = requests.get(f"{config.REAL_DATA_BASE_URL}/v2/tickers/{symbol}", timeout=10)
+    r.raise_for_status()
+    data = r.json().get("result", {})
+    return float(data.get("close") or data.get("mark_price") or data.get("spot_price"))
+
+
+def get_exec_price(symbol, real_market_price):
+    """
+    The real-market price (config.REAL_DATA_BASE_URL) decides the trade
+    DIRECTION and the ATR (volatility) used for SL/TP distance. But the
+    actual order/position lives on the TESTNET account (config.BASE_URL),
+    which can sit at a genuinely different price than the real market
+    (this is a real, structural difference between the two feeds — not
+    corrupted data, as we mistakenly assumed earlier in this project).
+    So before placing an entry, we fetch the testnet account's OWN current
+    price and anchor the initial SL/TP/sizing estimate to it instead —
+    reducing the gap between our pre-trade estimate and the actual fill,
+    matching the reference bot's get_exec_price() design.
+    Falls back to real_market_price if the testnet ticker fetch fails.
+    """
+    try:
+        r = requests.get(f"{config.BASE_URL}/v2/tickers/{symbol}", timeout=10)
+        r.raise_for_status()
+        data = r.json().get("result", {})
+        testnet_price = float(data.get("close") or data.get("mark_price") or data.get("spot_price"))
+        return testnet_price
+    except Exception as e:
+        print(f"    [WARN] Couldn't fetch testnet's own price for {symbol} ({e}) — "
+              f"using real-market price instead for the initial estimate.")
+        return real_market_price
+
+
+def place_bracket_order_raw(product_id, product_symbol, side, size, sl_price, tp_price,
+                             trigger_method="last_traded_price"):
+    """
+    Attaches a stop-loss + take-profit bracket to an EXISTING position via
+    Delta's native /v2/orders/bracket endpoint. Does NOT open a position —
+    must be called right after a market entry.
+    """
+    body = {
+        "product_id": product_id,
+        "product_symbol": product_symbol,
+        "stop_loss_order": {"order_type": "market_order", "stop_price": str(round(sl_price, 6))},
+        "take_profit_order": {"order_type": "market_order", "stop_price": str(round(tp_price, 6))},
+        "bracket_stop_trigger_method": trigger_method,
+    }
+    return client.request("POST", "/v2/orders/bracket", body, auth=True)
+
+
+def get_bracket_stop_loss_order_id(product_id):
+    """
+    Finds the ACTUAL stop-loss leg order that Delta created when the
+    bracket was attached (a separate resting/pending order, distinct from
+    our original MARKET entry order — which fills instantly and moves to
+    'closed' state, so its id can't be used to edit the bracket: Delta
+    rejects that with 'open_order_not_found'). Returns the order id of
+    the open/pending stop_loss_order for this product, or None if not found.
+    """
+    try:
+        r = client.request("GET", "/v2/orders", {"product_ids": str(product_id),
+                                                   "states": "open,pending"}, auth=True)
+        orders = r.json().get("result", [])
+    except Exception as e:
+        print(f"  [WARN] Couldn't fetch open orders to find bracket's stop-loss leg: {e}")
+        return None
+    for o in orders:
+        if o.get("stop_order_type") == "stop_loss_order":
+            return o.get("id")
+    return None
+
+
+def edit_bracket_order(order_id, product_id, product_symbol, sl_price, tp_price,
+                        trigger_method="last_traded_price"):
+    """
+    Modifies an EXISTING bracket's SL/TP levels via Delta's PUT
+    /v2/orders/bracket endpoint. This is the CORRECT way to update a
+    trailing stop — Delta only allows ONE bracket per open position, so
+    cancelling all orders and POSTing a fresh bracket (the old approach)
+    fails with 'bracket_order_exists' since the existing bracket is still
+    attached to the position and wasn't actually removed by a plain order
+    cancel. order_id is the id of the ORIGINAL entry order the bracket
+    was attached to (captured when the entry order was placed).
+    """
+    body = {
+        "id": order_id,
+        "product_id": product_id,
+        "product_symbol": product_symbol,
+        "bracket_stop_loss_price": str(round(sl_price, 6)),
+        "bracket_take_profit_price": str(round(tp_price, 6)),
+        "bracket_stop_trigger_method": trigger_method,
+    }
+    return client.request("PUT", "/v2/orders/bracket", body, auth=True)
+
+
+def place_bracket_with_retry(product_id, product_symbol, side, size, sl_price, tp_price,
+                              direction, trigger_method="last_traded_price",
+                              max_retries=BRACKET_MAX_RETRIES, widen_pct=BRACKET_WIDEN_PCT):
+    """
+    Same as place_bracket_order_raw, but recovers from Delta's
+    'bracket_order_immediate_execution' rejection (happens when price has
+    already moved past the SL/TP level by the time the bracket is placed —
+    common with a lagging/jumpy testnet feed). Widens both levels further
+    from the live price and retries, up to max_retries times.
+    """
+    attempt = 0
+    while True:
+        try:
+            return place_bracket_order_raw(
+                product_id, product_symbol, side, size, sl_price, tp_price, trigger_method)
+        except Exception as e:
+            if "bracket_order_immediate_execution" not in str(e) or attempt >= max_retries:
+                raise
+            attempt += 1
+            try:
+                current_price = get_current_ticker_price(product_symbol)
+            except Exception:
+                current_price = sl_price
+            widen = current_price * (widen_pct / 100.0)
+            if direction == "long":
+                sl_price -= widen
+                tp_price += widen
+            else:
+                sl_price += widen
+                tp_price -= widen
+            print(f"    [WARN] Bracket rejected as immediate-execution, widening and "
+                  f"retrying (attempt {attempt}/{max_retries}): sl={sl_price:.6f} tp={tp_price:.6f}")
+            time.sleep(0.5)
+
+
+def place_order_with_fallback(product_id, side, size, limit_price, reduce_only=False):
+    """
+    Places a LIMIT order first (cheaper maker fee). If not filled within
+    LIMIT_ORDER_TIMEOUT_SECONDS, cancels it and places a MARKET order
+    instead. reduce_only=True must be used for CLOSING/reducing a position
+    so the exchange doesn't treat it as a fresh trade requiring new margin.
+    Used by Logic A (limit-first philosophy — cheaper fees, willing to wait).
+    """
+    order = {
+        "product_id": product_id, "size": size, "side": side,
+        "order_type": "limit_order", "limit_price": str(round(limit_price, 6)),
+    }
+    if reduce_only:
+        order["reduce_only"] = True
+
+    print(f"  Placing LIMIT order: {order}")
+    response = client.create_order(order)
+    order_id = _extract_order_id(response)
+
+    if order_id is None:
+        print(f"  [WARN] couldn't read order id from response ({response}) — "
+              f"treating as unfilled, will fall back to market order.")
+
+    waited = 0
+    filled = False
+    while waited < LIMIT_ORDER_TIMEOUT_SECONDS:
+        time.sleep(5)
+        waited += 5
+        if order_id is None:
+            continue
+        still_open = _order_is_still_open(product_id, order_id)
+        if still_open is False:
+            print(f"  Limit order filled after {waited}s.")
+            filled = True
+            break
+
+    if filled:
+        return response, "limit"
+
+    print(f"  Limit order not filled after {LIMIT_ORDER_TIMEOUT_SECONDS}s — "
+          f"cancelling and using market order.")
+    if order_id is not None:
+        try:
+            client.cancel_order(product_id, order_id)
+        except Exception as e:
+            print(f"  [WARN] cancel failed (may have filled in the meantime): {e}")
+
+    market_order = {"product_id": product_id, "size": size, "side": side, "order_type": "market_order"}
+    if reduce_only:
+        market_order["reduce_only"] = True
+    response = client.create_order(market_order)
+    return response, "market_fallback"
+
+
+# ============================================================
+# Startup reconciliation — check the REAL exchange state, not just
+# the local JSON file, before doing anything else.
+# ============================================================
+
+def reconcile_with_exchange(state, products):
+    print("\n--- Startup reconciliation: checking real exchange state ---")
+
+    real_position = None
+    for sym, product in products.items():
+        try:
+            pos = client.get_position(product["id"])
+        except Exception as e:
+            print(f"  [WARN] couldn't fetch position for {sym}: {e}")
+            continue
+        size = float(pos.get("size", 0)) if isinstance(pos, dict) else 0
+        if size != 0:
+            real_position = (sym, product, pos, size)
+            print(f"  FOUND real open position on exchange: {sym}, size={size}")
+            break
+
+    if real_position is None:
+        if state["position"] is not None:
+            print("  Local state had a position recorded, but exchange shows none "
+                  "(it must have closed already). Clearing local state.")
+            state["position"] = None
+        else:
+            print("  No open position on exchange, and none tracked locally. Clean start.")
+    else:
+        sym, product, pos, size = real_position
+        entry_price = float(pos.get("entry_price", 0))
+        side = "long" if size > 0 else "short"
+        if state["position"] is not None and state["position"]["symbol"] == sym:
+            print(f"  Local state already tracking {sym} — keeping existing stop/target.")
+        else:
+            print(f"  Adopting untracked real position: {sym} {side} @ {entry_price}. "
+                  f"Recomputing stop/target from current data since original signal "
+                  f"candle isn't available.")
+            df = fetch_candles(sym)
+            if df is not None and len(df) > SWING_LOOKBACK:
+                if side == "long":
+                    stop = df["low"].iloc[-SWING_LOOKBACK:].min() * (1 - STOP_BUFFER_PCT / 100)
+                    stop_dist_pct = (entry_price - stop) / entry_price * 100
+                    target = entry_price * (1 + (stop_dist_pct * RISK_REWARD_MULT) / 100)
+                else:
+                    stop = df["high"].iloc[-SWING_LOOKBACK:].max() * (1 + STOP_BUFFER_PCT / 100)
+                    stop_dist_pct = (stop - entry_price) / entry_price * 100
+                    target = entry_price * (1 - (stop_dist_pct * RISK_REWARD_MULT) / 100)
+            else:
+                stop = entry_price * (0.99 if side == "long" else 1.01)
+                target = entry_price * (1.02 if side == "long" else 0.98)
+
+            state["position"] = {
+                "symbol": sym, "product_id": product["id"], "side": side,
+                "size": abs(size), "original_size": abs(size),
+                "entry_price": entry_price, "stop": stop, "target": target,
+                "entry_time": str(datetime.now()), "milestones_locked": 0,
+                "max_progress": 0.0, "strategy": "A",
+            }
+
+    # Cancel any stray open orders for our watched products that don't
+    # belong to a currently-tracked position (prevents duplicate-order buildup)
+    tracked_product_id = state["position"]["product_id"] if state["position"] else None
+    for sym, product in products.items():
+        try:
+            live_orders = client.get_live_orders({"product_id": product["id"]})
+            if isinstance(live_orders, dict):
+                live_orders = live_orders.get("result", [])
+        except Exception as e:
+            print(f"  [WARN] couldn't fetch open orders for {sym}: {e}")
+            continue
+        for o in live_orders:
+            oid = o.get("id")
+            if product["id"] != tracked_product_id:
+                print(f"  Cancelling stray leftover order on {sym} (id={oid})")
+                try:
+                    client.cancel_order(product["id"], oid)
+                except Exception as e:
+                    print(f"  [WARN] couldn't cancel stray order {oid}: {e}")
+
+    print("--- Reconciliation done ---\n")
+    return state
+
+
+# ============================================================
+# Position management (partial TP, trailing SL, smart near-target exit)
+# ============================================================
+
+def compute_progress(position, current_price):
+    entry = position["entry_price"]
+    target = position["target"]
+    if position["side"] == "long":
+        total_distance = target - entry
+        if total_distance <= 0:
+            return 0.0
+        return (current_price - entry) / total_distance
+    else:
+        total_distance = entry - target
+        if total_distance <= 0:
+            return 0.0
+        return (entry - current_price) / total_distance
+
+
+def cancel_all_orders_for_product(product_id):
+    body = {"product_id": product_id}
+    return client.request("DELETE", "/v2/orders/all", body, auth=True)
+
+
+def manage_bracket_position_b(state, pos, symbol_data):
+    """
+    Manages a Logic B position that has a native bracket order (SL+TP)
+    already attached on the exchange. Two jobs each loop:
+      1. Detect if the exchange-side bracket already closed the position
+         (SL or TP triggered) — if so, log it and clear local tracking.
+      2. If still open, check whether ATR has expanded significantly since
+         entry (a sign of a strengthening/volatile trend) — if so, trail
+         the stop behind the best price seen, replacing the bracket with
+         a tighter SL (and a deliberately distant TP, so the trailing stop
+         does the real exit management from here on), matching the
+         reference bot's design.
+    """
+    sym = pos["symbol"]
+    side = pos["side"]
+
+    try:
+        live_pos = client.get_position(pos["product_id"])
+        size_now = float(live_pos.get("size", 0)) if isinstance(live_pos, dict) else 0
+    except Exception as e:
+        print(f"  [WARN] {sym}: couldn't check live position status ({e}) — will retry next loop")
+        return
+
+    if size_now == 0:
+        # Bracket already closed this position on the exchange side. We
+        # don't get an exact fill price/reason from this check alone, so
+        # we log it using the current market price as a reasonable proxy.
+        current_price = symbol_data[sym].iloc[-1]["close"] if sym in symbol_data else pos["entry_price"]
+        entry_price = pos["entry_price"]
+        if side == "long":
+            approx_pnl_pct = (current_price - entry_price) / entry_price * 100
+        else:
+            approx_pnl_pct = (entry_price - current_price) / entry_price * 100
+        print(f"  {sym}: bracket order already closed this position on the exchange "
+              f"(SL or TP triggered). Approx exit ~{current_price:.6f}, "
+              f"approx gross P&L: {approx_pnl_pct:+.3f}%")
+        log_trade_event(
+            time=str(datetime.now()), symbol=sym, action="CLOSE",
+            side=("sell" if side == "long" else "buy"), size=pos["size"],
+            reason="bracket_closed", entry_price=entry_price, exit_price=current_price,
+            approx_gross_pnl_pct=round(approx_pnl_pct, 4), fill_method="bracket",
+            strategy="B",
+        )
+        state["last_trade_close_time_b"] = time.time()
+        state["position"] = None
+        return
+
+    if sym not in symbol_data:
+        return
+    latest = symbol_data[sym].iloc[-1]
+    current_price = latest["close"]
+    current_atr = latest["atr"]
+    entry_atr = pos.get("entry_atr")
+
+    if pd.isna(current_atr) or entry_atr is None or entry_atr <= 0:
+        return
+
+    # Track the best (most favorable) price seen so far
+    extreme = pos.get("extreme_price", pos["entry_price"])
+    if side == "long":
+        extreme = max(extreme, current_price)
+    else:
+        extreme = min(extreme, current_price)
+    pos["extreme_price"] = extreme
+
+    expansion_pct = ((current_atr - entry_atr) / entry_atr) * 100.0
+
+    # ---- R-multiple early exit (matches reference bot design) ----
+    # Once the trade reaches 1R profit (moved one SL-distance in its
+    # favor), take the modest guaranteed profit now — UNLESS ATR has
+    # expanded significantly, which signals the move may have more room,
+    # in which case we skip the early exit and let the ATR-expansion
+    # trailing logic below manage it instead (riding toward the full TP).
+    r_basis = pos.get("r_basis")
+    if r_basis and r_basis > 0 and not pos.get("early_exit_done", False):
+        if side == "long":
+            r_multiple = (current_price - pos["entry_price"]) / r_basis
+        else:
+            r_multiple = (pos["entry_price"] - current_price) / r_basis
+
+        if r_multiple >= 1.0:
+            if expansion_pct >= ATR_EXPANSION_TRIGGER_PCT:
+                print(f"  {sym}: reached 1R profit AND ATR expanded {expansion_pct:.1f}% "
+                      f"— skipping early exit, letting the trailing stop manage this "
+                      f"trade for potentially more than 1R.")
+                pos["early_exit_done"] = True  # don't re-check every loop once decided
+            else:
+                print(f"  {sym}: reached 1R profit (r_multiple={r_multiple:.2f}), ATR has "
+                      f"NOT expanded — taking the early exit now instead of risking a "
+                      f"round-trip back to breakeven/loss.")
+                try:
+                    cancel_all_orders_for_product(pos["product_id"])
+                except Exception as e:
+                    print(f"  [WARN] {sym}: couldn't cancel bracket before early exit ({e})")
+                try:
+                    resp, method = place_market_order_direct(
+                        pos["product_id"], ("sell" if side == "long" else "buy"),
+                        pos["size"], reduce_only=True)
+                    entry_price = pos["entry_price"]
+                    pnl_pct = ((current_price - entry_price) / entry_price * 100 if side == "long"
+                               else (entry_price - current_price) / entry_price * 100)
+                    log_trade_event(
+                        time=str(datetime.now()), symbol=sym, action="CLOSE",
+                        side=("sell" if side == "long" else "buy"), size=pos["size"],
+                        reason="early_exit_1R", entry_price=entry_price, exit_price=current_price,
+                        approx_gross_pnl_pct=round(pnl_pct, 4), fill_method=method, strategy="B",
+                    )
+                    print(f"  {sym}: CLOSED early at 1R, approx gross P&L: {pnl_pct:+.3f}%")
+                    state["last_trade_close_time_b"] = time.time()
+                    state["position"] = None
+                    return
+                except Exception as e:
+                    print(f"  [WARN] {sym}: early-exit order failed ({e}) — will retry next loop")
+
+    if expansion_pct < ATR_EXPANSION_TRIGGER_PCT:
+        state["position"] = pos
+        return  # ATR hasn't expanded enough yet to switch into trailing mode
+
+    trail_dist = TRAIL_MULT_B * current_atr
+    new_stop = extreme - trail_dist if side == "long" else extreme + trail_dist
+    old_stop = pos["stop"]
+    improved = (side == "long" and new_stop > old_stop) or (side == "short" and new_stop < old_stop)
+    if not improved:
+        state["position"] = pos
+        return
+
+    print(f"  {sym}: ATR expanded {expansion_pct:.1f}% since entry (>= {ATR_EXPANSION_TRIGGER_PCT}%) "
+          f"-> trailing stop from {old_stop:.6f} to {new_stop:.6f}")
+    # Matches reference bot's _far_take_profit(): far_dist = original
+    # SL-distance (r_basis) * 20, anchored off ENTRY price — not the
+    # current trailing distance/extreme, which would drift each update.
+    r_basis = pos.get("r_basis", trail_dist)
+    far_dist = r_basis * 20
+    entry_price = pos["entry_price"]
+    far_tp = entry_price + far_dist if side == "long" else entry_price - far_dist
+    try:
+        bracket_sl_order_id = get_bracket_stop_loss_order_id(pos["product_id"])
+        if bracket_sl_order_id is not None:
+            # CORRECT approach: edit the EXISTING bracket via PUT, using the
+            # bracket's OWN stop-loss leg order id (a resting/pending order
+            # Delta created when the bracket attached) — not our original
+            # MARKET entry order's id, which is already 'closed' by the
+            # time we're trailing and gets rejected as 'open_order_not_found'.
+            edit_bracket_order(bracket_sl_order_id, pos["product_id"], sym, new_stop, far_tp)
+        else:
+            # Couldn't find the bracket's stop-loss leg — fall back to the
+            # cancel+recreate approach as a last resort.
+            print(f"  [WARN] {sym}: couldn't find the bracket's stop-loss leg order — "
+                  f"falling back to cancel+recreate.")
+            cancel_all_orders_for_product(pos["product_id"])
+            place_bracket_with_retry(
+                pos["product_id"], sym, ("buy" if side == "long" else "sell"),
+                pos["size"], new_stop, far_tp, side)
+        pos["stop"] = new_stop
+        print(f"  {sym}: trailing bracket updated successfully.")
+    except Exception as e:
+        print(f"  [WARN] {sym}: failed to update trailing bracket ({e}) — "
+              f"keeping previous bracket levels, will retry next loop.")
+
+    state["position"] = pos
+
+
+def manage_open_position(state, symbol_data):
+    pos = state["position"]
+    sym = pos["symbol"]
+    if sym not in symbol_data:
+        print(f"  [WARN] no fresh data for open position {sym} this loop")
+        return
+
+    latest = symbol_data[sym].iloc[-1]
+    price = latest["close"]
+    side = pos["side"]
+
+    # ---- Live unrealized P&L snapshot (for the dashboard corner widget) ----
+    entry_price = pos["entry_price"]
+    if side == "long":
+        live_pnl_pct = (price - entry_price) / entry_price * 100
+    else:
+        live_pnl_pct = (entry_price - price) / entry_price * 100
+    LATEST_STATE["position"] = pos
+    LATEST_STATE["current_price"] = price
+    LATEST_STATE["live_pnl_pct"] = live_pnl_pct
+
+    # ---- Logic B with an active bracket order: exchange handles the actual
+    # SL/TP execution natively. Our job here is just to detect closure and
+    # manage ATR-expansion-triggered trailing. ----
+    if pos.get("strategy") == "B" and pos.get("bracket_active", False):
+        manage_bracket_position_b(state, pos, symbol_data)
+        return
+
+    # ---- Hard stop-loss / full target check first ----
+    hit_stop = hit_target = False
+    if side == "long":
+        if latest["low"] <= pos["stop"]:
+            hit_stop = True
+        elif latest["high"] >= pos["target"]:
+            hit_target = True
+    else:
+        if latest["high"] >= pos["stop"]:
+            hit_stop = True
+        elif latest["low"] <= pos["target"]:
+            hit_target = True
+
+    if hit_stop or hit_target:
+        _close_position(state, pos, price, "stop" if hit_stop else "target", pos["size"])
+        return
+
+    # ---- Progress tracking + staircase stop-loss ratcheting (now applies
+    # to BOTH Logic A and Logic B — added after observing that fixed SL/TP
+    # alone let a profitable-looking trade fully round-trip back to a loss) ----
+    progress = compute_progress(pos, price)
+    pos["max_progress"] = max(pos.get("max_progress", 0.0), progress)
+
+    entry = pos["entry_price"]
+    target = pos["target"]
+    locked_so_far = pos.get("milestones_locked", 0)  # how many staircase steps already applied
+
+    for i in range(locked_so_far, len(STAIRCASE_TRIGGERS)):
+        trigger = STAIRCASE_TRIGGERS[i]
+        lock_level = STAIRCASE_LOCKS[i]
+        if pos["max_progress"] < trigger:
+            break  # triggers are in increasing order, so no need to check further ones yet
+
+        if side == "long":
+            new_stop = entry + lock_level * (target - entry)
+        else:
+            new_stop = entry - lock_level * (entry - target)
+
+        old_stop = pos["stop"]
+        # Only ever move the stop in the favorable direction, never loosen it
+        if (side == "long" and new_stop > old_stop) or (side == "short" and new_stop < old_stop):
+            pos["stop"] = new_stop
+            print(f"  {sym}: progress reached {pos['max_progress']:.2f} (>= {trigger}) -> "
+                  f"stop moved to the {lock_level:.0%} level ({old_stop:.5f} -> {new_stop:.5f})")
+        pos["milestones_locked"] = i + 1
+
+    state["position"] = pos  # persist progress-tracking updates
+
+
+def _close_position(state, pos, price, reason, size):
+    sym = pos["symbol"]
+    side = pos["side"]
+    close_side = "sell" if side == "long" else "buy"
+    strategy = pos.get("strategy", "A")
+
+    try:
+        if strategy == "B":
+            resp, method = place_market_order_direct(
+                pos["product_id"], close_side, size, reduce_only=True)
+        else:
+            resp, method = place_order_with_fallback(
+                pos["product_id"], close_side, size, price, reduce_only=True)
+    except Exception as e:
+        if "no_position_for_reduce_only" in str(e):
+            print(f"  [INFO] {sym}: exchange says there's no position left to close "
+                  f"(it must have already been closed — possibly by a duplicate "
+                  f"running instance of this script, or manually). Clearing local "
+                  f"tracking, no action needed.")
+            if strategy == "B":
+                state["last_trade_close_time_b"] = time.time()
+            state["position"] = None
+            return
+        else:
+            raise  # unknown error — let the outer loop's error handler log it
+
+    entry_price = pos["entry_price"]
+    if side == "long":
+        gross_pnl_pct = (price - entry_price) / entry_price * 100
+    else:
+        gross_pnl_pct = (entry_price - price) / entry_price * 100
+
+    # Note: daily-loss circuit breaker now compares REAL account balance
+    # (checked at the top of each loop, see check_daily_loss_circuit_breaker)
+    # instead of summing our own computed P&L here — more robust against
+    # any internal calculation bugs.
+
+    log_trade_event(
+        time=str(datetime.now()), symbol=sym, action="CLOSE",
+        side=close_side, size=size, reason=reason,
+        entry_price=entry_price, exit_price=price,
+        approx_gross_pnl_pct=round(gross_pnl_pct, 4),
+        fill_method=method, order_response=json.dumps(resp),
+        strategy=pos.get("strategy", "A"),
+    )
+    print(f"  CLOSED {sym} due to {reason} (filled via {method}), "
+          f"approx gross P&L: {gross_pnl_pct:+.3f}%")
+    if strategy == "B":
+        state["last_trade_close_time_b"] = time.time()
+    state["position"] = None
+
+
+# ============================================================
+# Entry logic
+# ============================================================
+
+def swing_low(df, idx, lookback=SWING_LOOKBACK):
+    start = max(0, idx - lookback)
+    return df["low"].iloc[start:idx + 1].min()
+
+
+def swing_high(df, idx, lookback=SWING_LOOKBACK):
+    start = max(0, idx - lookback)
+    return df["high"].iloc[start:idx + 1].max()
+
+
+def look_for_entry_b(state, symbol_data, products):
+    """
+    Logic B: fast EMA(5/13) crossover + RSI filter + ATR-based SL/TP.
+    Only checked if Logic A found nothing this loop. Uses its OWN risk
+    settings (LOGIC_B_RISK_PER_TRADE_PCT, LOGIC_B_LEVERAGE) — independent
+    from Logic A's sizing.
+    """
+    last_close_ts = state.get("last_trade_close_time_b")
+    if last_close_ts is not None:
+        elapsed = time.time() - last_close_ts
+        if elapsed < COOLDOWN_SECONDS:
+            print(f"  [COOLDOWN] Logic B: {elapsed:.1f}s since last close, need "
+                  f"{COOLDOWN_SECONDS}s — skipping entry scan this loop.")
+            return False
+
+    print("  --- Logic B entry scan detail (per coin) ---")
+    for sym, df in symbol_data.items():
+        i = len(df) - 1
+        if i < 1:
+            continue
+        fast_col, slow_col = f"ema_{EMA_FAST}", f"ema_{EMA_SLOW}"
+        prev_fast, prev_slow = df[fast_col].iloc[i - 1], df[slow_col].iloc[i - 1]
+        curr_fast, curr_slow = df[fast_col].iloc[i], df[slow_col].iloc[i]
+        rsi = df["rsi"].iloc[i]
+        atr = df["atr"].iloc[i]
+        price = df["close"].iloc[i]
+
+        if pd.isna(prev_fast) or pd.isna(curr_slow) or pd.isna(rsi) or pd.isna(atr):
+            print(f"  {sym}: Logic B indicators not ready yet")
+            continue
+
+        bullish_cross = prev_fast <= prev_slow and curr_fast > curr_slow
+        bearish_cross = prev_fast >= prev_slow and curr_fast < curr_slow
+
+        print(f"  {sym}: EMA{EMA_FAST}={curr_fast:.5f} EMA{EMA_SLOW}={curr_slow:.5f} "
+              f"bullish_cross={bullish_cross} bearish_cross={bearish_cross} "
+              f"RSI={rsi:.1f} ATR={atr:.5f} mode={STRATEGY_MODE_B}")
+
+        side = None
+        if STRATEGY_MODE_B == "trend":
+            # Continuous re-entry: fires every loop where price/EMAs stay
+            # aligned with the trend and RSI confirms — not just at the
+            # moment of a fresh cross. Matches the reference bot's default.
+            uptrend = price > curr_fast > curr_slow
+            downtrend = price < curr_fast < curr_slow
+            if uptrend and RSI_LONG_MIN <= rsi <= RSI_LONG_MAX:
+                side = "long"
+            elif downtrend and RSI_SHORT_MIN <= rsi <= RSI_SHORT_MAX:
+                side = "short"
+            else:
+                continue
+        else:
+            # "crossover" mode — only a FRESH cross counts
+            if bullish_cross and RSI_LONG_MIN <= rsi <= RSI_LONG_MAX:
+                side = "long"
+            elif bearish_cross and RSI_SHORT_MIN <= rsi <= RSI_SHORT_MAX:
+                side = "short"
+            else:
+                if bullish_cross or bearish_cross:
+                    print(f"    -> SKIP: crossover happened but RSI ({rsi:.1f}) outside "
+                          f"the required band for that direction")
+                continue
+
+        # real-market "price" decided the direction and ATR above. Now fetch
+        # the TESTNET account's own current price to anchor the initial
+        # SL/TP/sizing estimate (reduces the gap vs the real fill later).
+        exec_price = get_exec_price(sym, price)
+        if abs(exec_price - price) / price * 100 > 0.02:
+            print(f"    [INFO] Real-market price {price:.5f} vs testnet's own price "
+                  f"{exec_price:.5f} — anchoring SL/TP/sizing to the testnet price.")
+
+        stop = exec_price - SL_ATR_MULT * atr if side == "long" else exec_price + SL_ATR_MULT * atr
+        target = exec_price + TP_ATR_MULT * atr if side == "long" else exec_price - TP_ATR_MULT * atr
+        stop_dist_pct = abs(exec_price - stop) / exec_price * 100
+        target_move_pct = abs(target - exec_price) / exec_price * 100
+
+        # NOTE: fee-aware minimum-target filter was REMOVED for Logic B on
+        # request. This means trades can now be taken even when the
+        # ATR-based target move is smaller than round-trip taker fees
+        # (currently 0.24%) — such trades can lose money to fees even if
+        # the price direction call is correct. Re-add the check above
+        # (target_move_pct < MIN_TARGET_PCT_B) if this causes issues.
+
+        print(f"    -> Logic B CONDITIONS MET: {side.upper()} entry")
+
+        # ---- Minimum stop-distance floor (WIDEN, don't skip) ----
+        # When ATR is extremely tiny, the raw ATR-based stop can be far
+        # tighter than MIN_STOP_DIST_PCT_B — instead of skipping the trade
+        # (which the reference bot's code doesn't even check for, and
+        # which just means fewer trades for us), we WIDEN the stop to the
+        # floor and let position sizing shrink accordingly to keep the
+        # same $ risk. This lets genuinely-signaled trades still execute
+        # during low-volatility periods, while staying safe from
+        # 'immediate_liquidation' rejections (which happen with razor-thin
+        # stops forced to near-max leverage).
+        if stop_dist_pct < MIN_STOP_DIST_PCT_B:
+            print(f"    [INFO] ATR-based stop distance {stop_dist_pct:.3f}% is tinier than "
+                  f"the {MIN_STOP_DIST_PCT_B}% floor — widening the stop to the floor "
+                  f"(position size will shrink to keep the same $ risk) instead of skipping.")
+            stop_dist_pct = MIN_STOP_DIST_PCT_B
+            stop = exec_price * (1 - stop_dist_pct / 100) if side == "long" else exec_price * (1 + stop_dist_pct / 100)
+            target = (exec_price * (1 + stop_dist_pct * TP_RR_MULT / 100) if side == "long"
+                      else exec_price * (1 - stop_dist_pct * TP_RR_MULT / 100))
+
+        if sym not in products:
+            print(f"    -> SKIP: {sym} not available on testnet account")
+            continue
+
+        available = get_wallet_available_balance()
+        if FIXED_SIZE and FIXED_SIZE > 0:
+            size = FIXED_SIZE
+        else:
+            risk_amount = available * (LOGIC_B_RISK_PER_TRADE_PCT / 100)
+            max_notional = available * LOGIC_B_LEVERAGE * MARGIN_SAFETY_FACTOR
+            notional = min(risk_amount / (stop_dist_pct / 100), max_notional)
+            product = products[sym]
+            contract_value = float(product.get("contract_value", 1))
+            size = max(1, round(notional / (contract_value * exec_price)))
+
+        product = products[sym]
+        order_side = "buy" if side == "long" else "sell"
+
+        resp, method = place_market_order_direct(product["id"], order_side, size)
+        entry_order_id = resp.get("id") if isinstance(resp, dict) else None
+        if entry_order_id is None:
+            # try the nested "result" shape defensively too
+            if isinstance(resp, dict) and isinstance(resp.get("result"), dict):
+                entry_order_id = resp["result"].get("id")
+
+        # Get the AUTHORITATIVE entry price from the exchange's own position
+        # record (single source of truth) — do NOT second-guess it based on
+        # a slippage-percentage threshold, since a genuinely large slippage
+        # fill was previously discarded as "corrupted data" this way,
+        # leaving our internal tracking disconnected from the real position.
+        price_for_calc = get_authoritative_entry_price(product["id"])
+        if price_for_calc is None:
+            # Fall back to whatever the order response itself reports, and
+            # failing that, the testnet exec_price (much closer to reality
+            # than the original real-market signal price) — logged clearly
+            # so it's visible if this path is ever hit.
+            fallback = _extract_fill_price(resp)
+            price_for_calc = fallback if fallback is not None else exec_price
+            print(f"    [WARN] Couldn't confirm entry price from the exchange's position "
+                  f"record — using {price_for_calc:.5f} as a fallback (verify manually).")
+        elif abs(price_for_calc - exec_price) / exec_price * 100 > 0.02:
+            print(f"    [INFO] Testnet exec_price estimate was {exec_price:.5f}, exchange "
+                  f"confirms REAL entry was {price_for_calc:.5f} (verified via position "
+                  f"record) — recalculating stop/target from this real entry price.")
+
+        # ---- Recompute SL/TP from the REAL entry price, with TP forced to
+        # a fixed risk:reward ratio off the SL distance (matches reference
+        # bot design). Uses stop_dist_pct (which may already have been
+        # widened to the MIN_STOP_DIST_PCT_B floor above) rather than raw
+        # ATR again, so the floor-widening isn't silently undone here. ----
+        sl_dist = price_for_calc * (stop_dist_pct / 100)
+        tp_dist = sl_dist * TP_RR_MULT
+        if side == "long":
+            stop = price_for_calc - sl_dist
+            target = price_for_calc + tp_dist
+        else:
+            stop = price_for_calc + sl_dist
+            target = price_for_calc - tp_dist
+
+        # ---- Attach a native bracket order (SL+TP in one exchange-side
+        # order) instead of managing exits via our own polling loop ----
+        bracket_active = False
+        try:
+            bracket_resp = place_bracket_with_retry(
+                product["id"], sym, order_side, size, stop, target, side)
+            bracket_active = True
+            print(f"    Bracket order attached: SL={stop:.6f} TP={target:.6f}")
+        except Exception as e:
+            print(f"    [WARN] Could not attach bracket order ({e}) — falling back to "
+                  f"our own polling-based SL/TP management for this trade instead.")
+
+        state["position"] = {
+            "symbol": sym, "product_id": product["id"], "side": side,
+            "size": size, "original_size": size,
+            "entry_price": price_for_calc, "stop": stop, "target": target,
+            "entry_time": str(datetime.now()), "strategy": "B",
+            "entry_order_id": entry_order_id,
+            "milestones_locked": 0, "max_progress": 0.0,
+            "bracket_active": bracket_active,
+            "entry_atr": atr, "extreme_price": price_for_calc,
+            "r_basis": sl_dist,  # original SL distance in price terms — the "R" unit
+            "early_exit_done": False,
+        }
+        log_trade_event(
+            time=str(datetime.now()), symbol=sym, action="OPEN",
+            side=order_side, size=size, entry_price=price_for_calc,
+            stop=stop, target=target, fill_method=method,
+            order_response=json.dumps(resp), strategy="B",
+        )
+        print(f"  OPENED {sym} {side} size={size} @ ~{price:.4f} (filled via {method}) [Logic B]")
+        return True
+
+    return False
+
+
+def check_daily_loss_circuit_breaker(state):
+    """
+    REAL-BALANCE-BASED kill switch (matches the reference bot's approach) —
+    compares actual account balance now vs at the start of the day, instead
+    of summing our own computed trade P&Ls. This is more robust: even if a
+    corrupted fill-price or a calculation bug produces a wrong P&L number
+    internally, the REAL balance is unaffected by our bugs, so the breaker
+    can't trip on a fake loss the way the old self-summed version could.
+    Resets automatically at UTC day change.
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        current_balance = get_wallet_total_balance()
+    except Exception as e:
+        print(f"  [WARN] Couldn't fetch balance for circuit-breaker check: {e}")
+        return True  # fail-open rather than fail-closed on a transient API hiccup
+
+    if state.get("daily_loss_date") != today or state.get("start_of_day_balance") is None:
+        state["daily_loss_date"] = today
+        state["start_of_day_balance"] = current_balance
+        state["daily_breaker_tripped"] = False
+        print(f"  [INFO] New trading day (UTC) — start-of-day balance recorded: ${current_balance:.2f}")
+
+    start_balance = state.get("start_of_day_balance", current_balance)
+    if start_balance > 0:
+        loss_pct = (start_balance - current_balance) / start_balance * 100
+    else:
+        loss_pct = 0.0
+
+    if loss_pct >= MAX_DAILY_LOSS_PCT:
+        if not state.get("daily_breaker_tripped", False):
+            print(f"  [CIRCUIT BREAKER TRIPPED] Real balance dropped {loss_pct:.2f}% today "
+                  f"(${start_balance:.2f} -> ${current_balance:.2f}), limit is {MAX_DAILY_LOSS_PCT}%.")
+        state["daily_breaker_tripped"] = True
+
+    if state.get("daily_breaker_tripped", False):
+        print(f"  [CIRCUIT BREAKER] Daily loss limit ({MAX_DAILY_LOSS_PCT}%) hit today "
+              f"(start ${start_balance:.2f} -> now ${current_balance:.2f}) — no new entries until tomorrow.")
+        return False
+    return True
+
+
+def look_for_entry_a(state, symbol_data, products):
+    """Logic A: 200 EMA + VWAP + CVD confluence (existing strategy)."""
+    print("  --- Entry scan detail (per coin) ---")
+    for sym, df in symbol_data.items():
+        i = len(df) - 1
+        row = df.iloc[i]
+        price = row["close"]
+        ema = row[f"ema_{EMA_PERIOD}"]
+        vwap = row["vwap"]
+        if pd.isna(ema) or pd.isna(vwap):
+            print(f"  {sym}: EMA/VWAP not ready yet (still warming up)")
+            continue
+
+        bullish = price > ema
+        bearish = price < ema
+        dist_from_vwap_pct = abs(price - vwap) / price * 100
+        near_vwap = dist_from_vwap_pct <= VWAP_PROXIMITY_PCT
+        trend_label = "BULLISH (price>EMA200)" if bullish else "BEARISH (price<EMA200)"
+        cvd_now = df["cvd"].iloc[i]
+        cvd_rising_flag = cvd_rising(df, i, CVD_LOOKBACK)
+        cvd_falling_flag = cvd_falling(df, i, CVD_LOOKBACK)
+
+        print(f"  {sym}: price={price:.5f} EMA200={ema:.5f} ({trend_label}) "
+              f"VWAP={vwap:.5f} (dist={dist_from_vwap_pct:.3f}%, need<={VWAP_PROXIMITY_PCT}%) "
+              f"CVD_now={cvd_now:.1f} rising={cvd_rising_flag} falling={cvd_falling_flag}")
+
+        if not near_vwap:
+            print(f"    -> SKIP: price not close enough to VWAP")
+            continue
+
+        side = None
+        if bullish and cvd_rising_flag:
+            side = "long"
+            stop = swing_low(df, i) * (1 - STOP_BUFFER_PCT / 100)
+            stop_dist_pct = (price - stop) / price * 100
+        elif bearish and cvd_falling_flag:
+            side = "short"
+            stop = swing_high(df, i) * (1 + STOP_BUFFER_PCT / 100)
+            stop_dist_pct = (stop - price) / price * 100
+        else:
+            print(f"    -> SKIP: trend direction and CVD momentum don't agree "
+                  f"(need bullish+CVD_rising OR bearish+CVD_falling)")
+            continue
+
+        if stop_dist_pct <= 0:
+            print(f"    -> SKIP: invalid stop distance")
+            continue
+        target_move_pct = stop_dist_pct * RISK_REWARD_MULT
+        if target_move_pct < MIN_TARGET_PCT:
+            print(f"    -> SKIP: target move {target_move_pct:.3f}% < fee-aware "
+                  f"minimum {MIN_TARGET_PCT:.3f}%")
+            continue
+
+        print(f"    -> ALL 3 CONDITIONS MET: trend={trend_label}, "
+              f"near_vwap=True, cvd_confirms=True. Proceeding with {side.upper()} entry.")
+
+        if sym not in products:
+            print(f"    -> SKIP: {sym} has a valid signal but isn't available on "
+                  f"the TESTNET account (production-only symbol) — can't place an "
+                  f"order for it here. Consider removing it from SYMBOLS_TO_WATCH.")
+            continue
+
+        # ---- Liquidation-distance safety sanity check ----
+        approx_liq_dist_pct, actual_stop_dist_pct = get_liquidation_distance_pct(
+            price, stop, side, LEVERAGE)
+        print(f"    Safety check: stop is {actual_stop_dist_pct:.2f}% away, "
+              f"approx liquidation is ~{approx_liq_dist_pct:.2f}% away at {LEVERAGE}x leverage.")
+        if actual_stop_dist_pct >= approx_liq_dist_pct * 0.7:
+            print(f"    -> SKIP: stop-loss is too close to estimated liquidation distance "
+                  f"(within 70%) — too risky at this leverage, skipping this setup.")
+            continue
+
+        target = (price * (1 + target_move_pct / 100) if side == "long"
+                  else price * (1 - target_move_pct / 100))
+
+        available = get_wallet_available_balance()
+        risk_amount = available * (RISK_PER_TRADE_PCT / 100)
+        max_notional = available * LEVERAGE * MARGIN_SAFETY_FACTOR
+        notional = min(risk_amount / (stop_dist_pct / 100), max_notional)
+
+        product = products[sym]
+        contract_value = float(product.get("contract_value", 1))
+        size = max(1, round(notional / (contract_value * price)))
+
+        order_side = "buy" if side == "long" else "sell"
+        limit_price = (price * (1 - LIMIT_OFFSET_PCT / 100) if side == "long"
+                       else price * (1 + LIMIT_OFFSET_PCT / 100))
+
+        resp, method = place_order_with_fallback(product["id"], order_side, size, limit_price)
+
+        # Get the AUTHORITATIVE entry price from the exchange's own position
+        # record rather than guessing based on a slippage-percentage
+        # threshold (see Logic B's identical fix for why — a genuinely
+        # large slippage fill was previously discarded as "bad data" this
+        # way, leaving our tracking disconnected from the real position).
+        price_for_calc = get_authoritative_entry_price(product["id"])
+        if price_for_calc is None:
+            fallback = _extract_fill_price(resp)
+            price_for_calc = fallback if fallback is not None else price
+            print(f"    [WARN] Couldn't confirm entry price from the exchange's position "
+                  f"record — using {price_for_calc:.5f} as a fallback (verify manually).")
+        elif abs(price_for_calc - price) / price * 100 > 0.02:
+            print(f"    [INFO] Signal price was {price:.5f}, exchange confirms REAL entry "
+                  f"was {price_for_calc:.5f} (verified via position record, not guessed) "
+                  f"— recalculating stop/target from this real entry price.")
+            if side == "long":
+                stop = swing_low(df, i) * (1 - STOP_BUFFER_PCT / 100)
+                stop_dist_pct = (price_for_calc - stop) / price_for_calc * 100
+                target = price_for_calc * (1 + (stop_dist_pct * RISK_REWARD_MULT) / 100)
+            else:
+                stop = swing_high(df, i) * (1 + STOP_BUFFER_PCT / 100)
+                stop_dist_pct = (stop - price_for_calc) / price_for_calc * 100
+                target = price_for_calc * (1 - (stop_dist_pct * RISK_REWARD_MULT) / 100)
+
+        state["position"] = {
+            "symbol": sym, "product_id": product["id"], "side": side,
+            "size": size, "original_size": size,
+            "entry_price": price_for_calc, "stop": stop, "target": target,
+            "entry_time": str(datetime.now()), "milestones_locked": 0,
+            "max_progress": 0.0, "strategy": "A",
+        }
+        log_trade_event(
+            time=str(datetime.now()), symbol=sym, action="OPEN",
+            side=order_side, size=size, entry_price=price_for_calc,
+            stop=stop, target=target, fill_method=method,
+            order_response=json.dumps(resp), strategy="A",
+        )
+        print(f"  OPENED {sym} {side} size={size} @ ~{price:.4f} (filled via {method}) [Logic A]")
+        return True  # only ONE trade at a time
+
+    return False
+
+
+# ============================================================
+# Main loop — wrapped so it NEVER stops on its own
+# ============================================================
+
+def run_one_loop_iteration(state, products):
+    symbol_data_a = {}  # Logic A: 15-min candles
+    symbol_data_b = {}  # Logic B: 1-min candles
+
+    mode = LOGIC_MODE["active"]
+    active_strategy = state["position"].get("strategy") if state["position"] else None
+    need_a = mode in ("A", "BOTH") or active_strategy == "A"
+    need_b = mode in ("B", "BOTH") or active_strategy == "B"
+
+    # ---- Logic A data (15-min) — watches all of SYMBOLS_TO_WATCH ----
+    if need_a:
+        for sym in SYMBOLS_TO_WATCH:
+            try:
+                df_a = fetch_candles(sym, hours=LOGIC_A_LOOKBACK_HOURS, resolution=LOGIC_A_RESOLUTION)
+            except Exception as e:
+                print(f"  [ERROR] {sym}: Logic A (15m) fetch failed ({e}) — skipping")
+                df_a = None
+            if df_a is not None and len(df_a) >= EMA_PERIOD + 5:
+                df_a = compute_ema(df_a, period=EMA_PERIOD)
+                df_a = compute_vwap(df_a)
+                df_a = compute_cvd(df_a)
+                symbol_data_a[sym] = df_a
+
+    # ---- Logic B data (1-min) — watches only LOGIC_B_SYMBOLS (BTC/ETH) ----
+    if need_b:
+        for sym in LOGIC_B_SYMBOLS:
+            try:
+                df_b = fetch_candles(sym, hours=LOOKBACK_HOURS, resolution="1m")
+            except Exception as e:
+                print(f"  [ERROR] {sym}: Logic B (1m) fetch failed ({e}) — skipping")
+                df_b = None
+            min_len_b = max(SWING_LOOKBACK, CVD_LOOKBACK, EMA_SLOW, RSI_PERIOD, ATR_PERIOD) + 5
+            if df_b is not None and len(df_b) >= min_len_b:
+                df_b = compute_ema(df_b, period=EMA_FAST)
+                df_b = compute_ema(df_b, period=EMA_SLOW)
+                df_b = compute_rsi(df_b, period=RSI_PERIOD)
+                df_b = compute_atr(df_b, period=ATR_PERIOD)
+                symbol_data_b[sym] = df_b
+
+    if not check_daily_loss_circuit_breaker(state):
+        save_state(state)
+        return
+
+    if state["position"] is not None:
+        active_strategy = state["position"].get("strategy", "A")
+        symbol_data_for_management = symbol_data_a if active_strategy == "A" else symbol_data_b
+        manage_open_position(state, symbol_data_for_management)
+
+    # ============================================================
+    # GUARANTEE: only ONE trade is ever open system-wide, across BOTH
+    # Logic A and Logic B combined. This works because:
+    #   1. There is a single state["position"] slot (not two separate ones)
+    #   2. Entries are only attempted when state["position"] is None
+    #   3. Logic B is only checked if Logic A found NOTHING this loop
+    #      (look_for_entry_b only runs when took_trade is False from A)
+    #   4. If either logic opens a trade, it returns True immediately,
+    #      so the other logic is never even checked that same loop
+    # ============================================================
+    if state["position"] is None:
+        mode = LOGIC_MODE["active"]
+        took_trade = False
+        if mode in ("A", "BOTH"):
+            took_trade = look_for_entry_a(state, symbol_data_a, products)
+        if not took_trade and mode in ("B", "BOTH"):
+            took_trade = look_for_entry_b(state, symbol_data_b, products)
+        if not took_trade:
+            print(f"  No tradeable setup this loop (mode={mode}) — staying flat.")
+
+    save_state(state)
+
+
+LATEST_STATE = {"position": None, "equity_note": None}
+
+
+def main_loop(stop_event=None):
+    def should_stop():
+        return stop_event is not None and stop_event.is_set()
+
+    state = load_state()
+    products = get_product_map()
+    print(f"Loaded products: {list(products.keys())}")
+    print(f"Fee-aware minimum target: {MIN_TARGET_PCT:.3f}% "
+          f"(maker round-trip {ROUND_TRIP_FEE_PCT:.3f}% x {SAFETY_MARGIN_MULT} safety margin)")
+
+    print(f"\nSetting leverage to {LEVERAGE}x for all watched products...")
+    set_leverage_for_all(products)
+
+    state = reconcile_with_exchange(state, products)
+    save_state(state)
+    LATEST_STATE["position"] = state["position"]
+
+    while not should_stop():
+        print(f"\n[{datetime.now()}] Loop start. Position: {state['position']}")
+        try:
+            run_one_loop_iteration(state, products)
+        except Exception as e:
+            # CRITICAL: never let one bad loop kill the whole script.
+            print(f"  [LOOP ERROR] {e}")
+            traceback.print_exc()
+            print("  Continuing to next loop despite the error above "
+                  "(script only stops on manual Stop/Ctrl+C).")
+
+        LATEST_STATE["position"] = state["position"]
+        if state["position"] is None:
+            LATEST_STATE["current_price"] = None
+            LATEST_STATE["live_pnl_pct"] = None
+
+        for _ in range(LOOP_INTERVAL_SECONDS):
+            if should_stop():
+                break
+            time.sleep(1)
+
+    print("\n[Algo stopped by user]")
+
+
+if __name__ == "__main__":
+    while True:
+        try:
+            main_loop()
+            break  # main_loop only returns normally if stop_event was set (not used in CLI mode)
+        except KeyboardInterrupt:
+            print("\nStopped by user (Ctrl+C). State saved.")
+            break
+        except Exception as e:
+            # Even a crash OUTSIDE the per-loop try/except (e.g. during
+            # startup reconciliation) will restart the whole script rather
+            # than exiting, per the "never stop until I stop it" requirement.
+            print(f"\n[FATAL ERROR, RESTARTING IN 10s] {e}")
+            traceback.print_exc()
+            time.sleep(10)

@@ -1,0 +1,34 @@
+TREND-SCALP ALGO (200 EMA + VWAP + CVD) — QUICK START
+========================================================
+
+1. Install Python from https://python.org/downloads/
+   (IMPORTANT: check "Add Python to PATH" during install)
+
+2. Open Command Prompt in this folder and run:
+   pip install delta-rest-client pandas requests
+
+3. Get your TESTNET API key from https://testnet.delta.exchange/
+   (API Management -> Create API Key -> enable Read Data + Trading)
+   (If you already have a key from the pivot algo, you can reuse the
+   SAME key here — just paste the same values into this folder's config.py)
+
+4. Open config.py in Notepad and paste your API key + secret in.
+
+5. Run it:
+   python trend_scalp_live.py
+
+FULL detailed instructions, troubleshooting, and explanations are in:
+Trend_Scalp_Complete_Setup_Guide.pdf
+
+Files in this folder:
+- config.py                  -> your API keys go here (keep private)
+- trend_scalp_indicators.py  -> EMA/VWAP/CVD calculations (used by the algo)
+- trend_scalp_live.py        -> the main trading logic (this is what you run)
+
+Log files (created automatically once you run it):
+- trend_trades_log.csv    -> every trade the algo takes
+- trend_live_state.json   -> remembers your open position between runs
+
+NOTE: This is a SEPARATE algo from the earlier "pivot ping-pong" one.
+You can run both at the same time in two different Command Prompt
+windows if you want — they use different file names so they won't clash.
