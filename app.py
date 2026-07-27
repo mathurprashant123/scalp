@@ -357,7 +357,12 @@ PAGE_TEMPLATE = """
 
     <script>
         function startAlgo() {
-            fetch('/start', {method:'POST'}).then(refreshStatus);
+            fetch('/start', {method:'POST'}).then(r => r.json()).then(data => {
+                if (data.already_running && data.message) {
+                    alert(data.message);
+                }
+                refreshStatus();
+            });
         }
         function stopAlgo() {
             fetch('/stop', {method:'POST'}).then(refreshStatus);
@@ -448,26 +453,43 @@ def index():
     return render_template_string(PAGE_TEMPLATE)
 
 
+start_lock = threading.Lock()
+
+
 @app.route("/start", methods=["POST"])
 def start():
-    if state_info["running"]:
-        return jsonify({"ok": True, "already_running": True})
+    with start_lock:
+        # Check the ACTUAL thread state, not just a flag — a flag can go
+        # stale (e.g. if the old thread is still finishing its current
+        # loop iteration after Stop was clicked, but hasn't set running=False
+        # yet). Starting a second thread while the old one is still alive
+        # causes TWO overlapping instances trading on the same account —
+        # exactly what caused the earlier duplicate-position incident.
+        old_thread = state_info.get("thread")
+        if old_thread is not None and old_thread.is_alive():
+            return jsonify({
+                "ok": False,
+                "already_running": True,
+                "message": "Previous run is still shutting down — please wait a few "
+                           "seconds and try Start again (this prevents two instances "
+                           "running at once).",
+            })
 
-    state_info["stop_event"] = threading.Event()
-    sys.stdout = WebLogRedirector()
+        state_info["stop_event"] = threading.Event()
+        sys.stdout = WebLogRedirector()
 
-    def run():
-        try:
-            algo.main_loop(stop_event=state_info["stop_event"])
-        except Exception as e:
-            log_queue.put(f"[FATAL ERROR] {e}")
-        finally:
-            state_info["running"] = False
+        def run():
+            try:
+                algo.main_loop(stop_event=state_info["stop_event"])
+            except Exception as e:
+                log_queue.put(f"[FATAL ERROR] {e}")
+            finally:
+                state_info["running"] = False
 
-    state_info["thread"] = threading.Thread(target=run, daemon=True)
-    state_info["running"] = True
-    state_info["thread"].start()
-    return jsonify({"ok": True})
+        state_info["thread"] = threading.Thread(target=run, daemon=True)
+        state_info["running"] = True
+        state_info["thread"].start()
+        return jsonify({"ok": True})
 
 
 @app.route("/stop", methods=["POST"])
@@ -480,7 +502,12 @@ def stop():
 
 @app.route("/status")
 def status():
-    return jsonify({"running": state_info["running"]})
+    # Derive from the actual thread object, not just the flag, so the UI
+    # never shows "stopped" while a thread is still genuinely alive (or
+    # vice versa) — keeps /start's liveness check and the UI in sync.
+    thread = state_info.get("thread")
+    truly_running = thread is not None and thread.is_alive()
+    return jsonify({"running": truly_running})
 
 
 @app.route("/logs")
