@@ -1057,6 +1057,52 @@ def manage_open_position(state, symbol_data):
         manage_bracket_position_b(state, pos, symbol_data)
         return
 
+    # ---- Logic A with an active exchange-side safety bracket: check FIRST
+    # whether that bracket already closed the position on the exchange
+    # (SL or TP triggered there) before relying on our own candle-based
+    # stop/target check below. This closes a real gap that was found in
+    # practice: the safety bracket correctly stopped out a losing trade,
+    # but this script's own local state kept showing the position as
+    # still open (since the candle-based check alone never "saw" the
+    # exchange-side close), leaving the dashboard stale and blocking new
+    # Logic A entries until a manual restart forced a reconciliation. ----
+    if pos.get("strategy") == "A" and pos.get("exchange_safety_stop_active"):
+        try:
+            live_pos = client.get_position(pos["product_id"])
+            size_now = float(live_pos.get("size", 0)) if isinstance(live_pos, dict) else pos["size"]
+        except Exception as e:
+            print(f"  [WARN] {sym}: couldn't check live position status against the "
+                  f"exchange ({e}) — will retry next loop, falling back to the "
+                  f"local candle-based stop/target check for now.")
+            size_now = pos["size"]  # assume still open this loop; try again next loop
+
+        if size_now == 0:
+            # The exchange-side safety bracket already closed this position
+            # (SL or TP triggered there). We don't get an exact fill price
+            # from this simple existence-check, so we log it using the
+            # current close price as a reasonable proxy — same approach
+            # already used for Logic B's equivalent bracket-closed case.
+            approx_exit_price = price
+            if side == "long":
+                approx_pnl_pct = (approx_exit_price - entry_price) / entry_price * 100
+            else:
+                approx_pnl_pct = (entry_price - approx_exit_price) / entry_price * 100
+            net_pnl_pct = estimate_net_pnl_pct(approx_pnl_pct, "A")
+            print(f"  {sym}: exchange-side safety bracket already closed this position "
+                  f"(SL or TP triggered there before the local check caught it). "
+                  f"Approx exit ~{approx_exit_price:.6f}, approx gross P&L: "
+                  f"{approx_pnl_pct:+.3f}% (approx net after fees: {net_pnl_pct:+.3f}%)")
+            log_trade_event(
+                time=str(datetime.now()), symbol=sym, action="CLOSE",
+                side=("sell" if side == "long" else "buy"), size=pos["size"],
+                reason="exchange_bracket_closed", entry_price=entry_price,
+                exit_price=approx_exit_price, approx_gross_pnl_pct=round(approx_pnl_pct, 4),
+                approx_net_pnl_pct_after_fees=round(net_pnl_pct, 4), fill_method="bracket",
+                strategy="A",
+            )
+            state["position"] = None
+            return
+
     # ---- Hard stop-loss / full target check first ----
     hit_stop = hit_target = False
     if side == "long":
