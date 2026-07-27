@@ -740,16 +740,44 @@ def reconcile_with_exchange(state, products):
                   f"Recomputing stop/target from current data since original signal "
                   f"candle isn't available.")
             df = fetch_candles(sym)
+            stop = target = None
             if df is not None and len(df) > SWING_LOOKBACK:
                 if side == "long":
-                    stop = df["low"].iloc[-SWING_LOOKBACK:].min() * (1 - STOP_BUFFER_PCT / 100)
-                    stop_dist_pct = (entry_price - stop) / entry_price * 100
-                    target = entry_price * (1 + (stop_dist_pct * RISK_REWARD_MULT) / 100)
+                    candidate_stop = df["low"].iloc[-SWING_LOOKBACK:].min() * (1 - STOP_BUFFER_PCT / 100)
+                    candidate_dist_pct = (entry_price - candidate_stop) / entry_price * 100
                 else:
-                    stop = df["high"].iloc[-SWING_LOOKBACK:].max() * (1 + STOP_BUFFER_PCT / 100)
-                    stop_dist_pct = (stop - entry_price) / entry_price * 100
-                    target = entry_price * (1 - (stop_dist_pct * RISK_REWARD_MULT) / 100)
-            else:
+                    candidate_stop = df["high"].iloc[-SWING_LOOKBACK:].max() * (1 + STOP_BUFFER_PCT / 100)
+                    candidate_dist_pct = (candidate_stop - entry_price) / entry_price * 100
+
+                # ---- Sanity check (BUG FIX) ----
+                # If price has moved significantly since the original real
+                # entry (e.g. rallied further before this restart/reconcile
+                # ran), the recent swing low/high can end up on the WRONG
+                # side of entry_price — e.g. a "swing low" that's actually
+                # ABOVE the long's entry price. That silently produces a
+                # NEGATIVE stop_dist_pct, which then flows into an INVERTED
+                # target (below entry for a long, above entry for a short).
+                # This actually happened in practice: the exchange safety
+                # bracket correctly rejected it as "immediate_execution"
+                # (since a stop already on the wrong side of price is
+                # trivially triggerable), but our own polling-loop stop/
+                # target check had no such guard and would have closed the
+                # position almost immediately against the wrong level.
+                # Fix: only use the swing-based level if it actually sits on
+                # the valid side of entry; otherwise fall back to the same
+                # safe percentage-based stop/target used when there isn't
+                # enough candle data at all.
+                if candidate_dist_pct > 0:
+                    stop = candidate_stop
+                    stop_dist_pct = candidate_dist_pct
+                    target = (entry_price * (1 + (stop_dist_pct * RISK_REWARD_MULT) / 100) if side == "long"
+                              else entry_price * (1 - (stop_dist_pct * RISK_REWARD_MULT) / 100))
+                else:
+                    print(f"    [WARN] Swing-based stop for {sym} came out on the WRONG side "
+                          f"of entry (price has likely moved a lot since the real entry) — "
+                          f"falling back to a safe percentage-based stop/target instead.")
+
+            if stop is None:
                 stop = entry_price * (0.99 if side == "long" else 1.01)
                 target = entry_price * (1.02 if side == "long" else 0.98)
 
