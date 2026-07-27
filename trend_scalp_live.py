@@ -62,6 +62,16 @@ SYMBOLS_TO_WATCH = [
 # ATR-based stop to clear that floor regularly.
 LOGIC_B_SYMBOLS = ["BTCUSD", "ETHUSD"]
 RISK_PER_TRADE_PCT = 1.5
+
+# Safety cap for Logic A: if a large slippage/gap on the real entry fill
+# makes the ACTUAL stop distance (relative to the real fill price) more
+# than this many times the stop distance the position size was originally
+# calculated for, the real dollar-risk on the trade has ballooned well
+# beyond what RISK_PER_TRADE_PCT was meant to cap — close the position
+# immediately instead of holding it. See look_for_entry_a() for where
+# this is used (found in practice: a 3% testnet slippage turned an
+# intended 0.51% risk into a realized 3.41% risk, a 6.7x blowup).
+MAX_SLIPPAGE_RISK_MULT = 2.0
 LEVERAGE = 10
 MARGIN_SAFETY_FACTOR = 0.90    # only use 90% of calculated max notional, leaves buffer
 EMA_PERIOD = 200
@@ -1578,6 +1588,12 @@ def look_for_entry_a(state, symbol_data, products):
         limit_price = (price * (1 - LIMIT_OFFSET_PCT / 100) if side == "long"
                        else price * (1 + LIMIT_OFFSET_PCT / 100))
 
+        # Remember the stop_dist_pct that position SIZE was actually sized
+        # for (via risk_amount / stop_dist_pct above) — needed after order
+        # placement to detect if a large slippage fill silently made the
+        # REAL risk much bigger than what this size was computed for.
+        intended_stop_dist_pct = stop_dist_pct
+
         resp, method = place_order_with_fallback(product["id"], order_side, size, limit_price)
 
         entry_order_id = resp.get("id") if isinstance(resp, dict) else None
@@ -1610,6 +1626,56 @@ def look_for_entry_a(state, symbol_data, products):
                 stop = swing_high(df, i) * (1 + STOP_BUFFER_PCT / 100)
                 stop_dist_pct = (stop - price_for_calc) / price_for_calc * 100
                 target = price_for_calc * (1 - (stop_dist_pct * RISK_REWARD_MULT) / 100)
+
+            # ---- Slippage risk-ballooning safety check (BUG FIX) ----
+            # Position SIZE above was computed assuming `intended_stop_dist_pct`
+            # (a small, tight risk % relative to the SIGNAL price). The swing-
+            # based stop is an ABSOLUTE price level that doesn't move just
+            # because the real fill came in far from the signal price — so if
+            # a large slippage/gap happens on entry (testnet price anomalies
+            # have been observed at 1-3%+), the REAL stop_dist_pct relative to
+            # the ACTUAL entry can balloon to several times what was intended,
+            # meaning the real dollar-risk on this trade is now much bigger
+            # than RISK_PER_TRADE_PCT of the account was ever meant to allow —
+            # this actually happened in practice (0.51% intended -> 3.41%
+            # realized, a 6.7x risk blowup, contributing to a real ~10%
+            # single-trade account loss that tripped the daily circuit
+            # breaker). Rather than holding a position whose real risk no
+            # longer matches what it was sized for, close it immediately here.
+            if stop_dist_pct > intended_stop_dist_pct * MAX_SLIPPAGE_RISK_MULT:
+                print(f"    [WARN] Real stop distance ({stop_dist_pct:.2f}%) is "
+                      f"{stop_dist_pct / intended_stop_dist_pct:.1f}x the intended "
+                      f"({intended_stop_dist_pct:.2f}%) this position's size was "
+                      f"calculated for — the slippage on this fill made the real "
+                      f"risk far bigger than sized for. Closing immediately instead "
+                      f"of holding an oversized-risk position.")
+                close_side = "sell" if side == "long" else "buy"
+                try:
+                    close_resp, close_method = place_order_with_fallback(
+                        product["id"], close_side, size, price_for_calc, reduce_only=True)
+                    exit_price = _extract_fill_price(close_resp) or price_for_calc
+                except Exception as e:
+                    print(f"    [WARN] Emergency close order failed ({e}) — falling back "
+                          f"to normal position tracking with the wide stop instead; "
+                          f"monitor this trade manually.")
+                    exit_price = None
+                if exit_price is not None:
+                    if side == "long":
+                        emergency_pnl_pct = (exit_price - price_for_calc) / price_for_calc * 100
+                    else:
+                        emergency_pnl_pct = (price_for_calc - exit_price) / price_for_calc * 100
+                    net_pnl_pct = estimate_net_pnl_pct(emergency_pnl_pct, "A")
+                    log_trade_event(
+                        time=str(datetime.now()), symbol=sym, action="CLOSE",
+                        side=close_side, size=size, reason="aborted_slippage_risk",
+                        entry_price=price_for_calc, exit_price=exit_price,
+                        approx_gross_pnl_pct=round(emergency_pnl_pct, 4),
+                        approx_net_pnl_pct_after_fees=round(net_pnl_pct, 4),
+                        fill_method=close_method, strategy="A",
+                    )
+                    print(f"    Closed immediately due to slippage risk. Approx P&L: "
+                          f"{emergency_pnl_pct:+.3f}% (net after fees: {net_pnl_pct:+.3f}%)")
+                    continue  # skip attaching a bracket / opening state["position"] below
 
         # ---- Safety-net exchange-side stop (NEW) ----
         # Logic A's staircase-trailing stop previously lived ONLY inside
