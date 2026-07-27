@@ -753,13 +753,36 @@ def reconcile_with_exchange(state, products):
                 stop = entry_price * (0.99 if side == "long" else 1.01)
                 target = entry_price * (1.02 if side == "long" else 0.98)
 
+            order_side = "buy" if side == "long" else "sell"
+            exchange_safety_stop_active = False
+            try:
+                place_bracket_with_retry(product["id"], sym, order_side, abs(size), stop, target, side)
+                exchange_safety_stop_active = True
+                print(f"    Exchange-side safety-net bracket attached for adopted "
+                      f"position: SL={stop:.6f} TP={target:.6f}")
+            except Exception as e:
+                print(f"    [WARN] Could not attach safety-net bracket for adopted "
+                      f"position ({e}) — will rely on the polling loop for this trade.")
+
             state["position"] = {
                 "symbol": sym, "product_id": product["id"], "side": side,
                 "size": abs(size), "original_size": abs(size),
                 "entry_price": entry_price, "stop": stop, "target": target,
                 "entry_time": str(datetime.now()), "milestones_locked": 0,
                 "max_progress": 0.0, "strategy": "A",
+                "entry_order_id": None,  # unknown for an adopted position — see note below
+                "exchange_safety_stop_active": exchange_safety_stop_active,
             }
+            # NOTE: entry_order_id is None here because we never placed the
+            # original entry order ourselves (it happened before this
+            # restart). This means later staircase-trailing updates to this
+            # particular bracket will be skipped (edit_bracket_order needs
+            # that id) — the exchange-side stop will stay frozen at this
+            # initial level rather than trailing. The bracket still fully
+            # protects the ORIGINAL stop level either way; it just won't
+            # ratchet tighter as profit builds, unlike bracketed positions
+            # opened normally by this script. Acceptable trade-off for a
+            # rare edge case (adopting a position after an unplanned restart).
 
     # Cancel any stray open orders for our watched products that don't
     # belong to a currently-tracked position (prevents duplicate-order buildup)
@@ -1050,6 +1073,23 @@ def manage_open_position(state, symbol_data):
             pos["stop"] = new_stop
             print(f"  {sym}: progress reached {pos['max_progress']:.2f} (>= {trigger}) -> "
                   f"stop moved to the {lock_level:.0%} level ({old_stop:.5f} -> {new_stop:.5f})")
+
+            # ---- Push the new stop level to the exchange-side safety-net
+            # bracket too (Logic A only), so the hard protection on Delta's
+            # server stays in sync with our staircase trailing — otherwise
+            # the exchange-side stop would sit frozen at the ORIGINAL level
+            # forever, defeating the point of trailing it. ----
+            if pos.get("strategy") == "A" and pos.get("exchange_safety_stop_active") and pos.get("entry_order_id"):
+                try:
+                    edit_bracket_order(
+                        pos["entry_order_id"], pos["product_id"], sym,
+                        new_stop, target)
+                    print(f"    Exchange-side safety-net bracket updated: SL -> {new_stop:.6f}")
+                except Exception as e:
+                    print(f"    [WARN] Could not update exchange-side safety bracket "
+                          f"({e}) — local staircase stop is still correct, but the "
+                          f"exchange-side hard stop may lag behind it until this "
+                          f"succeeds on a later loop.")
         pos["milestones_locked"] = i + 1
 
     state["position"] = pos  # persist progress-tracking updates
@@ -1107,6 +1147,17 @@ def _close_position(state, pos, price, reason, size):
           f"(approx net after fees: {net_pnl_pct:+.3f}%)")
     if strategy == "B":
         state["last_trade_close_time_b"] = time.time()
+    if strategy == "A" and pos.get("exchange_safety_stop_active"):
+        # The bracket's child orders are normally auto-cancelled by Delta
+        # once the position is fully flat, but clean up explicitly too —
+        # matches the existing "cancel stray leftover orders" pattern used
+        # elsewhere (harmless no-op via open_order_not_found if already gone).
+        try:
+            cancel_all_orders_for_product(pos["product_id"])
+        except Exception as e:
+            print(f"  [INFO] {sym}: cleanup of leftover safety-bracket orders "
+                  f"failed/no-op ({e}) — usually harmless, they're likely "
+                  f"already gone.")
     state["position"] = None
 
 
@@ -1455,6 +1506,13 @@ def look_for_entry_a(state, symbol_data, products):
 
         resp, method = place_order_with_fallback(product["id"], order_side, size, limit_price)
 
+        entry_order_id = resp.get("id") if isinstance(resp, dict) else None
+        if entry_order_id is None:
+            try:
+                entry_order_id = resp["result"].get("id")
+            except Exception:
+                entry_order_id = None
+
         # Get the AUTHORITATIVE entry price from the exchange's own position
         # record rather than guessing based on a slippage-percentage
         # threshold (see Logic B's identical fix for why — a genuinely
@@ -1479,12 +1537,37 @@ def look_for_entry_a(state, symbol_data, products):
                 stop_dist_pct = (stop - price_for_calc) / price_for_calc * 100
                 target = price_for_calc * (1 - (stop_dist_pct * RISK_REWARD_MULT) / 100)
 
+        # ---- Safety-net exchange-side stop (NEW) ----
+        # Logic A's staircase-trailing stop previously lived ONLY inside
+        # this script's own polling loop — if the process/service is ever
+        # down (deploy restart, Render free-tier sleep, crash) while a
+        # position is open, nothing would enforce the stop until the loop
+        # comes back. Attaching a bracket order here puts a hard stop on
+        # Delta's own server as a safety net, independent of this script
+        # staying alive. We reuse Logic B's proven bracket-order helpers.
+        # NOTE: unlike Logic B, we do NOT set "bracket_active" (that flag
+        # routes position management to manage_bracket_position_b(), which
+        # has ATR-trailing logic specific to Logic B) — this is purely a
+        # background safety net; our own staircase-trailing loop still
+        # drives the "real" stop level, and pushes updates to this
+        # exchange-side bracket via edit_bracket_order() whenever it moves.
+        exchange_safety_stop_active = False
+        try:
+            place_bracket_with_retry(product["id"], sym, order_side, size, stop, target, side)
+            exchange_safety_stop_active = True
+            print(f"    Exchange-side safety-net bracket attached: SL={stop:.6f} TP={target:.6f}")
+        except Exception as e:
+            print(f"    [WARN] Could not attach safety-net bracket ({e}) — this trade will "
+                  f"rely solely on the script's own polling loop for stop/target, same as before.")
+
         state["position"] = {
             "symbol": sym, "product_id": product["id"], "side": side,
             "size": size, "original_size": size,
             "entry_price": price_for_calc, "stop": stop, "target": target,
             "entry_time": str(datetime.now()), "milestones_locked": 0,
             "max_progress": 0.0, "strategy": "A",
+            "entry_order_id": entry_order_id,
+            "exchange_safety_stop_active": exchange_safety_stop_active,
         }
         log_trade_event(
             time=str(datetime.now()), symbol=sym, action="OPEN",
