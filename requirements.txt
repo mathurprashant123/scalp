@@ -2,3 +2,4 @@ flask
 pandas
 requests
 delta-rest-client
+python-dotenv

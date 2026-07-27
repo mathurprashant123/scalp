@@ -1,5 +1,5 @@
-config.py
+.env
 *.pyc
 __pycache__/
-trend_live_state.Json
+trend_live_state.json
 trend_trades_log*.csv
