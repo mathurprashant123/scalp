@@ -599,6 +599,38 @@ def get_bracket_stop_loss_order_id(product_id):
     return None
 
 
+def get_bracket_sl_tp_prices(product_id):
+    """
+    Fetches BOTH legs of an existing bracket order (if any) for this
+    product — the stop-loss trigger price and the take-profit trigger
+    price. Used after a restart to fingerprint which strategy (A or B)
+    an adopted, previously-untracked position most likely belongs to:
+    Logic A always uses a 2.5x reward:risk ratio (RISK_REWARD_MULT) and
+    Logic B always uses a fixed 2.0x ratio (TP_RR_MULT) — different
+    enough to distinguish reliably from the bracket's actual levels,
+    without needing any of the local state that a restart just wiped.
+    Returns (sl_price, tp_price), each None if that leg wasn't found.
+    """
+    try:
+        r = client.request("GET", "/v2/orders", {"product_ids": str(product_id),
+                                                   "states": "open,pending"}, auth=True)
+        orders = r.json().get("result", [])
+    except Exception as e:
+        print(f"  [WARN] Couldn't fetch open orders to read bracket SL/TP levels: {e}")
+        return None, None
+    sl_price = tp_price = None
+    for o in orders:
+        otype = o.get("stop_order_type")
+        trigger = o.get("stop_price")
+        if trigger is None:
+            continue
+        if otype == "stop_loss_order":
+            sl_price = float(trigger)
+        elif otype == "take_profit_order":
+            tp_price = float(trigger)
+    return sl_price, tp_price
+
+
 def edit_bracket_order(order_id, product_id, product_symbol, sl_price, tp_price,
                         trigger_method="last_traded_price"):
     """
@@ -716,6 +748,59 @@ def place_order_with_fallback(product_id, side, size, limit_price, reduce_only=F
 # the local JSON file, before doing anything else.
 # ============================================================
 
+def guess_strategy_for_adopted_position(sym, product_id, entry_price, side):
+    """
+    After a restart, an untracked-but-real open position could have been
+    opened by EITHER Logic A or Logic B (both share the single position
+    slot). Guessing wrong matters: each has a different stop/target
+    formula and different ongoing management (A's staircase-trailing vs
+    B's ATR-expansion trailing + bracket), so misclassifying a real B
+    trade as A (or vice versa) would manage it with the wrong logic
+    entirely. Since a restart wipes the local state that would have said
+    which one it was, this reconstructs a best-effort answer from what's
+    still knowable on the exchange itself:
+
+      1. Symbol restriction: Logic B ONLY trades LOGIC_B_SYMBOLS (BTC/ETH).
+         Any other symbol can only be a Logic A position — no guessing
+         needed there.
+      2. For BTC/ETH: if a bracket order is still attached, its actual
+         reward:risk ratio fingerprints which strategy set it — Logic A
+         always targets RISK_REWARD_MULT (2.5x), Logic B always targets
+         TP_RR_MULT (2.0x). Whichever is closer wins.
+      3. If neither of the above resolves it (no symbol restriction hit,
+         and no bracket found to fingerprint), fall back to the current
+         LOGIC_MODE setting: if only one logic is active, it must be that
+         one. If both are active and there's truly no other signal, default
+         to Logic A but print a loud warning so this can be checked manually.
+    """
+    if sym not in LOGIC_B_SYMBOLS:
+        return "A"
+
+    sl_price, tp_price = get_bracket_sl_tp_prices(product_id)
+    if sl_price is not None and tp_price is not None:
+        risk = abs(entry_price - sl_price)
+        reward = abs(tp_price - entry_price)
+        if risk > 0:
+            ratio = reward / risk
+            dist_to_a = abs(ratio - RISK_REWARD_MULT)
+            dist_to_b = abs(ratio - TP_RR_MULT)
+            guess = "B" if dist_to_b < dist_to_a else "A"
+            print(f"    Strategy fingerprint for {sym}: existing bracket reward:risk "
+                  f"ratio is {ratio:.2f} (A targets {RISK_REWARD_MULT}x, B targets "
+                  f"{TP_RR_MULT}x) -> guessing Logic {guess}.")
+            return guess
+
+    mode = LOGIC_MODE.get("active", "BOTH")
+    if mode == "A":
+        return "A"
+    if mode == "B":
+        return "B"
+    print(f"    [WARN] Couldn't fingerprint {sym} (no bracket found and both logics "
+          f"are active) — defaulting to Logic A as a guess. Please verify manually "
+          f"against the exchange's own order history if this matters.")
+    return "A"
+
+
 def reconcile_with_exchange(state, products):
     print("\n--- Startup reconciliation: checking real exchange state ---")
 
@@ -749,78 +834,126 @@ def reconcile_with_exchange(state, products):
             print(f"  Adopting untracked real position: {sym} {side} @ {entry_price}. "
                   f"Recomputing stop/target from current data since original signal "
                   f"candle isn't available.")
-            df = fetch_candles(sym)
-            stop = target = None
-            if df is not None and len(df) > SWING_LOOKBACK:
-                if side == "long":
-                    candidate_stop = df["low"].iloc[-SWING_LOOKBACK:].min() * (1 - STOP_BUFFER_PCT / 100)
-                    candidate_dist_pct = (entry_price - candidate_stop) / entry_price * 100
-                else:
-                    candidate_stop = df["high"].iloc[-SWING_LOOKBACK:].max() * (1 + STOP_BUFFER_PCT / 100)
-                    candidate_dist_pct = (candidate_stop - entry_price) / entry_price * 100
-
-                # ---- Sanity check (BUG FIX) ----
-                # If price has moved significantly since the original real
-                # entry (e.g. rallied further before this restart/reconcile
-                # ran), the recent swing low/high can end up on the WRONG
-                # side of entry_price — e.g. a "swing low" that's actually
-                # ABOVE the long's entry price. That silently produces a
-                # NEGATIVE stop_dist_pct, which then flows into an INVERTED
-                # target (below entry for a long, above entry for a short).
-                # This actually happened in practice: the exchange safety
-                # bracket correctly rejected it as "immediate_execution"
-                # (since a stop already on the wrong side of price is
-                # trivially triggerable), but our own polling-loop stop/
-                # target check had no such guard and would have closed the
-                # position almost immediately against the wrong level.
-                # Fix: only use the swing-based level if it actually sits on
-                # the valid side of entry; otherwise fall back to the same
-                # safe percentage-based stop/target used when there isn't
-                # enough candle data at all.
-                if candidate_dist_pct > 0:
-                    stop = candidate_stop
-                    stop_dist_pct = candidate_dist_pct
-                    target = (entry_price * (1 + (stop_dist_pct * RISK_REWARD_MULT) / 100) if side == "long"
-                              else entry_price * (1 - (stop_dist_pct * RISK_REWARD_MULT) / 100))
-                else:
-                    print(f"    [WARN] Swing-based stop for {sym} came out on the WRONG side "
-                          f"of entry (price has likely moved a lot since the real entry) — "
-                          f"falling back to a safe percentage-based stop/target instead.")
-
-            if stop is None:
-                stop = entry_price * (0.99 if side == "long" else 1.01)
-                target = entry_price * (1.02 if side == "long" else 0.98)
+            guessed_strategy = guess_strategy_for_adopted_position(sym, product["id"], entry_price, side)
+            print(f"    Guessed strategy for this adopted position: Logic {guessed_strategy}")
 
             order_side = "buy" if side == "long" else "sell"
-            exchange_safety_stop_active = False
-            try:
-                place_bracket_with_retry(product["id"], sym, order_side, abs(size), stop, target, side)
-                exchange_safety_stop_active = True
-                print(f"    Exchange-side safety-net bracket attached for adopted "
-                      f"position: SL={stop:.6f} TP={target:.6f}")
-            except Exception as e:
-                print(f"    [WARN] Could not attach safety-net bracket for adopted "
-                      f"position ({e}) — will rely on the polling loop for this trade.")
 
-            state["position"] = {
-                "symbol": sym, "product_id": product["id"], "side": side,
-                "size": abs(size), "original_size": abs(size),
-                "entry_price": entry_price, "stop": stop, "target": target,
-                "entry_time": str(datetime.now()), "milestones_locked": 0,
-                "max_progress": 0.0, "strategy": "A",
-                "entry_order_id": None,  # unknown for an adopted position — see note below
-                "exchange_safety_stop_active": exchange_safety_stop_active,
-            }
-            # NOTE: entry_order_id is None here because we never placed the
-            # original entry order ourselves (it happened before this
-            # restart). This means later staircase-trailing updates to this
-            # particular bracket will be skipped (edit_bracket_order needs
-            # that id) — the exchange-side stop will stay frozen at this
-            # initial level rather than trailing. The bracket still fully
-            # protects the ORIGINAL stop level either way; it just won't
-            # ratchet tighter as profit builds, unlike bracketed positions
-            # opened normally by this script. Acceptable trade-off for a
-            # rare edge case (adopting a position after an unplanned restart).
+            if guessed_strategy == "B":
+                # ---- Logic B formula: ATR-based stop (with the same
+                # percentage floor used at normal entry), TP forced to a
+                # fixed TP_RR_MULT reward:risk ratio off that distance. ----
+                df_b = fetch_candles(sym, resolution="1m")
+                stop = target = None
+                entry_atr = None
+                if df_b is not None and len(df_b) > ATR_PERIOD:
+                    df_b = compute_atr(df_b, period=ATR_PERIOD)
+                    entry_atr = float(df_b["atr"].iloc[-1])
+                    raw_dist_pct = (entry_atr * SL_ATR_MULT) / entry_price * 100
+                    stop_dist_pct = max(raw_dist_pct, MIN_STOP_DIST_PCT_B)
+                    sl_dist = entry_price * (stop_dist_pct / 100)
+                    tp_dist = sl_dist * TP_RR_MULT
+                    stop = entry_price - sl_dist if side == "long" else entry_price + sl_dist
+                    target = entry_price + tp_dist if side == "long" else entry_price - tp_dist
+                if stop is None:
+                    # Couldn't fetch fresh ATR data — safe percentage fallback
+                    stop = entry_price * (0.99 if side == "long" else 1.01)
+                    target = entry_price * (1.02 if side == "long" else 0.98)
+                    entry_atr = 0.0
+
+                bracket_active = False
+                try:
+                    place_bracket_with_retry(product["id"], sym, order_side, abs(size), stop, target, side)
+                    bracket_active = True
+                    print(f"    Exchange-side bracket attached for adopted Logic B "
+                          f"position: SL={stop:.6f} TP={target:.6f}")
+                except Exception as e:
+                    print(f"    [WARN] Could not attach bracket for adopted Logic B "
+                          f"position ({e}) — will rely on the polling loop for this trade.")
+
+                state["position"] = {
+                    "symbol": sym, "product_id": product["id"], "side": side,
+                    "size": abs(size), "original_size": abs(size),
+                    "entry_price": entry_price, "stop": stop, "target": target,
+                    "entry_time": str(datetime.now()), "strategy": "B",
+                    "entry_order_id": None, "bracket_active": bracket_active,
+                    "entry_atr": entry_atr, "extreme_price": entry_price,
+                    "r_basis": abs(entry_price - stop), "early_exit_done": False,
+                }
+            else:
+                print(f"    Recomputing stop/target from current data since original "
+                      f"signal candle isn't available.")
+                df = fetch_candles(sym)
+                stop = target = None
+                if df is not None and len(df) > SWING_LOOKBACK:
+                    if side == "long":
+                        candidate_stop = df["low"].iloc[-SWING_LOOKBACK:].min() * (1 - STOP_BUFFER_PCT / 100)
+                        candidate_dist_pct = (entry_price - candidate_stop) / entry_price * 100
+                    else:
+                        candidate_stop = df["high"].iloc[-SWING_LOOKBACK:].max() * (1 + STOP_BUFFER_PCT / 100)
+                        candidate_dist_pct = (candidate_stop - entry_price) / entry_price * 100
+
+                    # ---- Sanity check (BUG FIX) ----
+                    # If price has moved significantly since the original real
+                    # entry (e.g. rallied further before this restart/reconcile
+                    # ran), the recent swing low/high can end up on the WRONG
+                    # side of entry_price — e.g. a "swing low" that's actually
+                    # ABOVE the long's entry price. That silently produces a
+                    # NEGATIVE stop_dist_pct, which then flows into an INVERTED
+                    # target (below entry for a long, above entry for a short).
+                    # This actually happened in practice: the exchange safety
+                    # bracket correctly rejected it as "immediate_execution"
+                    # (since a stop already on the wrong side of price is
+                    # trivially triggerable), but our own polling-loop stop/
+                    # target check had no such guard and would have closed the
+                    # position almost immediately against the wrong level.
+                    # Fix: only use the swing-based level if it actually sits on
+                    # the valid side of entry; otherwise fall back to the same
+                    # safe percentage-based stop/target used when there isn't
+                    # enough candle data at all.
+                    if candidate_dist_pct > 0:
+                        stop = candidate_stop
+                        stop_dist_pct = candidate_dist_pct
+                        target = (entry_price * (1 + (stop_dist_pct * RISK_REWARD_MULT) / 100) if side == "long"
+                                  else entry_price * (1 - (stop_dist_pct * RISK_REWARD_MULT) / 100))
+                    else:
+                        print(f"    [WARN] Swing-based stop for {sym} came out on the WRONG side "
+                              f"of entry (price has likely moved a lot since the real entry) — "
+                              f"falling back to a safe percentage-based stop/target instead.")
+
+                if stop is None:
+                    stop = entry_price * (0.99 if side == "long" else 1.01)
+                    target = entry_price * (1.02 if side == "long" else 0.98)
+
+                exchange_safety_stop_active = False
+                try:
+                    place_bracket_with_retry(product["id"], sym, order_side, abs(size), stop, target, side)
+                    exchange_safety_stop_active = True
+                    print(f"    Exchange-side safety-net bracket attached for adopted "
+                          f"position: SL={stop:.6f} TP={target:.6f}")
+                except Exception as e:
+                    print(f"    [WARN] Could not attach safety-net bracket for adopted "
+                          f"position ({e}) — will rely on the polling loop for this trade.")
+
+                state["position"] = {
+                    "symbol": sym, "product_id": product["id"], "side": side,
+                    "size": abs(size), "original_size": abs(size),
+                    "entry_price": entry_price, "stop": stop, "target": target,
+                    "entry_time": str(datetime.now()), "milestones_locked": 0,
+                    "max_progress": 0.0, "strategy": "A",
+                    "entry_order_id": None,  # unknown for an adopted position — see note below
+                    "exchange_safety_stop_active": exchange_safety_stop_active,
+                }
+                # NOTE: entry_order_id is None here because we never placed the
+                # original entry order ourselves (it happened before this
+                # restart). This means later staircase-trailing updates to this
+                # particular bracket will be skipped (edit_bracket_order needs
+                # that id) — the exchange-side stop will stay frozen at this
+                # initial level rather than trailing. The bracket still fully
+                # protects the ORIGINAL stop level either way; it just won't
+                # ratchet tighter as profit builds, unlike bracketed positions
+                # opened normally by this script. Acceptable trade-off for a
+                # rare edge case (adopting a position after an unplanned restart).
 
     # Cancel any stray open orders for our watched products that don't
     # belong to a currently-tracked position (prevents duplicate-order buildup)
