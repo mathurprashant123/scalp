@@ -180,9 +180,35 @@ client = DeltaRestClient(base_url=config.BASE_URL, api_key=config.API_KEY, api_s
 
 TRADE_LOG_COLUMNS = [
     "time", "symbol", "action", "side", "size", "entry_price", "exit_price",
-    "stop", "target", "reason", "approx_gross_pnl_pct", "fill_method",
+    "stop", "target", "reason", "approx_gross_pnl_pct",
+    "approx_net_pnl_pct_after_fees", "fill_method",
     "order_response", "strategy",
 ]
+
+
+def estimate_net_pnl_pct(gross_pnl_pct, strategy):
+    """
+    Rough fee-adjusted P&L estimate for REPORTING/AWARENESS only — this does
+    NOT filter or block any trade, it just subtracts an assumed round-trip
+    fee from the gross P&L so the trades log shows both numbers side by
+    side. This lets us judge, from real trade history, how much fees are
+    actually eating into Logic B's results before deciding whether to
+    change anything about its entries.
+
+    Assumption used (approximate, not exact per-trade):
+      - Logic A: assumed maker fee both legs (its normal entry path is
+        LIMIT-first) -> ROUND_TRIP_FEE_PCT. If a trade actually fell back
+        to a market fill on one or both legs, real fees were higher than
+        this estimate — this is a best-case approximation, not exact.
+      - Logic B: ALWAYS uses market/bracket orders (taker fee) on both
+        entry and exit -> taker round-trip (TAKER_FEE_PCT * 2). This one
+        should be fairly accurate since Logic B's execution path is fixed.
+    """
+    if strategy == "B":
+        round_trip_fee_pct = TAKER_FEE_PCT * 2
+    else:
+        round_trip_fee_pct = ROUND_TRIP_FEE_PCT
+    return gross_pnl_pct - round_trip_fee_pct
 
 
 def log_trade_event(**fields):
@@ -816,14 +842,17 @@ def manage_bracket_position_b(state, pos, symbol_data):
             approx_pnl_pct = (current_price - entry_price) / entry_price * 100
         else:
             approx_pnl_pct = (entry_price - current_price) / entry_price * 100
+        net_pnl_pct = estimate_net_pnl_pct(approx_pnl_pct, "B")
         print(f"  {sym}: bracket order already closed this position on the exchange "
               f"(SL or TP triggered). Approx exit ~{current_price:.6f}, "
-              f"approx gross P&L: {approx_pnl_pct:+.3f}%")
+              f"approx gross P&L: {approx_pnl_pct:+.3f}% "
+              f"(approx net after fees: {net_pnl_pct:+.3f}%)")
         log_trade_event(
             time=str(datetime.now()), symbol=sym, action="CLOSE",
             side=("sell" if side == "long" else "buy"), size=pos["size"],
             reason="bracket_closed", entry_price=entry_price, exit_price=current_price,
-            approx_gross_pnl_pct=round(approx_pnl_pct, 4), fill_method="bracket",
+            approx_gross_pnl_pct=round(approx_pnl_pct, 4),
+            approx_net_pnl_pct_after_fees=round(net_pnl_pct, 4), fill_method="bracket",
             strategy="B",
         )
         state["last_trade_close_time_b"] = time.time()
@@ -884,13 +913,17 @@ def manage_bracket_position_b(state, pos, symbol_data):
                     entry_price = pos["entry_price"]
                     pnl_pct = ((current_price - entry_price) / entry_price * 100 if side == "long"
                                else (entry_price - current_price) / entry_price * 100)
+                    net_pnl_pct = estimate_net_pnl_pct(pnl_pct, "B")
                     log_trade_event(
                         time=str(datetime.now()), symbol=sym, action="CLOSE",
                         side=("sell" if side == "long" else "buy"), size=pos["size"],
                         reason="early_exit_1R", entry_price=entry_price, exit_price=current_price,
-                        approx_gross_pnl_pct=round(pnl_pct, 4), fill_method=method, strategy="B",
+                        approx_gross_pnl_pct=round(pnl_pct, 4),
+                        approx_net_pnl_pct_after_fees=round(net_pnl_pct, 4),
+                        fill_method=method, strategy="B",
                     )
-                    print(f"  {sym}: CLOSED early at 1R, approx gross P&L: {pnl_pct:+.3f}%")
+                    print(f"  {sym}: CLOSED early at 1R, approx gross P&L: {pnl_pct:+.3f}% "
+                          f"(approx net after fees: {net_pnl_pct:+.3f}%)")
                     state["last_trade_close_time_b"] = time.time()
                     state["position"] = None
                     return
@@ -1059,16 +1092,19 @@ def _close_position(state, pos, price, reason, size):
     # instead of summing our own computed P&L here — more robust against
     # any internal calculation bugs.
 
+    net_pnl_pct = estimate_net_pnl_pct(gross_pnl_pct, strategy)
     log_trade_event(
         time=str(datetime.now()), symbol=sym, action="CLOSE",
         side=close_side, size=size, reason=reason,
         entry_price=entry_price, exit_price=price,
         approx_gross_pnl_pct=round(gross_pnl_pct, 4),
+        approx_net_pnl_pct_after_fees=round(net_pnl_pct, 4),
         fill_method=method, order_response=json.dumps(resp),
         strategy=pos.get("strategy", "A"),
     )
     print(f"  CLOSED {sym} due to {reason} (filled via {method}), "
-          f"approx gross P&L: {gross_pnl_pct:+.3f}%")
+          f"approx gross P&L: {gross_pnl_pct:+.3f}% "
+          f"(approx net after fees: {net_pnl_pct:+.3f}%)")
     if strategy == "B":
         state["last_trade_close_time_b"] = time.time()
     state["position"] = None

@@ -80,7 +80,7 @@ def reconstruct_trades(strategy="A"):
                 "size": row.get("size"),
                 "partials": [],
                 "exit_price": None, "exit_time": None,
-                "reason": None, "pnl_pct": None, "status": "OPEN",
+                "reason": None, "pnl_pct": None, "net_pnl_pct": None, "status": "OPEN",
             }
             trades.append(current)
         elif action == "PARTIAL_CLOSE" and current is not None and current["symbol"] == sym:
@@ -93,6 +93,7 @@ def reconstruct_trades(strategy="A"):
             current["exit_time"] = row.get("time")
             current["reason"] = row.get("reason")
             current["pnl_pct"] = row.get("approx_gross_pnl_pct")
+            current["net_pnl_pct"] = row.get("approx_net_pnl_pct_after_fees")
             current["status"] = "CLOSED"
             current = None  # ready for next OPEN
 
@@ -150,7 +151,8 @@ TRADES_PAGE_TEMPLATE = """
     <div class="summary-box">
         <div>Total Closed Trades: <b>{{ total_trades }}</b></div>
         <div>Wins: <span class="pos">{{ wins }}</span> &nbsp;|&nbsp; Losses: <span class="neg">{{ losses }}</span></div>
-        <div>Cumulative P&amp;L: <span class="{{ 'pos' if cum_pnl >= 0 else 'neg' }}">{{ '%.3f'|format(cum_pnl) }}%</span></div>
+        <div>Cumulative Gross P&amp;L: <span class="{{ 'pos' if cum_pnl >= 0 else 'neg' }}">{{ '%.3f'|format(cum_pnl) }}%</span></div>
+        <div>Cumulative Net P&amp;L (after est. fees): <span class="{{ 'pos' if cum_net_pnl >= 0 else 'neg' }}">{{ '%.3f'|format(cum_net_pnl) }}%</span></div>
     </div>
 
     <h2>Day-by-Day Summary</h2>
@@ -168,7 +170,7 @@ TRADES_PAGE_TEMPLATE = """
     <table>
         <tr>
             <th>Entry Time</th><th>Symbol</th><th>Side</th><th>Entry Price</th>
-            <th>Exit Price</th><th>Exit Time</th><th>Reason</th><th>P&amp;L %</th><th>Status</th>
+            <th>Exit Price</th><th>Exit Time</th><th>Reason</th><th>Gross P&amp;L %</th><th>Net P&amp;L % (est. fees)</th><th>Status</th>
         </tr>
         {% for t in trades|reverse %}
         <tr class="{{ 'open' if t.status=='OPEN' else ('win' if (t.pnl_pct and t.pnl_pct|float >= 0) else 'loss') }}">
@@ -180,6 +182,7 @@ TRADES_PAGE_TEMPLATE = """
             <td>{{ t.exit_time if t.exit_time else '—' }}</td>
             <td>{{ t.reason if t.reason else '—' }}</td>
             <td>{{ '%.3f'|format(t.pnl_pct|float) + '%' if t.pnl_pct else '—' }}</td>
+            <td>{{ '%.3f'|format(t.net_pnl_pct|float) + '%' if t.net_pnl_pct else '—' }}</td>
             <td>{{ t.status }}</td>
         </tr>
         {% endfor %}
@@ -238,6 +241,7 @@ def trades_page():
     wins = sum(1 for t in closed if t["pnl_pct"] and float(t["pnl_pct"]) >= 0)
     losses = len(closed) - wins
     cum_pnl = sum(float(t["pnl_pct"]) for t in closed if t["pnl_pct"])
+    cum_net_pnl = sum(float(t["net_pnl_pct"]) for t in closed if t["net_pnl_pct"])
 
     day_summary = {}
     for t in closed:
@@ -254,7 +258,7 @@ def trades_page():
 
     return render_template_string(
         TRADES_PAGE_TEMPLATE, trades=trades, total_trades=len(closed),
-        wins=wins, losses=losses, cum_pnl=cum_pnl, day_summary=day_summary,
+        wins=wins, losses=losses, cum_pnl=cum_pnl, cum_net_pnl=cum_net_pnl, day_summary=day_summary,
         csv_path=path or "not found yet", strategy=strategy)
 
 
