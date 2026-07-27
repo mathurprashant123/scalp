@@ -25,12 +25,54 @@ import queue
 import time
 from datetime import datetime
 
-from flask import Flask, render_template_string, jsonify
+from flask import Flask, render_template_string, jsonify, request, Response
 
 import csv as csv_module
 import trend_scalp_live as algo
 
 app = Flask(__name__)
+
+# ============================================================
+# PASSWORD PROTECTION (HTTP Basic Auth)
+# ============================================================
+# The Render URL is public on the internet by default — anyone who has
+# (or guesses) the URL can open the dashboard, click Start/Stop, reset
+# the circuit breaker, or clear trade logs. This adds a simple username +
+# password prompt (the browser's built-in login popup) in front of EVERY
+# page/route in this app, so only someone who knows the credentials can
+# use it.
+#
+# Credentials are read from environment variables (NOT hardcoded here,
+# same pattern as the API keys in config.py) so this file stays safe to
+# commit to a public or private GitHub repo either way:
+#   - Locally: set them in your .env file
+#   - On Render: set them under Settings -> Environment as
+#     DASHBOARD_USERNAME and DASHBOARD_PASSWORD
+DASHBOARD_USERNAME = os.getenv("DASHBOARD_USERNAME", "")
+DASHBOARD_PASSWORD = os.getenv("DASHBOARD_PASSWORD", "")
+
+if not DASHBOARD_USERNAME or not DASHBOARD_PASSWORD:
+    print("[WARN] DASHBOARD_USERNAME / DASHBOARD_PASSWORD are not set — "
+          "the dashboard will run WITHOUT password protection. Set them "
+          "under Render -> Settings -> Environment to secure it.")
+
+
+@app.before_request
+def require_login():
+    # If credentials aren't configured, skip auth entirely (so local dev
+    # without a .env still works) — but this means it's WIDE OPEN, so
+    # always set these in production (Render).
+    if not DASHBOARD_USERNAME or not DASHBOARD_PASSWORD:
+        return None
+
+    auth = request.authorization
+    if not auth or auth.username != DASHBOARD_USERNAME or auth.password != DASHBOARD_PASSWORD:
+        return Response(
+            "Login required to view this dashboard.",
+            401,
+            {"WWW-Authenticate": 'Basic realm="Trend-Scalp Dashboard"'},
+        )
+    return None
 
 log_queue = queue.Queue()
 log_buffer = []  # keeps full history for the page (capped)
