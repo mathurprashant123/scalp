@@ -577,7 +577,7 @@ def place_bracket_order_raw(product_id, product_symbol, side, size, sl_price, tp
     return client.request("POST", "/v2/orders/bracket", body, auth=True)
 
 
-def get_bracket_stop_loss_order_id(product_id):
+def get_bracket_stop_loss_order_id(product_id, retries=3, delay=2):
     """
     Finds the ACTUAL stop-loss leg order that Delta created when the
     bracket was attached (a separate resting/pending order, distinct from
@@ -585,17 +585,29 @@ def get_bracket_stop_loss_order_id(product_id):
     'closed' state, so its id can't be used to edit the bracket: Delta
     rejects that with 'open_order_not_found'). Returns the order id of
     the open/pending stop_loss_order for this product, or None if not found.
+
+    Retries a few times with a short delay on failure — this call was
+    observed hitting transient CloudFront-level 403s (generic "too much
+    traffic" CDN errors, not a Delta-specific auth/permission error),
+    which a short retry can ride out rather than immediately falling back
+    to the more disruptive cancel+recreate path below.
     """
-    try:
-        r = client.request("GET", "/v2/orders", {"product_ids": str(product_id),
-                                                   "states": "open,pending"}, auth=True)
-        orders = r.json().get("result", [])
-    except Exception as e:
-        print(f"  [WARN] Couldn't fetch open orders to find bracket's stop-loss leg: {e}")
-        return None
-    for o in orders:
-        if o.get("stop_order_type") == "stop_loss_order":
-            return o.get("id")
+    last_error = None
+    for attempt in range(retries):
+        try:
+            r = client.request("GET", "/v2/orders", {"product_ids": str(product_id),
+                                                       "states": "open,pending"}, auth=True)
+            orders = r.json().get("result", [])
+            for o in orders:
+                if o.get("stop_order_type") == "stop_loss_order":
+                    return o.get("id")
+            return None  # request succeeded, just no matching order found
+        except Exception as e:
+            last_error = e
+            if attempt < retries - 1:
+                time.sleep(delay)
+    print(f"  [WARN] Couldn't fetch open orders to find bracket's stop-loss leg "
+          f"after {retries} attempts: {last_error}")
     return None
 
 
@@ -735,6 +747,42 @@ def place_order_with_fallback(product_id, side, size, limit_price, reduce_only=F
             client.cancel_order(product_id, order_id)
         except Exception as e:
             print(f"  [WARN] cancel failed (may have filled in the meantime): {e}")
+
+        # ---- Verify the cancel actually took effect (BUG FIX) ----
+        # cancel_order() not raising an exception doesn't guarantee Delta
+        # actually removed the order — this was observed in practice:
+        # repeated close attempts each left a NEW stray reduce-only limit
+        # order resting on the exchange (multiple showed up simultaneously
+        # in "Open Orders"), while the market-order fallback kept failing
+        # with "out_of_bankruptcy" — almost certainly because these
+        # accumulating stray reduce-only orders confused Delta's margin/
+        # bankruptcy-price calculation for the position. Explicitly
+        # verify and retry the cancel a couple of times before moving on.
+        for _ in range(3):
+            still_open = _order_is_still_open(product_id, order_id)
+            if still_open is not True:
+                break
+            print(f"  [WARN] Limit order {order_id} still shows as open after "
+                  f"cancel — retrying cancel.")
+            time.sleep(2)
+            try:
+                client.cancel_order(product_id, order_id)
+            except Exception as e:
+                print(f"  [WARN] retry cancel failed: {e}")
+
+    # ---- Sweep ANY other stray orders left on this product (BUG FIX) ----
+    # Defensive cleanup regardless of whether the single cancel above
+    # looked successful — earlier failed close attempts (e.g. from a
+    # previous loop iteration hitting a transient error) can leave
+    # additional stray reduce-only orders behind that the single
+    # cancel_order() call above wouldn't touch. A hard sweep here avoids
+    # letting them pile up and interfere with the market fallback below.
+    try:
+        cancel_all_orders_for_product(product_id)
+    except Exception as e:
+        print(f"  [WARN] Sweep of stray orders on product {product_id} failed "
+              f"({e}) — continuing anyway, market order may still fail if "
+              f"stray orders remain.")
 
     market_order = {"product_id": product_id, "size": size, "side": side, "order_type": "market_order"}
     if reduce_only:
