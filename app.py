@@ -283,6 +283,36 @@ def reset_abnormal_fill_breaker():
     return jsonify({"ok": True, "message": "Abnormal-fill breaker reset. New entries allowed again."})
 
 
+@app.route("/force_clear_position", methods=["POST"])
+def force_clear_position():
+    """EMERGENCY escape hatch. Clears this script's LOCAL tracking of an
+    open position — it does NOT touch anything on the exchange itself.
+
+    Use this only when a position is genuinely stuck (e.g. the exchange
+    itself is rejecting every close attempt with something like
+    'out_of_bankruptcy', usually caused by corrupted/glitched testnet
+    price data on that specific position) and you've decided to deal
+    with the real position on the exchange separately (manually, or via
+    exchange support), rather than have it keep blocking this script from
+    taking any new trades (since only one position is ever tracked at a
+    time by design).
+
+    After using this, the bot will believe it's flat and resume scanning
+    for new entries. If the real position on the exchange is still open,
+    the next restart's reconciliation will find it again and re-adopt it
+    — so this is meant as a temporary unblock, not a permanent fix for
+    whatever is stuck on the exchange side."""
+    state = algo.load_state()
+    had_position = state.get("position") is not None
+    state["position"] = None
+    algo.save_state(state)
+    msg = ("Local position tracking cleared — the bot will resume scanning for new "
+           "trades. Remember: this did NOT close anything on the exchange itself; "
+           "if a real position is still open there, handle it separately." if had_position
+           else "No position was being tracked locally — nothing to clear.")
+    return jsonify({"ok": True, "message": msg})
+
+
 @app.route("/clear_trades_log", methods=["POST"])
 def clear_trades_log():
     """Deletes the trades log CSV (for the given strategy) from both
@@ -425,6 +455,10 @@ PAGE_TEMPLATE = """
                 padding:8px 18px; border-radius:6px; cursor:pointer; font-size:13px; margin-left:8px;">
             &#9888; Reset Abnormal-Fill Breaker
         </button>
+        <button onclick="forceClearPosition()" style="background:#333333; color:white; border:2px solid #ff4444;
+                padding:8px 18px; border-radius:6px; cursor:pointer; font-size:13px; margin-left:8px;">
+            &#9940; Force-Clear Stuck Position (emergency)
+        </button>
     </div>
     <script>
         function resetBreaker() {
@@ -442,6 +476,12 @@ PAGE_TEMPLATE = """
         function resetAbnormalFillBreaker() {
             if (!confirm('Ye tabhi reset karo jab tumne exchange ke Order History mein dekh liya ho ki abnormal fill kya thi. Sure?')) return;
             fetch('/reset_abnormal_fill_breaker', {method:'POST'}).then(r => r.json()).then(data => {
+                alert(data.message || 'Done');
+            });
+        }
+        function forceClearPosition() {
+            if (!confirm('EMERGENCY: Ye sirf LOCAL tracking clear karega, exchange par kuch close NAHI hoga. Sirf tab use karo jab position genuinely stuck ho (out_of_bankruptcy jaisa error) aur exchange par usse alag se, manually deal karna decide kar liya ho. Sure?')) return;
+            fetch('/force_clear_position', {method:'POST'}).then(r => r.json()).then(data => {
                 alert(data.message || 'Done');
             });
         }
