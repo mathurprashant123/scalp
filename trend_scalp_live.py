@@ -47,12 +47,15 @@ from trend_scalp_indicators import (compute_ema, compute_vwap, compute_cvd, cvd_
 
 # ---------------- SETTINGS ----------------
 SYMBOLS_TO_WATCH = [
-    # Only symbols CONFIRMED available on your testnet account (verified from
-    # your logs — LINKUSD/AVAXUSD/DOTUSD/NEARUSD exist on production but not
-    # on this testnet, which would crash order placement if they ever
-    # triggered a signal). Run get_full_symbol_list.py against BASE_URL to
-    # check your testnet's exact available list if you want to add more.
-    "BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD", "DOGEUSD", "ADAUSD",
+    # RESTRICTED to BTC/ETH only (matches LOGIC_B_SYMBOLS below). Every
+    # real incident hit in practice — the DOGEUSD entry-price doubling/
+    # corruption, the ADAUSD near-zero catastrophic fill, repeated
+    # bracket_order_immediate_execution rejections — happened specifically
+    # on the smaller/thinner altcoins (SOL/XRP/DOGE/ADA), never on BTC/ETH.
+    # Those coins previously watched (still left here, commented, in case
+    # testnet liquidity/data quality improves later and you want them back):
+    #   "SOLUSD", "XRPUSD", "DOGEUSD", "ADAUSD",
+    "BTCUSD", "ETHUSD",
 ]
 
 # Logic B specifically only watches these — the smaller, low-priced coins
