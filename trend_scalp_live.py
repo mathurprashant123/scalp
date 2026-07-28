@@ -1703,6 +1703,7 @@ def check_daily_loss_circuit_breaker(state):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     try:
         current_balance = get_wallet_total_balance()
+        LATEST_STATE["wallet_balance"] = current_balance
     except Exception as e:
         print(f"  [WARN] Couldn't fetch balance for circuit-breaker check: {e}")
         return True  # fail-open rather than fail-closed on a transient API hiccup

@@ -381,6 +381,9 @@ PAGE_TEMPLATE = """
 <body>
     <div id="pnlWidget" class="flat">
         <h3>Live Trade P&amp;L</h3>
+        <div class="pnl-row" style="border-bottom:1px solid #333; padding-bottom:6px; margin-bottom:6px;">
+            <span>Wallet Balance</span><span id="walletBalance"><b>—</b></span>
+        </div>
         <div id="pnlBody">No open position</div>
     </div>
     <h1>Trend-Scalp Algo — Dashboard</h1>
@@ -482,6 +485,10 @@ PAGE_TEMPLATE = """
         }
         function refreshPnl() {
             fetch('/live_pnl').then(r => r.json()).then(data => {
+                const walletEl = document.getElementById('walletBalance');
+                const bal = data.wallet_balance;
+                walletEl.innerHTML = (bal !== null && bal !== undefined) ? `<b>$${bal.toFixed(2)}</b>` : '<b>—</b>';
+
                 const widget = document.getElementById('pnlWidget');
                 const body = document.getElementById('pnlBody');
                 if (!data.has_position) {
@@ -606,8 +613,10 @@ def set_logic_mode():
 @app.route("/live_pnl")
 def live_pnl():
     pos = algo.LATEST_STATE.get("position")
+    wallet_balance = algo.LATEST_STATE.get("wallet_balance")
+
     if pos is None:
-        return jsonify({"has_position": False})
+        return jsonify({"has_position": False, "wallet_balance": wallet_balance})
 
     return jsonify({
         "has_position": True,
@@ -621,6 +630,7 @@ def live_pnl():
         "live_pnl_pct": algo.LATEST_STATE.get("live_pnl_pct"),
         "milestones_locked": pos.get("milestones_locked", 0),
         "strategy": pos.get("strategy", "A"),
+        "wallet_balance": wallet_balance,
     })
 
 
