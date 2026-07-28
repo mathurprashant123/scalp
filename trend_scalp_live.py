@@ -98,6 +98,21 @@ MIN_TARGET_PCT_B = (TAKER_FEE_PCT * 2) * SAFETY_MARGIN_MULT
 LIMIT_ORDER_TIMEOUT_SECONDS = 45
 LIMIT_OFFSET_PCT = 0.02
 
+# Safety bound for CLOSING a position when the limit-first attempt above
+# doesn't fill in time. Previously this fell back to a true, UNBOUNDED
+# market order — found in practice to be dangerous on testnet's thin
+# order books: one ADAUSD close filled at $0.00001 (real price was
+# ~$0.155 at the time) because a plain market order accepts literally
+# ANY price with no limit. Instead, fall back to a "marketable limit"
+# order — a limit order priced this many percent worse than the last
+# known price, in the direction that guarantees a fill under normal
+# liquidity, but which CANNOT fill beyond this bound no matter how thin
+# the order book is. This trades a small chance of a delayed close
+# (extremely rare on liquid pairs) for eliminating the catastrophic-fill
+# scenario entirely, by construction rather than just detecting it after.
+MAX_CLOSE_SLIPPAGE_PCT = 3.0
+BOUNDED_CLOSE_WAIT_SECONDS = 10
+
 # Sanity check: if a reported fill price differs from the signal price by
 # more than this %, treat it as corrupted/wrong exchange data rather than
 # a genuine slippage event (real market-order slippage this large in under
@@ -809,6 +824,47 @@ def place_order_with_fallback(product_id, side, size, limit_price, reduce_only=F
               f"({e}) — continuing anyway, market order may still fail if "
               f"stray orders remain.")
 
+    # ---- Bounded marketable-limit fallback (BUG FIX — see
+    # MAX_CLOSE_SLIPPAGE_PCT above for why this replaced a plain market
+    # order here). Priced worse than the reference price by up to
+    # MAX_CLOSE_SLIPPAGE_PCT, in whichever direction guarantees a fill
+    # under normal liquidity — but the exchange can never fill it beyond
+    # that bound, unlike a true market order. ----
+    bounded_price = (limit_price * (1 - MAX_CLOSE_SLIPPAGE_PCT / 100) if side == "sell"
+                     else limit_price * (1 + MAX_CLOSE_SLIPPAGE_PCT / 100))
+    bounded_order = {
+        "product_id": product_id, "size": size, "side": side,
+        "order_type": "limit_order", "limit_price": str(round(bounded_price, 6)),
+    }
+    if reduce_only:
+        bounded_order["reduce_only"] = True
+
+    print(f"  Placing bounded marketable-limit order (max {MAX_CLOSE_SLIPPAGE_PCT}% "
+          f"slippage from {limit_price:.6f}): {bounded_order}")
+    response = client.create_order(bounded_order)
+    order_id = _extract_order_id(response)
+
+    waited = 0
+    while order_id is not None and waited < BOUNDED_CLOSE_WAIT_SECONDS:
+        time.sleep(2)
+        waited += 2
+        if _order_is_still_open(product_id, order_id) is False:
+            print(f"  Bounded marketable-limit order filled after {waited}s.")
+            return response, "market_fallback"
+
+    if order_id is not None:
+        try:
+            client.cancel_order(product_id, order_id)
+        except Exception as e:
+            print(f"  [WARN] cancel of bounded fallback order failed: {e}")
+
+    # ---- Absolute last resort: true unbounded market order. Reaching
+    # this point means even a {MAX_CLOSE_SLIPPAGE_PCT}%-bounded order
+    # couldn't fill — genuinely abnormal, so this is flagged loudly by
+    # the abnormal-fill check that runs after every close regardless. ----
+    print(f"  [WARN] Bounded marketable-limit order didn't fill within "
+          f"{BOUNDED_CLOSE_WAIT_SECONDS}s — this is unusual. Falling back to a true "
+          f"unbounded market order as an absolute last resort.")
     market_order = {"product_id": product_id, "size": size, "side": side, "order_type": "market_order"}
     if reduce_only:
         market_order["reduce_only"] = True
@@ -1437,11 +1493,32 @@ def _close_position(state, pos, price, reason, size):
         else:
             raise  # unknown error — let the outer loop's error handler log it
 
+    # ---- Abnormal-fill detection (BUG FIX — the ADAUSD incident) ----
+    # A real fill can land far from the reference price on a genuinely
+    # thin/broken order book (observed: a market close filled at $0.00001
+    # when the real price was ~$0.155). Use the ACTUAL fill price for P&L
+    # (more accurate than just assuming the reference price filled), and
+    # if it's abnormally far from the reference, trip a dedicated breaker
+    # so this is impossible to miss and no further trades happen until
+    # it's manually reviewed.
+    actual_fill_price = _extract_fill_price(resp) or price
+    fill_dist_pct = abs(actual_fill_price - price) / price * 100 if price else 0.0
+    if fill_dist_pct > MAX_CLOSE_SLIPPAGE_PCT * 2:
+        print(f"  [CRITICAL — ABNORMAL FILL DETECTED] {sym} closed at "
+              f"{actual_fill_price:.6f}, but the expected/reference price was "
+              f"{price:.6f} ({fill_dist_pct:.1f}% away!). This looks like a "
+              f"thin/broken order book, not a normal fill. Blocking all new "
+              f"entries until this is manually reviewed and reset from the dashboard.")
+        state["abnormal_fill_breaker_tripped"] = True
+        state["abnormal_fill_detail"] = (
+            f"{sym} closed at {actual_fill_price:.6f} vs expected {price:.6f} "
+            f"({fill_dist_pct:.1f}% away) at {datetime.now()}")
+
     entry_price = pos["entry_price"]
     if side == "long":
-        gross_pnl_pct = (price - entry_price) / entry_price * 100
+        gross_pnl_pct = (actual_fill_price - entry_price) / entry_price * 100
     else:
-        gross_pnl_pct = (entry_price - price) / entry_price * 100
+        gross_pnl_pct = (entry_price - actual_fill_price) / entry_price * 100
 
     # Note: daily-loss circuit breaker now compares REAL account balance
     # (checked at the top of each loop, see check_daily_loss_circuit_breaker)
@@ -1452,7 +1529,7 @@ def _close_position(state, pos, price, reason, size):
     log_trade_event(
         time=str(datetime.now()), symbol=sym, action="CLOSE",
         side=close_side, size=size, reason=reason,
-        entry_price=entry_price, exit_price=price,
+        entry_price=entry_price, exit_price=actual_fill_price,
         approx_gross_pnl_pct=round(gross_pnl_pct, 4),
         approx_net_pnl_pct_after_fees=round(net_pnl_pct, 4),
         fill_method=method, order_response=json.dumps(resp),
@@ -2111,6 +2188,13 @@ def run_one_loop_iteration(state, products):
         return
 
     if not check_minimum_balance_floor(state):
+        save_state(state)
+        return
+
+    if state.get("abnormal_fill_breaker_tripped", False):
+        print(f"  [ABNORMAL-FILL BREAKER] No new entries — an abnormal fill was "
+              f"detected ({state.get('abnormal_fill_detail', 'see earlier log')}). "
+              f"Reset manually from the dashboard after reviewing what happened.")
         save_state(state)
         return
 

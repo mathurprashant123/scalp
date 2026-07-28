@@ -269,6 +269,20 @@ def reset_min_balance_breaker():
     return jsonify({"ok": True, "message": "Minimum-balance floor breaker reset. New entries allowed again."})
 
 
+@app.route("/reset_abnormal_fill_breaker", methods=["POST"])
+def reset_abnormal_fill_breaker():
+    """Manually clears the abnormal-fill breaker — this trips when a
+    close order fills at a price wildly far from the expected/reference
+    price (e.g. a thin/broken order book), which real accounting can't
+    catch in advance. Reset only after checking the exchange's own order
+    history for what actually happened."""
+    state = algo.load_state()
+    state["abnormal_fill_breaker_tripped"] = False
+    state["abnormal_fill_detail"] = None
+    algo.save_state(state)
+    return jsonify({"ok": True, "message": "Abnormal-fill breaker reset. New entries allowed again."})
+
+
 @app.route("/clear_trades_log", methods=["POST"])
 def clear_trades_log():
     """Deletes the trades log CSV (for the given strategy) from both
@@ -407,6 +421,10 @@ PAGE_TEMPLATE = """
                 padding:8px 18px; border-radius:6px; cursor:pointer; font-size:13px; margin-left:8px;">
             &#9888; Reset Min-Balance Floor Breaker
         </button>
+        <button onclick="resetAbnormalFillBreaker()" style="background:#4a0033; color:white; border:none;
+                padding:8px 18px; border-radius:6px; cursor:pointer; font-size:13px; margin-left:8px;">
+            &#9888; Reset Abnormal-Fill Breaker
+        </button>
     </div>
     <script>
         function resetBreaker() {
@@ -418,6 +436,12 @@ PAGE_TEMPLATE = """
         function resetMinBalanceBreaker() {
             if (!confirm('Ye account ka minimum-balance safety floor reset kar dega — balance kaafi gir chuka hai, isliye pehle wajah samajh lo phir hi reset karo. Sure?')) return;
             fetch('/reset_min_balance_breaker', {method:'POST'}).then(r => r.json()).then(data => {
+                alert(data.message || 'Done');
+            });
+        }
+        function resetAbnormalFillBreaker() {
+            if (!confirm('Ye tabhi reset karo jab tumne exchange ke Order History mein dekh liya ho ki abnormal fill kya thi. Sure?')) return;
+            fetch('/reset_abnormal_fill_breaker', {method:'POST'}).then(r => r.json()).then(data => {
                 alert(data.message || 'Done');
             });
         }
