@@ -910,11 +910,17 @@ def reconcile_with_exchange(state, products):
                     entry_atr = 0.0
 
                 bracket_active = False
+                bracket_sl_order_id = None
                 try:
                     place_bracket_with_retry(product["id"], sym, order_side, abs(size), stop, target, side)
                     bracket_active = True
                     print(f"    Exchange-side bracket attached for adopted Logic B "
                           f"position: SL={stop:.6f} TP={target:.6f}")
+                    try:
+                        bracket_sl_order_id = get_bracket_stop_loss_order_id(product["id"])
+                    except Exception as e:
+                        print(f"    [WARN] Could not cache the bracket's stop-loss leg id "
+                              f"yet ({e}) — will try again if/when trailing needs it.")
                 except Exception as e:
                     print(f"    [WARN] Could not attach bracket for adopted Logic B "
                           f"position ({e}) — will rely on the polling loop for this trade.")
@@ -925,6 +931,7 @@ def reconcile_with_exchange(state, products):
                     "entry_price": entry_price, "stop": stop, "target": target,
                     "entry_time": str(datetime.now()), "strategy": "B",
                     "entry_order_id": None, "bracket_active": bracket_active,
+                    "bracket_sl_order_id": bracket_sl_order_id,
                     "entry_atr": entry_atr, "extreme_price": entry_price,
                     "r_basis": abs(entry_price - stop), "early_exit_done": False,
                 }
@@ -1194,14 +1201,33 @@ def manage_bracket_position_b(state, pos, symbol_data):
     entry_price = pos["entry_price"]
     far_tp = entry_price + far_dist if side == "long" else entry_price - far_dist
     try:
-        bracket_sl_order_id = get_bracket_stop_loss_order_id(pos["product_id"])
+        bracket_sl_order_id = pos.get("bracket_sl_order_id")
+        if bracket_sl_order_id is None:
+            # Not cached yet (e.g. attach happened before this fix, or the
+            # cache attempt failed earlier) — fall back to looking it up now.
+            bracket_sl_order_id = get_bracket_stop_loss_order_id(pos["product_id"])
+            pos["bracket_sl_order_id"] = bracket_sl_order_id
+
         if bracket_sl_order_id is not None:
-            # CORRECT approach: edit the EXISTING bracket via PUT, using the
-            # bracket's OWN stop-loss leg order id (a resting/pending order
-            # Delta created when the bracket attached) — not our original
-            # MARKET entry order's id, which is already 'closed' by the
-            # time we're trailing and gets rejected as 'open_order_not_found'.
-            edit_bracket_order(bracket_sl_order_id, pos["product_id"], sym, new_stop, far_tp)
+            try:
+                # CORRECT approach: edit the EXISTING bracket via PUT, using the
+                # bracket's OWN stop-loss leg order id (a resting/pending order
+                # Delta created when the bracket attached) — not our original
+                # MARKET entry order's id, which is already 'closed' by the
+                # time we're trailing and gets rejected as 'open_order_not_found'.
+                edit_bracket_order(bracket_sl_order_id, pos["product_id"], sym, new_stop, far_tp)
+            except Exception as e:
+                # The cached id might have gone stale (rare — e.g. if the
+                # bracket was somehow replaced). Refresh it once and retry
+                # before giving up, rather than immediately falling back to
+                # the disruptive cancel+recreate path.
+                print(f"  [WARN] {sym}: edit with cached bracket id failed ({e}) — "
+                      f"refreshing the id and retrying once.")
+                bracket_sl_order_id = get_bracket_stop_loss_order_id(pos["product_id"])
+                pos["bracket_sl_order_id"] = bracket_sl_order_id
+                if bracket_sl_order_id is None:
+                    raise
+                edit_bracket_order(bracket_sl_order_id, pos["product_id"], sym, new_stop, far_tp)
         else:
             # Couldn't find the bracket's stop-loss leg — fall back to the
             # cancel+recreate approach as a last resort.
@@ -1606,11 +1632,25 @@ def look_for_entry_b(state, symbol_data, products):
         # ---- Attach a native bracket order (SL+TP in one exchange-side
         # order) instead of managing exits via our own polling loop ----
         bracket_active = False
+        bracket_sl_order_id = None
         try:
             bracket_resp = place_bracket_with_retry(
                 product["id"], sym, order_side, size, stop, target, side)
             bracket_active = True
             print(f"    Bracket order attached: SL={stop:.6f} TP={target:.6f}")
+            # Look up the bracket's own stop-loss leg id ONCE, right now,
+            # and cache it — this is the id trailing-stop updates need
+            # later. Fetching it fresh on every trailing update (instead of
+            # once here) meant a GET /v2/orders call every ~20s for the
+            # life of the trade, which was observed hitting a CloudFront
+            # 403 block during a volatile stretch and silently breaking
+            # trailing-stop updates for the rest of the trade. Caching it
+            # once here removes nearly all of that repeated traffic.
+            try:
+                bracket_sl_order_id = get_bracket_stop_loss_order_id(product["id"])
+            except Exception as e:
+                print(f"    [WARN] Could not cache the bracket's stop-loss leg id yet "
+                      f"({e}) — will try again if/when trailing needs to update it.")
         except Exception as e:
             print(f"    [WARN] Could not attach bracket order ({e}) — falling back to "
                   f"our own polling-based SL/TP management for this trade instead.")
@@ -1623,6 +1663,7 @@ def look_for_entry_b(state, symbol_data, products):
             "entry_order_id": entry_order_id,
             "milestones_locked": 0, "max_progress": 0.0,
             "bracket_active": bracket_active,
+            "bracket_sl_order_id": bracket_sl_order_id,
             "entry_atr": atr, "extreme_price": price_for_calc,
             "r_basis": sl_dist,  # original SL distance in price terms — the "R" unit
             "early_exit_done": False,
@@ -1878,8 +1919,46 @@ def look_for_entry_a(state, symbol_data, products):
             exchange_safety_stop_active = True
             print(f"    Exchange-side safety-net bracket attached: SL={stop:.6f} TP={target:.6f}")
         except Exception as e:
-            print(f"    [WARN] Could not attach safety-net bracket ({e}) — this trade will "
-                  f"rely solely on the script's own polling loop for stop/target, same as before.")
+            # ---- BUG FIX (was a real incident) ----
+            # Previously this just printed a warning and let the trade run
+            # with NO exchange-side protection at all, relying solely on
+            # this script's own polling loop. That combined with a
+            # separate close-order bug on one occasion to leave a position
+            # completely unprotected for an extended period — before that
+            # second bug is even considered, holding any position with zero
+            # exchange-side stop whenever this attach fails is too risky to
+            # accept silently. Close the position immediately instead.
+            print(f"    [WARN] Could not attach safety-net bracket ({e}) — this position "
+                  f"would have NO exchange-side stop protection at all if held. "
+                  f"Closing it immediately instead of accepting that risk.")
+            close_side = "sell" if side == "long" else "buy"
+            try:
+                close_resp, close_method = place_order_with_fallback(
+                    product["id"], close_side, size, price_for_calc, reduce_only=True)
+                exit_price = _extract_fill_price(close_resp) or price_for_calc
+            except Exception as close_e:
+                print(f"    [WARN] Emergency close after failed bracket attach also "
+                      f"failed ({close_e}) — this position is now unprotected and "
+                      f"UNTRACKED locally; check the exchange manually. Falling back "
+                      f"to normal tracking with polling-only stop as a last resort.")
+                exit_price = None
+            if exit_price is not None:
+                if side == "long":
+                    abort_pnl_pct = (exit_price - price_for_calc) / price_for_calc * 100
+                else:
+                    abort_pnl_pct = (price_for_calc - exit_price) / price_for_calc * 100
+                net_pnl_pct = estimate_net_pnl_pct(abort_pnl_pct, "A")
+                log_trade_event(
+                    time=str(datetime.now()), symbol=sym, action="CLOSE",
+                    side=close_side, size=size, reason="aborted_no_bracket_protection",
+                    entry_price=price_for_calc, exit_price=exit_price,
+                    approx_gross_pnl_pct=round(abort_pnl_pct, 4),
+                    approx_net_pnl_pct_after_fees=round(net_pnl_pct, 4),
+                    fill_method=close_method, strategy="A",
+                )
+                print(f"    Closed immediately (no bracket protection available). "
+                      f"Approx P&L: {abort_pnl_pct:+.3f}% (net after fees: {net_pnl_pct:+.3f}%)")
+                return True  # took action this loop; skip opening state["position"] below
 
         state["position"] = {
             "symbol": sym, "product_id": product["id"], "side": side,
