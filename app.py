@@ -254,6 +254,21 @@ def reset_circuit_breaker():
     return jsonify({"ok": True, "message": "Circuit breaker reset. New entries allowed again."})
 
 
+@app.route("/reset_min_balance_breaker", methods=["POST"])
+def reset_min_balance_breaker():
+    """Manually clears the minimum-balance floor breaker (the second,
+    independent safety net that blocks new trades if the account ever
+    falls below MIN_BALANCE_FLOOR_PCT of its all-time starting balance).
+    This does NOT re-baseline the all-time starting balance — that number
+    stays fixed on purpose, so resetting this only un-blocks new entries,
+    it doesn't move the floor itself. Use this deliberately, only after
+    understanding why it tripped."""
+    state = algo.load_state()
+    state["min_balance_breaker_tripped"] = False
+    algo.save_state(state)
+    return jsonify({"ok": True, "message": "Minimum-balance floor breaker reset. New entries allowed again."})
+
+
 @app.route("/clear_trades_log", methods=["POST"])
 def clear_trades_log():
     """Deletes the trades log CSV (for the given strategy) from both
@@ -385,11 +400,21 @@ PAGE_TEMPLATE = """
                 padding:8px 18px; border-radius:6px; cursor:pointer; font-size:13px;">
             &#9888; Reset Daily Circuit Breaker
         </button>
+        <button onclick="resetMinBalanceBreaker()" style="background:#7a0000; color:white; border:none;
+                padding:8px 18px; border-radius:6px; cursor:pointer; font-size:13px; margin-left:8px;">
+            &#9888; Reset Min-Balance Floor Breaker
+        </button>
     </div>
     <script>
         function resetBreaker() {
             if (!confirm('Ye aaj ka daily-loss circuit breaker reset kar dega. Sure?')) return;
             fetch('/reset_circuit_breaker', {method:'POST'}).then(r => r.json()).then(data => {
+                alert(data.message || 'Done');
+            });
+        }
+        function resetMinBalanceBreaker() {
+            if (!confirm('Ye account ka minimum-balance safety floor reset kar dega — balance kaafi gir chuka hai, isliye pehle wajah samajh lo phir hi reset karo. Sure?')) return;
+            fetch('/reset_min_balance_breaker', {method:'POST'}).then(r => r.json()).then(data => {
                 alert(data.message || 'Done');
             });
         }

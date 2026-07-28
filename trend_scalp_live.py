@@ -172,6 +172,16 @@ TRAIL_MULT_B = 1.5            # trailing stop = TRAIL_MULT_B * ATR behind the be
 ATR_EXPANSION_TRIGGER_PCT = 20  # ATR must expand this much (%) vs entry-time ATR to trail
 
 MAX_DAILY_LOSS_PCT = 5.0   # circuit breaker — applies across BOTH logics combined
+
+# Absolute safety net BEYOND the daily circuit breaker: the daily breaker
+# only ever looks at loss WITHIN a single UTC day (it resets every day, so
+# several days of losses just under 5% each would never trip it, even
+# though the account could have quietly shrunk a lot over time). This is
+# a second, independent floor based on the account's balance the very
+# FIRST time this bot ever ran — if the account ever drops below this
+# percentage of that original balance, ALL new trades (both logics) are
+# blocked until manually reset, regardless of what day it is.
+MIN_BALANCE_FLOOR_PCT = 50.0
 COOLDOWN_SECONDS = 10      # min gap after any close before a new entry
                             # (note: our loop only checks once every
                             # LOOP_INTERVAL_SECONDS=60s anyway, so a 10s
@@ -1722,6 +1732,47 @@ def check_daily_loss_circuit_breaker(state):
     return True
 
 
+def check_minimum_balance_floor(state):
+    """
+    Second, independent safety net beyond the daily circuit breaker. The
+    daily breaker resets every UTC day, so a slow multi-day erosion (e.g.
+    losing 4% several days in a row, never quite tripping the 5% daily
+    limit any single day) could still quietly drain the account with
+    nothing ever stopping it. This checks the CURRENT balance against the
+    balance the very first time this bot ever ran (captured once, persisted
+    in the state file, never overwritten again) — if it ever falls below
+    MIN_BALANCE_FLOOR_PCT of that original amount, block ALL new entries
+    (both logics) until manually reset via the dashboard, same pattern as
+    the daily breaker's reset button.
+    """
+    try:
+        current_balance = get_wallet_total_balance()
+    except Exception as e:
+        print(f"  [WARN] Couldn't fetch balance for minimum-balance floor check: {e}")
+        return True  # fail-open on a transient API hiccup, same as the daily breaker
+
+    if state.get("all_time_starting_balance") is None:
+        state["all_time_starting_balance"] = current_balance
+        print(f"  [INFO] Recorded all-time starting balance: ${current_balance:.2f} "
+              f"(new trades will be blocked if balance ever falls below "
+              f"{MIN_BALANCE_FLOOR_PCT}% of this, i.e. ${current_balance * MIN_BALANCE_FLOOR_PCT / 100:.2f})")
+        return True
+
+    floor_balance = state["all_time_starting_balance"] * (MIN_BALANCE_FLOOR_PCT / 100)
+    if current_balance < floor_balance:
+        if not state.get("min_balance_breaker_tripped", False):
+            print(f"  [MIN-BALANCE BREAKER TRIPPED] Balance (${current_balance:.2f}) has fallen "
+                  f"below {MIN_BALANCE_FLOOR_PCT}% of the all-time starting balance "
+                  f"(${state['all_time_starting_balance']:.2f}) — floor is ${floor_balance:.2f}.")
+        state["min_balance_breaker_tripped"] = True
+
+    if state.get("min_balance_breaker_tripped", False):
+        print(f"  [MIN-BALANCE BREAKER] No new entries until this is manually reset from "
+              f"the dashboard — current ${current_balance:.2f} is below the ${floor_balance:.2f} floor.")
+        return False
+    return True
+
+
 def look_for_entry_a(state, symbol_data, products):
     """Logic A: 200 EMA + VWAP + CVD confluence (existing strategy)."""
     print("  --- Entry scan detail (per coin) ---")
@@ -2024,14 +2075,28 @@ def run_one_loop_iteration(state, products):
                 df_b = compute_atr(df_b, period=ATR_PERIOD)
                 symbol_data_b[sym] = df_b
 
-    if not check_daily_loss_circuit_breaker(state):
-        save_state(state)
-        return
-
+    # ---- Always manage an already-open position first, regardless of the
+    # daily circuit breaker. (BUG FIX: this used to be gated behind the
+    # circuit-breaker check below, which meant that if the breaker tripped
+    # while a position was open, local monitoring — staircase/ATR trailing,
+    # stop/target checks, and the exchange-bracket-external-close detection
+    # — would ALL silently stop until the breaker reset. The exchange-side
+    # bracket still protects the position during that gap, but trailing
+    # stops stop tightening and a real external close wouldn't be noticed
+    # locally until the breaker reset. New entries are the only thing that
+    # should ever be blocked by the circuit breaker.) ----
     if state["position"] is not None:
         active_strategy = state["position"].get("strategy", "A")
         symbol_data_for_management = symbol_data_a if active_strategy == "A" else symbol_data_b
         manage_open_position(state, symbol_data_for_management)
+
+    if not check_daily_loss_circuit_breaker(state):
+        save_state(state)
+        return
+
+    if not check_minimum_balance_floor(state):
+        save_state(state)
+        return
 
     # ============================================================
     # GUARANTEE: only ONE trade is ever open system-wide, across BOTH
