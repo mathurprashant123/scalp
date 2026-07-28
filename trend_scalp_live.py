@@ -1033,6 +1033,7 @@ def reconcile_with_exchange(state, products):
                     "entry_time": str(now_ist()), "strategy": "B",
                     "entry_order_id": None, "bracket_active": bracket_active,
                     "bracket_sl_order_id": bracket_sl_order_id,
+                    "exchange_stop_synced": stop if bracket_active else None,
                     "entry_atr": entry_atr, "extreme_price": entry_price,
                     "r_basis": abs(entry_price - stop), "early_exit_done": False,
                 }
@@ -1363,54 +1364,70 @@ def manage_bracket_position_b(state, pos, symbol_data):
 
     old_stop = pos["stop"]
     improved = (side == "long" and new_stop > old_stop) or (side == "short" and new_stop < old_stop)
-    if not improved:
-        state["position"] = pos
-        return
+    if improved:
+        # ---- BUG FIX: update the LOCAL stop/target immediately, regardless
+        # of whether the exchange-side push below succeeds. Previously
+        # pos["stop"] was only assigned INSIDE the try block, AFTER the
+        # exchange API calls — so if those calls raised (which they did
+        # repeatedly in practice, from CloudFront 403s and similar), the
+        # local stop silently never advanced either, even though
+        # milestones_locked kept incrementing in the staircase loop above
+        # (that counter isn't gated on push-success). This produced exactly
+        # the mismatch seen in practice: the dashboard showing "3/4 steps
+        # locked" while Stop still displayed the very first, un-tightened
+        # value. Now the local value is authoritative and updates
+        # immediately; only the EXCHANGE-side sync is retried below (and
+        # again on later loops via exchange_stop_synced, same pattern
+        # already used for Logic A). ----
+        print(f"  {sym}: {trigger_desc} -> trailing stop from {old_stop:.6f} to {new_stop:.6f}")
+        pos["stop"] = new_stop
+        pos["target"] = new_tp
 
-    print(f"  {sym}: {trigger_desc} -> trailing stop from {old_stop:.6f} to {new_stop:.6f}")
-    far_tp = new_tp
-    try:
-        bracket_sl_order_id = pos.get("bracket_sl_order_id")
-        if bracket_sl_order_id is None:
-            # Not cached yet (e.g. attach happened before this fix, or the
-            # cache attempt failed earlier) — fall back to looking it up now.
-            bracket_sl_order_id = get_bracket_stop_loss_order_id(pos["product_id"])
-            pos["bracket_sl_order_id"] = bracket_sl_order_id
-
-        if bracket_sl_order_id is not None:
-            try:
-                # CORRECT approach: edit the EXISTING bracket via PUT, using the
-                # bracket's OWN stop-loss leg order id (a resting/pending order
-                # Delta created when the bracket attached) — not our original
-                # MARKET entry order's id, which is already 'closed' by the
-                # time we're trailing and gets rejected as 'open_order_not_found'.
-                edit_bracket_order(bracket_sl_order_id, pos["product_id"], sym, new_stop, far_tp)
-            except Exception as e:
-                # The cached id might have gone stale (rare — e.g. if the
-                # bracket was somehow replaced). Refresh it once and retry
-                # before giving up, rather than immediately falling back to
-                # the disruptive cancel+recreate path.
-                print(f"  [WARN] {sym}: edit with cached bracket id failed ({e}) — "
-                      f"refreshing the id and retrying once.")
+    if pos.get("exchange_stop_synced") != pos["stop"]:
+        far_tp = pos["target"]
+        try:
+            bracket_sl_order_id = pos.get("bracket_sl_order_id")
+            if bracket_sl_order_id is None:
+                # Not cached yet (e.g. attach happened before this fix, or the
+                # cache attempt failed earlier) — fall back to looking it up now.
                 bracket_sl_order_id = get_bracket_stop_loss_order_id(pos["product_id"])
                 pos["bracket_sl_order_id"] = bracket_sl_order_id
-                if bracket_sl_order_id is None:
-                    raise
-                edit_bracket_order(bracket_sl_order_id, pos["product_id"], sym, new_stop, far_tp)
-        else:
-            # Couldn't find the bracket's stop-loss leg — fall back to the
-            # cancel+recreate approach as a last resort.
-            print(f"  [WARN] {sym}: couldn't find the bracket's stop-loss leg order — "
-                  f"falling back to cancel+recreate.")
-            cancel_all_orders_for_product(pos["product_id"])
-            place_bracket_with_retry(
-                pos["product_id"], sym, ("buy" if side == "long" else "sell"),
-                pos["size"], new_stop, far_tp, side)
-        pos["stop"] = new_stop
-        print(f"  {sym}: trailing bracket updated successfully.")
-    except Exception as e:
-        print(f"  [WARN] {sym}: failed to update trailing bracket ({e}) — "
-              f"keeping previous bracket levels, will retry next loop.")
+
+            if bracket_sl_order_id is not None:
+                try:
+                    # CORRECT approach: edit the EXISTING bracket via PUT, using the
+                    # bracket's OWN stop-loss leg order id (a resting/pending order
+                    # Delta created when the bracket attached) — not our original
+                    # MARKET entry order's id, which is already 'closed' by the
+                    # time we're trailing and gets rejected as 'open_order_not_found'.
+                    edit_bracket_order(bracket_sl_order_id, pos["product_id"], sym, pos["stop"], far_tp)
+                except Exception as e:
+                    # The cached id might have gone stale (rare — e.g. if the
+                    # bracket was somehow replaced). Refresh it once and retry
+                    # before giving up, rather than immediately falling back to
+                    # the disruptive cancel+recreate path.
+                    print(f"  [WARN] {sym}: edit with cached bracket id failed ({e}) — "
+                          f"refreshing the id and retrying once.")
+                    bracket_sl_order_id = get_bracket_stop_loss_order_id(pos["product_id"])
+                    pos["bracket_sl_order_id"] = bracket_sl_order_id
+                    if bracket_sl_order_id is None:
+                        raise
+                    edit_bracket_order(bracket_sl_order_id, pos["product_id"], sym, pos["stop"], far_tp)
+            else:
+                # Couldn't find the bracket's stop-loss leg — fall back to the
+                # cancel+recreate approach as a last resort.
+                print(f"  [WARN] {sym}: couldn't find the bracket's stop-loss leg order — "
+                      f"falling back to cancel+recreate.")
+                cancel_all_orders_for_product(pos["product_id"])
+                place_bracket_with_retry(
+                    pos["product_id"], sym, ("buy" if side == "long" else "sell"),
+                    pos["size"], pos["stop"], far_tp, side)
+            pos["exchange_stop_synced"] = pos["stop"]
+            print(f"  {sym}: exchange-side bracket synced: SL -> {pos['stop']:.6f}")
+        except Exception as e:
+            print(f"  [WARN] {sym}: exchange-side bracket still out of sync with local "
+                  f"stop ({pos['stop']:.6f}) — will keep retrying every loop until this "
+                  f"succeeds ({e})")
 
     state["position"] = pos
 
@@ -1920,6 +1937,7 @@ def look_for_entry_b(state, symbol_data, products):
             "milestones_locked": 0, "max_progress": 0.0,
             "bracket_active": bracket_active,
             "bracket_sl_order_id": bracket_sl_order_id,
+            "exchange_stop_synced": stop if bracket_active else None,
             "entry_atr": atr, "extreme_price": price_for_calc,
             "r_basis": sl_dist,  # original SL distance in price terms — the "R" unit
             "early_exit_done": False,
