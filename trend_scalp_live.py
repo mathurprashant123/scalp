@@ -621,7 +621,7 @@ def get_bracket_stop_loss_order_id(product_id, retries=3, delay=2):
     return None
 
 
-def get_bracket_sl_tp_prices(product_id):
+def get_bracket_sl_tp_prices(product_id, retries=5, delay=3):
     """
     Fetches BOTH legs of an existing bracket order (if any) for this
     product — the stop-loss trigger price and the take-profit trigger
@@ -632,25 +632,40 @@ def get_bracket_sl_tp_prices(product_id):
     enough to distinguish reliably from the bracket's actual levels,
     without needing any of the local state that a restart just wiped.
     Returns (sl_price, tp_price), each None if that leg wasn't found.
+
+    Retries several times with backoff on failure — this specific lookup
+    was observed hitting CloudFront-level 403s that outlasted a shorter
+    3-attempt retry (used elsewhere for the more frequent trailing-stop
+    lookup). It's worth waiting longer here specifically: a WRONG guess
+    here doesn't just fail once, it silently sticks for the entire rest
+    of the trade (once a strategy is assigned, later restarts just keep
+    it as-is rather than re-checking) — so a slower, more persistent
+    retry is worth the extra delay during this one-time startup check.
     """
-    try:
-        r = client.request("GET", "/v2/orders", {"product_ids": str(product_id),
-                                                   "states": "open,pending"}, auth=True)
-        orders = r.json().get("result", [])
-    except Exception as e:
-        print(f"  [WARN] Couldn't fetch open orders to read bracket SL/TP levels: {e}")
-        return None, None
-    sl_price = tp_price = None
-    for o in orders:
-        otype = o.get("stop_order_type")
-        trigger = o.get("stop_price")
-        if trigger is None:
-            continue
-        if otype == "stop_loss_order":
-            sl_price = float(trigger)
-        elif otype == "take_profit_order":
-            tp_price = float(trigger)
-    return sl_price, tp_price
+    last_error = None
+    for attempt in range(retries):
+        try:
+            r = client.request("GET", "/v2/orders", {"product_ids": str(product_id),
+                                                       "states": "open,pending"}, auth=True)
+            orders = r.json().get("result", [])
+            sl_price = tp_price = None
+            for o in orders:
+                otype = o.get("stop_order_type")
+                trigger = o.get("stop_price")
+                if trigger is None:
+                    continue
+                if otype == "stop_loss_order":
+                    sl_price = float(trigger)
+                elif otype == "take_profit_order":
+                    tp_price = float(trigger)
+            return sl_price, tp_price
+        except Exception as e:
+            last_error = e
+            if attempt < retries - 1:
+                time.sleep(delay * (attempt + 1))  # 3s, 6s, 9s, 12s — backs off
+    print(f"  [WARN] Couldn't fetch open orders to read bracket SL/TP levels "
+          f"after {retries} attempts: {last_error}")
+    return None, None
 
 
 def edit_bracket_order(order_id, product_id, product_symbol, sl_price, tp_price,
