@@ -1207,6 +1207,31 @@ def manage_bracket_position_b(state, pos, symbol_data):
         extreme = min(extreme, current_price)
     pos["extreme_price"] = extreme
 
+    # ---- Staircase stop-loss ratcheting (ADDED — same system Logic A
+    # uses: 20%->breakeven, 50%->20%, 75%->50%, 90%->75% of the distance
+    # to target). This runs independently of the ATR-expansion trailing
+    # below — it guarantees a baseline profit-lock purely from price
+    # progress, even on quiet trades that never trigger the ATR-expansion
+    # trailing at all. When ATR-expansion trailing ALSO triggers this loop,
+    # whichever of the two gives the MORE protective (tighter, in the
+    # favorable direction) stop is the one that's actually applied. ----
+    entry = pos["entry_price"]
+    target = pos["target"]
+    progress = compute_progress(pos, current_price)
+    pos["max_progress"] = max(pos.get("max_progress", 0.0), progress)
+    staircase_stop = pos["stop"]
+    locked_so_far = pos.get("milestones_locked", 0)
+    for i in range(locked_so_far, len(STAIRCASE_TRIGGERS)):
+        trigger = STAIRCASE_TRIGGERS[i]
+        lock_level = STAIRCASE_LOCKS[i]
+        if pos["max_progress"] < trigger:
+            break
+        candidate = (entry + lock_level * (target - entry) if side == "long"
+                     else entry - lock_level * (entry - target))
+        if (side == "long" and candidate > staircase_stop) or (side == "short" and candidate < staircase_stop):
+            staircase_stop = candidate
+        pos["milestones_locked"] = i + 1
+
     expansion_pct = ((current_atr - entry_atr) / entry_atr) * 100.0
 
     # ---- R-multiple early exit (matches reference bot design) ----
@@ -1261,26 +1286,37 @@ def manage_bracket_position_b(state, pos, symbol_data):
                     print(f"  [WARN] {sym}: early-exit order failed ({e}) — will retry next loop")
 
     if expansion_pct < ATR_EXPANSION_TRIGGER_PCT:
-        state["position"] = pos
-        return  # ATR hasn't expanded enough yet to switch into trailing mode
+        # ATR hasn't expanded enough for trailing-mode yet, but the
+        # staircase ratchet above may still have produced a tighter stop
+        # purely from price progress — apply that on its own if so,
+        # keeping the ORIGINAL target unchanged (staircase only ever
+        # tightens the stop, same as Logic A).
+        new_stop = staircase_stop
+        new_tp = pos["target"]
+        trigger_desc = f"staircase progress reached {pos['max_progress']:.2f}"
+    else:
+        trail_dist = TRAIL_MULT_B * current_atr
+        atr_stop = extreme - trail_dist if side == "long" else extreme + trail_dist
+        # Whichever of the staircase-ratchet stop and the ATR-trail stop
+        # is more protective (tighter, in the favorable direction) wins.
+        new_stop = max(staircase_stop, atr_stop) if side == "long" else min(staircase_stop, atr_stop)
+        # Matches reference bot's _far_take_profit(): far_dist = original
+        # SL-distance (r_basis) * 20, anchored off ENTRY price — not the
+        # current trailing distance/extreme, which would drift each update.
+        r_basis = pos.get("r_basis", trail_dist)
+        far_dist = r_basis * 20
+        entry_price = pos["entry_price"]
+        new_tp = entry_price + far_dist if side == "long" else entry_price - far_dist
+        trigger_desc = f"ATR expanded {expansion_pct:.1f}% since entry (>= {ATR_EXPANSION_TRIGGER_PCT}%)"
 
-    trail_dist = TRAIL_MULT_B * current_atr
-    new_stop = extreme - trail_dist if side == "long" else extreme + trail_dist
     old_stop = pos["stop"]
     improved = (side == "long" and new_stop > old_stop) or (side == "short" and new_stop < old_stop)
     if not improved:
         state["position"] = pos
         return
 
-    print(f"  {sym}: ATR expanded {expansion_pct:.1f}% since entry (>= {ATR_EXPANSION_TRIGGER_PCT}%) "
-          f"-> trailing stop from {old_stop:.6f} to {new_stop:.6f}")
-    # Matches reference bot's _far_take_profit(): far_dist = original
-    # SL-distance (r_basis) * 20, anchored off ENTRY price — not the
-    # current trailing distance/extreme, which would drift each update.
-    r_basis = pos.get("r_basis", trail_dist)
-    far_dist = r_basis * 20
-    entry_price = pos["entry_price"]
-    far_tp = entry_price + far_dist if side == "long" else entry_price - far_dist
+    print(f"  {sym}: {trigger_desc} -> trailing stop from {old_stop:.6f} to {new_stop:.6f}")
+    far_tp = new_tp
     try:
         bracket_sl_order_id = pos.get("bracket_sl_order_id")
         if bracket_sl_order_id is None:
@@ -1642,14 +1678,10 @@ def look_for_entry_b(state, symbol_data, products):
         stop = exec_price - SL_ATR_MULT * atr if side == "long" else exec_price + SL_ATR_MULT * atr
         target = exec_price + TP_ATR_MULT * atr if side == "long" else exec_price - TP_ATR_MULT * atr
         stop_dist_pct = abs(exec_price - stop) / exec_price * 100
-        target_move_pct = abs(target - exec_price) / exec_price * 100
 
-        # NOTE: fee-aware minimum-target filter was REMOVED for Logic B on
-        # request. This means trades can now be taken even when the
-        # ATR-based target move is smaller than round-trip taker fees
-        # (currently 0.24%) — such trades can lose money to fees even if
-        # the price direction call is correct. Re-add the check above
-        # (target_move_pct < MIN_TARGET_PCT_B) if this causes issues.
+        # NOTE: the fee-aware minimum-target filter was removed for a while
+        # per an earlier request, then RE-ADDED below (after the floor-
+        # widening, since that's what actually determines the final target).
 
         print(f"    -> Logic B CONDITIONS MET: {side.upper()} entry")
 
@@ -1671,6 +1703,19 @@ def look_for_entry_b(state, symbol_data, products):
             stop = exec_price * (1 - stop_dist_pct / 100) if side == "long" else exec_price * (1 + stop_dist_pct / 100)
             target = (exec_price * (1 + stop_dist_pct * TP_RR_MULT / 100) if side == "long"
                       else exec_price * (1 - stop_dist_pct * TP_RR_MULT / 100))
+
+        # ---- Fee-aware minimum-target filter (RE-ADDED per user request) ----
+        # Recompute the FINAL target-move % after the floor-widening above
+        # (target is always stop_dist_pct * TP_RR_MULT away in Logic B, by
+        # design) and skip this trade if it's smaller than what round-trip
+        # taker fees would eat — same protective idea Logic A already has,
+        # just using Logic B's taker-fee-based threshold instead of maker.
+        final_target_move_pct = stop_dist_pct * TP_RR_MULT
+        if final_target_move_pct < MIN_TARGET_PCT_B:
+            print(f"    -> SKIP: target move ({final_target_move_pct:.3f}%) is smaller than "
+                  f"the fee-aware minimum ({MIN_TARGET_PCT_B:.3f}%) — likely to lose money "
+                  f"to fees even if the direction call is right.")
+            continue
 
         if sym not in products:
             print(f"    -> SKIP: {sym} not available on testnet account")

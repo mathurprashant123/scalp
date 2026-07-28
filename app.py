@@ -532,7 +532,7 @@ PAGE_TEMPLATE = """
                     <div class="pnl-row"><span>Current</span><span>${data.current_price ?? '—'}</span></div>
                     <div class="pnl-row"><span>Stop</span><span>${data.stop}</span></div>
                     <div class="pnl-row"><span>Target</span><span>${data.target}</span></div>
-                    <div class="pnl-row"><span>Stop-loss steps locked</span><span>${data.strategy === 'A' ? data.milestones_locked + ' / 4' : 'N/A (fixed SL/TP)'}</span></div>
+                    <div class="pnl-row"><span>Stop-loss steps locked</span><span>${data.milestones_locked} / 4</span></div>
                 `;
             });
         }
