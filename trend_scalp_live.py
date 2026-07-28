@@ -1082,11 +1082,17 @@ def reconcile_with_exchange(state, products):
                     target = entry_price * (1.02 if side == "long" else 0.98)
 
                 exchange_safety_stop_active = False
+                bracket_sl_order_id = None
                 try:
                     place_bracket_with_retry(product["id"], sym, order_side, abs(size), stop, target, side)
                     exchange_safety_stop_active = True
                     print(f"    Exchange-side safety-net bracket attached for adopted "
                           f"position: SL={stop:.6f} TP={target:.6f}")
+                    try:
+                        bracket_sl_order_id = get_bracket_stop_loss_order_id(product["id"])
+                    except Exception as e:
+                        print(f"    [WARN] Could not cache the bracket's stop-loss leg id "
+                              f"yet ({e}) — will try again if/when the staircase needs it.")
                 except Exception as e:
                     print(f"    [WARN] Could not attach safety-net bracket for adopted "
                           f"position ({e}) — will rely on the polling loop for this trade.")
@@ -1099,6 +1105,8 @@ def reconcile_with_exchange(state, products):
                     "max_progress": 0.0, "strategy": "A",
                     "entry_order_id": None,  # unknown for an adopted position — see note below
                     "exchange_safety_stop_active": exchange_safety_stop_active,
+                    "exchange_stop_synced": stop if exchange_safety_stop_active else None,
+                    "bracket_sl_order_id": bracket_sl_order_id,
                 }
                 # NOTE: entry_order_id is None here because we never placed the
                 # original entry order ourselves (it happened before this
@@ -1562,16 +1570,44 @@ def manage_open_position(state, symbol_data):
     # successfully pushed — and keeps retrying every loop until the
     # exchange actually confirms the update, so a temporary disruption
     # can no longer cause a permanently-stale exchange-side stop. ----
-    if pos.get("strategy") == "A" and pos.get("exchange_safety_stop_active") and pos.get("entry_order_id"):
+    if pos.get("strategy") == "A" and pos.get("exchange_safety_stop_active"):
         if pos.get("exchange_stop_synced") != pos["stop"]:
-            try:
-                edit_bracket_order(pos["entry_order_id"], pos["product_id"], sym, pos["stop"], target)
-                pos["exchange_stop_synced"] = pos["stop"]
-                print(f"    Exchange-side safety-net bracket synced: SL -> {pos['stop']:.6f}")
-            except Exception as e:
-                print(f"    [WARN] Exchange-side bracket still out of sync with local "
-                      f"stop ({pos['stop']:.6f}) — will keep retrying every loop until "
-                      f"this succeeds ({e})")
+            # ---- BUG FIX: use the bracket's OWN stop-loss leg id (same
+            # correct pattern Logic B already uses), not entry_order_id —
+            # the original entry order is already 'closed' the instant it
+            # fills, so Delta rejects edits to it with 'open_order_not_found'
+            # (observed in practice: every staircase move after entry was
+            # silently failing to reach the exchange for exactly this
+            # reason). Cache it once, refresh on failure, same as Logic B. ----
+            bracket_sl_order_id = pos.get("bracket_sl_order_id")
+            if bracket_sl_order_id is None:
+                try:
+                    bracket_sl_order_id = get_bracket_stop_loss_order_id(pos["product_id"])
+                    pos["bracket_sl_order_id"] = bracket_sl_order_id
+                except Exception as e:
+                    bracket_sl_order_id = None
+                    print(f"    [WARN] Couldn't look up the bracket's stop-loss leg id "
+                          f"({e}) — will retry next loop.")
+            if bracket_sl_order_id is not None:
+                try:
+                    edit_bracket_order(bracket_sl_order_id, pos["product_id"], sym, pos["stop"], target)
+                    pos["exchange_stop_synced"] = pos["stop"]
+                    print(f"    Exchange-side safety-net bracket synced: SL -> {pos['stop']:.6f}")
+                except Exception as e:
+                    # The cached id might have gone stale — refresh once and retry.
+                    print(f"    [WARN] Edit with cached bracket id failed ({e}) — "
+                          f"refreshing the id and retrying once.")
+                    try:
+                        bracket_sl_order_id = get_bracket_stop_loss_order_id(pos["product_id"])
+                        pos["bracket_sl_order_id"] = bracket_sl_order_id
+                        if bracket_sl_order_id is not None:
+                            edit_bracket_order(bracket_sl_order_id, pos["product_id"], sym, pos["stop"], target)
+                            pos["exchange_stop_synced"] = pos["stop"]
+                            print(f"    Exchange-side safety-net bracket synced: SL -> {pos['stop']:.6f}")
+                    except Exception as e2:
+                        print(f"    [WARN] Exchange-side bracket still out of sync with local "
+                              f"stop ({pos['stop']:.6f}) — will keep retrying every loop until "
+                              f"this succeeds ({e2})")
 
     state["position"] = pos  # persist progress-tracking updates
 
@@ -2176,10 +2212,23 @@ def look_for_entry_a(state, symbol_data, products):
         # drives the "real" stop level, and pushes updates to this
         # exchange-side bracket via edit_bracket_order() whenever it moves.
         exchange_safety_stop_active = False
+        bracket_sl_order_id = None
         try:
             place_bracket_with_retry(product["id"], sym, order_side, size, stop, target, side)
             exchange_safety_stop_active = True
             print(f"    Exchange-side safety-net bracket attached: SL={stop:.6f} TP={target:.6f}")
+            # ---- BUG FIX: cache the bracket's OWN stop-loss leg id now,
+            # same as Logic B already does. Without this, later staircase
+            # updates tried to edit the bracket using entry_order_id (the
+            # original MARKET/LIMIT entry order) — which becomes 'closed'
+            # the moment it fills, so Delta rejects edits to it with
+            # 'open_order_not_found' (observed in practice: every staircase
+            # move after entry silently failed to reach the exchange). ----
+            try:
+                bracket_sl_order_id = get_bracket_stop_loss_order_id(product["id"])
+            except Exception as e:
+                print(f"    [WARN] Could not cache the bracket's stop-loss leg id yet "
+                      f"({e}) — will try again if/when the staircase needs to update it.")
         except Exception as e:
             # ---- BUG FIX (was a real incident) ----
             # Previously this just printed a warning and let the trade run
@@ -2231,6 +2280,7 @@ def look_for_entry_a(state, symbol_data, products):
             "entry_order_id": entry_order_id,
             "exchange_safety_stop_active": exchange_safety_stop_active,
             "exchange_stop_synced": stop if exchange_safety_stop_active else None,
+            "bracket_sl_order_id": bracket_sl_order_id,
         }
         log_trade_event(
             time=str(now_ist()), symbol=sym, action="OPEN",
