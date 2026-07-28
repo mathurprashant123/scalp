@@ -1548,24 +1548,30 @@ def manage_open_position(state, symbol_data):
             pos["stop"] = new_stop
             print(f"  {sym}: progress reached {pos['max_progress']:.2f} (>= {trigger}) -> "
                   f"stop moved to the {lock_level:.0%} level ({old_stop:.5f} -> {new_stop:.5f})")
-
-            # ---- Push the new stop level to the exchange-side safety-net
-            # bracket too (Logic A only), so the hard protection on Delta's
-            # server stays in sync with our staircase trailing — otherwise
-            # the exchange-side stop would sit frozen at the ORIGINAL level
-            # forever, defeating the point of trailing it. ----
-            if pos.get("strategy") == "A" and pos.get("exchange_safety_stop_active") and pos.get("entry_order_id"):
-                try:
-                    edit_bracket_order(
-                        pos["entry_order_id"], pos["product_id"], sym,
-                        new_stop, target)
-                    print(f"    Exchange-side safety-net bracket updated: SL -> {new_stop:.6f}")
-                except Exception as e:
-                    print(f"    [WARN] Could not update exchange-side safety bracket "
-                          f"({e}) — local staircase stop is still correct, but the "
-                          f"exchange-side hard stop may lag behind it until this "
-                          f"succeeds on a later loop.")
         pos["milestones_locked"] = i + 1
+
+    # ---- Keep the exchange-side safety-net bracket IN SYNC with the local
+    # staircase stop (BUG FIX). Previously this push only happened once,
+    # right when a milestone first triggered — if that single attempt
+    # failed (e.g. 'market_disrupted_cancel_only_mode' during an exchange
+    # outage, observed in practice), the exchange-side hard stop stayed
+    # frozen at the OLD, wider level FOREVER, since nothing retried it
+    # unless a LATER milestone happened to trigger again. Now this runs
+    # every loop regardless of whether a new milestone triggered THIS
+    # loop, comparing the local stop against the last level we know we
+    # successfully pushed — and keeps retrying every loop until the
+    # exchange actually confirms the update, so a temporary disruption
+    # can no longer cause a permanently-stale exchange-side stop. ----
+    if pos.get("strategy") == "A" and pos.get("exchange_safety_stop_active") and pos.get("entry_order_id"):
+        if pos.get("exchange_stop_synced") != pos["stop"]:
+            try:
+                edit_bracket_order(pos["entry_order_id"], pos["product_id"], sym, pos["stop"], target)
+                pos["exchange_stop_synced"] = pos["stop"]
+                print(f"    Exchange-side safety-net bracket synced: SL -> {pos['stop']:.6f}")
+            except Exception as e:
+                print(f"    [WARN] Exchange-side bracket still out of sync with local "
+                      f"stop ({pos['stop']:.6f}) — will keep retrying every loop until "
+                      f"this succeeds ({e})")
 
     state["position"] = pos  # persist progress-tracking updates
 
@@ -2224,6 +2230,7 @@ def look_for_entry_a(state, symbol_data, products):
             "max_progress": 0.0, "strategy": "A",
             "entry_order_id": entry_order_id,
             "exchange_safety_stop_active": exchange_safety_stop_active,
+            "exchange_stop_synced": stop if exchange_safety_stop_active else None,
         }
         log_trade_event(
             time=str(now_ist()), symbol=sym, action="OPEN",
