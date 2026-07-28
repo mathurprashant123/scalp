@@ -35,7 +35,24 @@ import time
 import json
 import os
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+# All logging/display timestamps below use IST (UTC+5:30) instead of the
+# server's raw system time (Render's containers run on UTC) — purely for
+# readability, so log times match what the user actually sees on their
+# clock in India without needing to mentally add 5:30 every time. This
+# does NOT affect any actual date/time-based LOGIC — the daily circuit
+# breaker's day-boundary reset (check_daily_loss_circuit_breaker) and any
+# other real time-based decisions still explicitly use UTC, unaffected.
+IST_OFFSET = timedelta(hours=5, minutes=30)
+
+
+def now_ist():
+    """Naive datetime whose wall-clock values are IST, for display in
+    logs only — deliberately has no tzinfo attached so it prints as a
+    clean 'YYYY-MM-DD HH:MM:SS' with no confusing UTC-offset suffix.
+    Never used for any actual time-based logic/comparisons."""
+    return (datetime.now(timezone.utc) + IST_OFFSET).replace(tzinfo=None)
 
 import requests
 import pandas as pd
@@ -406,7 +423,7 @@ def get_liquidation_distance_pct(entry_price, stop_price, side, leverage):
 def fetch_candles(symbol, hours=LOOKBACK_HOURS, resolution="1m"):
     # Uses REAL_DATA_BASE_URL (production exchange), not testnet — testnet's
     # price feed is thin/simulated. Read-only public data, no key needed.
-    end = int(datetime.now().timestamp())
+    end = int(datetime.now(timezone.utc).timestamp())
     start = end - hours * 3600
     url = f"{config.REAL_DATA_BASE_URL}/v2/history/candles"
     params = {"symbol": symbol, "resolution": resolution, "start": start, "end": end}
@@ -1013,7 +1030,7 @@ def reconcile_with_exchange(state, products):
                     "symbol": sym, "product_id": product["id"], "side": side,
                     "size": abs(size), "original_size": abs(size),
                     "entry_price": entry_price, "stop": stop, "target": target,
-                    "entry_time": str(datetime.now()), "strategy": "B",
+                    "entry_time": str(now_ist()), "strategy": "B",
                     "entry_order_id": None, "bracket_active": bracket_active,
                     "bracket_sl_order_id": bracket_sl_order_id,
                     "entry_atr": entry_atr, "extreme_price": entry_price,
@@ -1078,7 +1095,7 @@ def reconcile_with_exchange(state, products):
                     "symbol": sym, "product_id": product["id"], "side": side,
                     "size": abs(size), "original_size": abs(size),
                     "entry_price": entry_price, "stop": stop, "target": target,
-                    "entry_time": str(datetime.now()), "milestones_locked": 0,
+                    "entry_time": str(now_ist()), "milestones_locked": 0,
                     "max_progress": 0.0, "strategy": "A",
                     "entry_order_id": None,  # unknown for an adopted position — see note below
                     "exchange_safety_stop_active": exchange_safety_stop_active,
@@ -1166,6 +1183,28 @@ def manage_bracket_position_b(state, pos, symbol_data):
         return
 
     if size_now == 0:
+        # ---- BUG FIX: require confirmation on a SECOND consecutive loop
+        # before trusting this. Observed in practice: during an exchange
+        # disruption event, get_position() returned a technically-valid
+        # response with size=0 even though the position was still genuinely
+        # open (confirmed afterward on the exchange's own UI) — Delta's own
+        # backend was inconsistent during that outage. Acting on a single
+        # reading caused local tracking to wrongly think the position was
+        # flat, and the bot went on to try opening brand-new trades while
+        # the real position sat unmonitored (still protected by its
+        # bracket, luckily, but untracked locally). Now requires the SAME
+        # zero-size reading on two consecutive loops (~20s apart) before
+        # believing it — a small delay in detecting a genuine close, worth
+        # it to avoid losing track of a real, still-open position. ----
+        confirmations = pos.get("_zero_size_confirmations", 0) + 1
+        if confirmations < 2:
+            pos["_zero_size_confirmations"] = confirmations
+            state["position"] = pos
+            print(f"  [WARN] {sym}: exchange shows zero size — could be a genuine "
+                  f"close, or a flaky/incomplete API response (seen during past "
+                  f"exchange disruptions). Confirming again next loop before "
+                  f"treating this as closed.")
+            return
         # Bracket already closed this position on the exchange side. We
         # don't get an exact fill price/reason from this check alone, so
         # we log it using the current market price as a reasonable proxy.
@@ -1181,7 +1220,7 @@ def manage_bracket_position_b(state, pos, symbol_data):
               f"approx gross P&L: {approx_pnl_pct:+.3f}% "
               f"(approx net after fees: {net_pnl_pct:+.3f}%)")
         log_trade_event(
-            time=str(datetime.now()), symbol=sym, action="CLOSE",
+            time=str(now_ist()), symbol=sym, action="CLOSE",
             side=("sell" if side == "long" else "buy"), size=pos["size"],
             reason="bracket_closed", entry_price=entry_price, exit_price=current_price,
             approx_gross_pnl_pct=round(approx_pnl_pct, 4),
@@ -1191,6 +1230,8 @@ def manage_bracket_position_b(state, pos, symbol_data):
         state["last_trade_close_time_b"] = time.time()
         state["position"] = None
         return
+    else:
+        pos["_zero_size_confirmations"] = 0
 
     if sym not in symbol_data:
         return
@@ -1273,7 +1314,7 @@ def manage_bracket_position_b(state, pos, symbol_data):
                                else (entry_price - current_price) / entry_price * 100)
                     net_pnl_pct = estimate_net_pnl_pct(pnl_pct, "B")
                     log_trade_event(
-                        time=str(datetime.now()), symbol=sym, action="CLOSE",
+                        time=str(now_ist()), symbol=sym, action="CLOSE",
                         side=("sell" if side == "long" else "buy"), size=pos["size"],
                         reason="early_exit_1R", entry_price=entry_price, exit_price=current_price,
                         approx_gross_pnl_pct=round(pnl_pct, 4),
@@ -1414,6 +1455,27 @@ def manage_open_position(state, symbol_data):
             size_now = pos["size"]  # assume still open this loop; try again next loop
 
         if size_now == 0:
+            # ---- BUG FIX: require confirmation on a SECOND consecutive
+            # loop before trusting this. Observed in practice during an
+            # exchange disruption event: get_position() returned size=0
+            # even though the position was still genuinely open (confirmed
+            # afterward on the exchange's own UI, still showing the exact
+            # same entry/SL/TP) — Delta's own backend was inconsistent
+            # during that outage. Acting on the single reading wrongly
+            # cleared local tracking, and the bot went on to try opening
+            # brand-new trades while the real position sat untracked
+            # locally (though still protected by its bracket on the
+            # exchange, luckily). Now requires the SAME zero-size reading
+            # on two consecutive loops (~20s apart) before believing it. ----
+            confirmations = pos.get("_zero_size_confirmations", 0) + 1
+            if confirmations < 2:
+                pos["_zero_size_confirmations"] = confirmations
+                state["position"] = pos
+                print(f"  [WARN] {sym}: exchange shows zero size — could be a genuine "
+                      f"close, or a flaky/incomplete API response (seen during past "
+                      f"exchange disruptions). Confirming again next loop before "
+                      f"treating this as closed.")
+                return
             # The exchange-side safety bracket already closed this position
             # (SL or TP triggered there). We don't get an exact fill price
             # from this simple existence-check, so we log it using the
@@ -1430,7 +1492,7 @@ def manage_open_position(state, symbol_data):
                   f"Approx exit ~{approx_exit_price:.6f}, approx gross P&L: "
                   f"{approx_pnl_pct:+.3f}% (approx net after fees: {net_pnl_pct:+.3f}%)")
             log_trade_event(
-                time=str(datetime.now()), symbol=sym, action="CLOSE",
+                time=str(now_ist()), symbol=sym, action="CLOSE",
                 side=("sell" if side == "long" else "buy"), size=pos["size"],
                 reason="exchange_bracket_closed", entry_price=entry_price,
                 exit_price=approx_exit_price, approx_gross_pnl_pct=round(approx_pnl_pct, 4),
@@ -1439,6 +1501,8 @@ def manage_open_position(state, symbol_data):
             )
             state["position"] = None
             return
+        else:
+            pos["_zero_size_confirmations"] = 0
 
     # ---- Hard stop-loss / full target check first ----
     hit_stop = hit_target = False
@@ -1551,7 +1615,7 @@ def _close_position(state, pos, price, reason, size):
         state["abnormal_fill_breaker_tripped"] = True
         state["abnormal_fill_detail"] = (
             f"{sym} closed at {actual_fill_price:.6f} vs expected {price:.6f} "
-            f"({fill_dist_pct:.1f}% away) at {datetime.now()}")
+            f"({fill_dist_pct:.1f}% away) at {now_ist()}")
 
     entry_price = pos["entry_price"]
     if side == "long":
@@ -1566,7 +1630,7 @@ def _close_position(state, pos, price, reason, size):
 
     net_pnl_pct = estimate_net_pnl_pct(gross_pnl_pct, strategy)
     log_trade_event(
-        time=str(datetime.now()), symbol=sym, action="CLOSE",
+        time=str(now_ist()), symbol=sym, action="CLOSE",
         side=close_side, size=size, reason=reason,
         entry_price=entry_price, exit_price=actual_fill_price,
         approx_gross_pnl_pct=round(gross_pnl_pct, 4),
@@ -1809,7 +1873,7 @@ def look_for_entry_b(state, symbol_data, products):
             "symbol": sym, "product_id": product["id"], "side": side,
             "size": size, "original_size": size,
             "entry_price": price_for_calc, "stop": stop, "target": target,
-            "entry_time": str(datetime.now()), "strategy": "B",
+            "entry_time": str(now_ist()), "strategy": "B",
             "entry_order_id": entry_order_id,
             "milestones_locked": 0, "max_progress": 0.0,
             "bracket_active": bracket_active,
@@ -1819,7 +1883,7 @@ def look_for_entry_b(state, symbol_data, products):
             "early_exit_done": False,
         }
         log_trade_event(
-            time=str(datetime.now()), symbol=sym, action="OPEN",
+            time=str(now_ist()), symbol=sym, action="OPEN",
             side=order_side, size=size, entry_price=price_for_calc,
             stop=stop, target=target, fill_method=method,
             order_response=json.dumps(resp), strategy="B",
@@ -2080,7 +2144,7 @@ def look_for_entry_a(state, symbol_data, products):
                         emergency_pnl_pct = (price_for_calc - exit_price) / price_for_calc * 100
                     net_pnl_pct = estimate_net_pnl_pct(emergency_pnl_pct, "A")
                     log_trade_event(
-                        time=str(datetime.now()), symbol=sym, action="CLOSE",
+                        time=str(now_ist()), symbol=sym, action="CLOSE",
                         side=close_side, size=size, reason="aborted_slippage_risk",
                         entry_price=price_for_calc, exit_price=exit_price,
                         approx_gross_pnl_pct=round(emergency_pnl_pct, 4),
@@ -2141,7 +2205,7 @@ def look_for_entry_a(state, symbol_data, products):
                     abort_pnl_pct = (price_for_calc - exit_price) / price_for_calc * 100
                 net_pnl_pct = estimate_net_pnl_pct(abort_pnl_pct, "A")
                 log_trade_event(
-                    time=str(datetime.now()), symbol=sym, action="CLOSE",
+                    time=str(now_ist()), symbol=sym, action="CLOSE",
                     side=close_side, size=size, reason="aborted_no_bracket_protection",
                     entry_price=price_for_calc, exit_price=exit_price,
                     approx_gross_pnl_pct=round(abort_pnl_pct, 4),
@@ -2156,13 +2220,13 @@ def look_for_entry_a(state, symbol_data, products):
             "symbol": sym, "product_id": product["id"], "side": side,
             "size": size, "original_size": size,
             "entry_price": price_for_calc, "stop": stop, "target": target,
-            "entry_time": str(datetime.now()), "milestones_locked": 0,
+            "entry_time": str(now_ist()), "milestones_locked": 0,
             "max_progress": 0.0, "strategy": "A",
             "entry_order_id": entry_order_id,
             "exchange_safety_stop_active": exchange_safety_stop_active,
         }
         log_trade_event(
-            time=str(datetime.now()), symbol=sym, action="OPEN",
+            time=str(now_ist()), symbol=sym, action="OPEN",
             side=order_side, size=size, entry_price=price_for_calc,
             stop=stop, target=target, fill_method=method,
             order_response=json.dumps(resp), strategy="A",
@@ -2290,7 +2354,7 @@ def main_loop(stop_event=None):
     LATEST_STATE["position"] = state["position"]
 
     while not should_stop():
-        print(f"\n[{datetime.now()}] Loop start. Position: {state['position']}")
+        print(f"\n[{now_ist()}] Loop start. Position: {state['position']}")
         try:
             run_one_loop_iteration(state, products)
         except Exception as e:
