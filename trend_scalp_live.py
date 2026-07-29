@@ -733,8 +733,16 @@ def edit_bracket_order(order_id, product_id, product_symbol, sl_price, tp_price,
     cancelling all orders and POSTing a fresh bracket (the old approach)
     fails with 'bracket_order_exists' since the existing bracket is still
     attached to the position and wasn't actually removed by a plain order
-    cancel. order_id is the id of the ORIGINAL entry order the bracket
-    was attached to (captured when the entry order was placed).
+    cancel.
+
+    order_id MUST be the bracket's own resting stop-loss leg order id
+    (fetched via get_bracket_stop_loss_order_id) — NOT the original entry
+    order's id. Confirmed against Delta's own support forum: the entry
+    order becomes 'closed' the instant it fills, so PUT-ing against it
+    is rejected as 'open order not found'. Also per Delta's docs: size
+    doesn't need to be (and can't be) specified here — an existing
+    bracket automatically covers however much of the position is
+    currently open, so this call updates SL/TP levels only.
     """
     body = {
         "id": order_id,
