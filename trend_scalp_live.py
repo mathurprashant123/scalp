@@ -1615,10 +1615,23 @@ def manage_open_position(state, symbol_data):
     LATEST_STATE["current_price"] = price
     LATEST_STATE["live_pnl_pct"] = live_pnl_pct
 
-    # ---- Logic B with an active bracket order: exchange handles the actual
-    # SL/TP execution natively. Our job here is just to detect closure and
-    # manage ATR-expansion-triggered trailing. ----
-    if pos.get("strategy") == "B" and pos.get("bracket_active", False):
+    # ---- Logic B: exchange handles the actual SL/TP execution natively.
+    # Our job here is just to detect closure and manage ATR-expansion-
+    # triggered trailing.
+    #
+    # ---- BUG FIX: this used to require bracket_active == True before even
+    # calling manage_bracket_position_b — meaning if the INITIAL bracket
+    # attach failed (e.g. 'bracket_order_exists' because a stale bracket
+    # from an earlier trade was still attached), this Logic B position got
+    # ZERO active management at all: no external-close-detection, no ATR-
+    # trailing, no staircase-sync, nothing — it just silently fell through
+    # to Logic A's code below with the wrong strategy-specific logic
+    # applied. manage_bracket_position_b() doesn't actually depend on
+    # bracket_active being True — it independently looks up whatever
+    # bracket currently exists (ours or a leftover one) via
+    # get_bracket_stop_loss_order_id, so it's safe to always call it for
+    # any Logic B position. ----
+    if pos.get("strategy") == "B":
         manage_bracket_position_b(state, pos, symbol_data)
         return
 
@@ -1749,7 +1762,18 @@ def manage_open_position(state, symbol_data):
     # successfully pushed — and keeps retrying every loop until the
     # exchange actually confirms the update, so a temporary disruption
     # can no longer cause a permanently-stale exchange-side stop. ----
-    if pos.get("strategy") == "A" and pos.get("exchange_safety_stop_active"):
+    # ---- BUG FIX: this used to require exchange_safety_stop_active == True
+    # before even trying to sync — meaning if our OWN initial bracket-attach
+    # failed (e.g. 'bracket_order_exists' because a stale bracket from an
+    # earlier trade was still attached to this symbol), staircase updates
+    # would NEVER be pushed to the exchange, no matter how many times the
+    # local stop moved. The staircase would keep computing perfectly
+    # correct tighter levels locally forever, with zero way to reach the
+    # exchange — "visible in the dashboard but never actually protecting
+    # anything for real." Now this always tries to find and edit WHATEVER
+    # bracket currently exists on this position (ours or a leftover one),
+    # regardless of whether our own attach succeeded earlier. ----
+    if pos.get("strategy") == "A":
         if pos.get("exchange_stop_synced") != pos["stop"]:
             # ---- BUG FIX: use the bracket's OWN stop-loss leg id (same
             # correct pattern Logic B already uses), not entry_order_id —
@@ -1771,6 +1795,10 @@ def manage_open_position(state, symbol_data):
                 try:
                     edit_bracket_order(bracket_sl_order_id, pos["product_id"], sym, pos["stop"], target)
                     pos["exchange_stop_synced"] = pos["stop"]
+                    # Now confirmed a real bracket exists and is manageable —
+                    # this also unlocks the external-close-detection check
+                    # above, which was gated on this same flag.
+                    pos["exchange_safety_stop_active"] = True
                     print(f"    Exchange-side safety-net bracket synced: SL -> {pos['stop']:.6f}")
                 except Exception as e:
                     # The cached id might have gone stale — refresh once and retry.
@@ -1782,6 +1810,7 @@ def manage_open_position(state, symbol_data):
                         if bracket_sl_order_id is not None:
                             edit_bracket_order(bracket_sl_order_id, pos["product_id"], sym, pos["stop"], target)
                             pos["exchange_stop_synced"] = pos["stop"]
+                            pos["exchange_safety_stop_active"] = True
                             print(f"    Exchange-side safety-net bracket synced: SL -> {pos['stop']:.6f}")
                     except Exception as e2:
                         print(f"    [WARN] Exchange-side bracket still out of sync with local "
