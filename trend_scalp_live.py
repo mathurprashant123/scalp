@@ -993,6 +993,35 @@ def reconcile_with_exchange(state, products):
             print("  No open position on exchange, and none tracked locally. Clean start.")
     else:
         sym, product, pos, size = real_position
+
+        # ---- BUG FIX: re-verify the size RIGHT NOW, one more time, before
+        # actually adopting it. The initial detection loop above could be
+        # followed by strategy-fingerprinting, candle fetches, etc. — all
+        # of which take real time, during which the exchange's actual
+        # position size could change (e.g. if it merges with another
+        # trade opened around the same time — Delta automatically nets
+        # same-direction positions on the same symbol together). Adopting
+        # a STALE, smaller size than what's really open would mean any
+        # bracket we attach only covers PART of the real position, leaving
+        # the rest silently unprotected. This was observed in practice:
+        # reconciliation read size=1.0, but the real, current position was
+        # actually 5.0 by the time adoption ran (confirmed via a
+        # 'bracket_order_exists' rejection — a bracket already existed for
+        # a DIFFERENT size than what we were about to track). ----
+        try:
+            fresh_pos = client.get_position(product["id"])
+            if isinstance(fresh_pos, dict) and fresh_pos.get("size"):
+                fresh_size = float(fresh_pos["size"])
+                if fresh_size != size:
+                    print(f"  [INFO] {sym}: re-verified size just before adopting — "
+                          f"was {size}, now {fresh_size} (likely merged with another "
+                          f"position in the meantime). Using the fresher value.")
+                    size = fresh_size
+                    pos = fresh_pos
+        except Exception as e:
+            print(f"  [WARN] {sym}: couldn't re-verify size before adopting ({e}) — "
+                  f"proceeding with the earlier reading ({size}).")
+
         entry_price = float(pos.get("entry_price", 0))
         side = "long" if size > 0 else "short"
         if state["position"] is not None and state["position"]["symbol"] == sym:
