@@ -95,7 +95,14 @@ MAX_SLIPPAGE_RISK_MULT = 2.0
 LEVERAGE = 10
 MARGIN_SAFETY_FACTOR = 0.90    # only use 90% of calculated max notional, leaves buffer
 EMA_PERIOD = 200
-VWAP_PROXIMITY_PCT = 0.15
+VWAP_PROXIMITY_PCT = 0.25  # Widened from 0.15% -> 0.25% (see conversation): after
+                           # restricting Logic A to BTC/ETH only, this filter was
+                           # found to be starving Logic A of almost all entries,
+                           # since these two coins trend/move away from VWAP more
+                           # than the altcoins previously watched. 0.25% was chosen
+                           # as the value that captures real near-miss cases seen
+                           # in practice (0.23-0.245% distances) without loosening
+                           # much further than that.
 CVD_LOOKBACK = 10
 SWING_LOOKBACK = 15
 STOP_BUFFER_PCT = 0.05
