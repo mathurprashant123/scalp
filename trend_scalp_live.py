@@ -494,14 +494,22 @@ def get_wallet_total_balance():
 def get_authoritative_entry_price(product_id, retries=5, delay=1.0):
     """
     After placing a market entry order, polls the exchange's own position
-    endpoint to find the REAL entry price it recorded — this is the single
-    source of truth for what actually happened, more reliable than parsing
-    the order response or guessing based on a slippage-percentage
-    threshold (which previously caused a genuine large-slippage fill to
-    be wrongly discarded as "corrupted data", leaving our internal
-    tracking completely disconnected from the real position).
-    Returns None if no position shows up in time (caller should fall back
-    to the order-response-based price in that case).
+    endpoint to find the REAL entry price AND size it recorded — this is
+    the single source of truth for what actually happened, more reliable
+    than parsing the order response or guessing. Returns (price, size),
+    or (None, None) if no position shows up in time (caller should fall
+    back to its own tracking in that case).
+
+    Checking size here too (not just price) catches a related issue:
+    if this symbol already had a small pre-existing residual position
+    (e.g. leftover from an earlier partial-close), Delta nets same-
+    direction fills together automatically — so the REAL resulting size
+    can differ from what we just requested. Observed in practice: we
+    requested/expected 47 lots, but the real resulting position was only
+    43 lots. The bracket protection isn't affected either way (Delta
+    brackets auto-cover whatever the current real size is), but our own
+    LOCAL size tracking (used for P&L math and for sizing later reduce-
+    only close orders) needs the real number to stay accurate.
     """
     for _ in range(retries):
         time.sleep(delay)
@@ -513,8 +521,8 @@ def get_authoritative_entry_price(product_id, retries=5, delay=1.0):
         if size != 0:
             entry_price = pos.get("entry_price")
             if entry_price is not None:
-                return float(entry_price)
-    return None
+                return float(entry_price), abs(size)
+    return None, None
 
 
 def _extract_fill_price(response):
@@ -1957,7 +1965,7 @@ def look_for_entry_b(state, symbol_data, products):
         # a slippage-percentage threshold, since a genuinely large slippage
         # fill was previously discarded as "corrupted data" this way,
         # leaving our internal tracking disconnected from the real position.
-        price_for_calc = get_authoritative_entry_price(product["id"])
+        price_for_calc, real_size = get_authoritative_entry_price(product["id"])
         if price_for_calc is None:
             # Fall back to whatever the order response itself reports, and
             # failing that, the testnet exec_price (much closer to reality
@@ -1967,10 +1975,17 @@ def look_for_entry_b(state, symbol_data, products):
             price_for_calc = fallback if fallback is not None else exec_price
             print(f"    [WARN] Couldn't confirm entry price from the exchange's position "
                   f"record — using {price_for_calc:.5f} as a fallback (verify manually).")
-        elif abs(price_for_calc - exec_price) / exec_price * 100 > 0.02:
-            print(f"    [INFO] Testnet exec_price estimate was {exec_price:.5f}, exchange "
-                  f"confirms REAL entry was {price_for_calc:.5f} (verified via position "
-                  f"record) — recalculating stop/target from this real entry price.")
+        else:
+            if abs(price_for_calc - exec_price) / exec_price * 100 > 0.02:
+                print(f"    [INFO] Testnet exec_price estimate was {exec_price:.5f}, exchange "
+                      f"confirms REAL entry was {price_for_calc:.5f} (verified via position "
+                      f"record) — recalculating stop/target from this real entry price.")
+            if real_size is not None and real_size != size:
+                print(f"    [INFO] Requested/expected size was {size}, but the real resulting "
+                      f"position size is {real_size} (likely merged with a small pre-existing "
+                      f"residual on this symbol) — using the real size for tracking so P&L "
+                      f"and future closes stay accurate.")
+                size = real_size
 
         # ---- Recompute SL/TP from the REAL entry price, with TP forced to
         # a fixed risk:reward ratio off the SL distance (matches reference
@@ -2233,74 +2248,81 @@ def look_for_entry_a(state, symbol_data, products):
         # threshold (see Logic B's identical fix for why — a genuinely
         # large slippage fill was previously discarded as "bad data" this
         # way, leaving our tracking disconnected from the real position).
-        price_for_calc = get_authoritative_entry_price(product["id"])
+        price_for_calc, real_size = get_authoritative_entry_price(product["id"])
         if price_for_calc is None:
             fallback = _extract_fill_price(resp)
             price_for_calc = fallback if fallback is not None else price
             print(f"    [WARN] Couldn't confirm entry price from the exchange's position "
                   f"record — using {price_for_calc:.5f} as a fallback (verify manually).")
-        elif abs(price_for_calc - price) / price * 100 > 0.02:
-            print(f"    [INFO] Signal price was {price:.5f}, exchange confirms REAL entry "
-                  f"was {price_for_calc:.5f} (verified via position record, not guessed) "
-                  f"— recalculating stop/target from this real entry price.")
-            if side == "long":
-                stop = swing_low(df, i) * (1 - STOP_BUFFER_PCT / 100)
-                stop_dist_pct = (price_for_calc - stop) / price_for_calc * 100
-                target = price_for_calc * (1 + (stop_dist_pct * RISK_REWARD_MULT) / 100)
-            else:
-                stop = swing_high(df, i) * (1 + STOP_BUFFER_PCT / 100)
-                stop_dist_pct = (stop - price_for_calc) / price_for_calc * 100
-                target = price_for_calc * (1 - (stop_dist_pct * RISK_REWARD_MULT) / 100)
+        else:
+            if real_size is not None and real_size != size:
+                print(f"    [INFO] Requested/expected size was {size}, but the real resulting "
+                      f"position size is {real_size} (likely merged with a small pre-existing "
+                      f"residual on this symbol) — using the real size for tracking so P&L "
+                      f"and future closes stay accurate.")
+                size = real_size
+            if abs(price_for_calc - price) / price * 100 > 0.02:
+                print(f"    [INFO] Signal price was {price:.5f}, exchange confirms REAL entry "
+                      f"was {price_for_calc:.5f} (verified via position record, not guessed) "
+                      f"— recalculating stop/target from this real entry price.")
+                if side == "long":
+                    stop = swing_low(df, i) * (1 - STOP_BUFFER_PCT / 100)
+                    stop_dist_pct = (price_for_calc - stop) / price_for_calc * 100
+                    target = price_for_calc * (1 + (stop_dist_pct * RISK_REWARD_MULT) / 100)
+                else:
+                    stop = swing_high(df, i) * (1 + STOP_BUFFER_PCT / 100)
+                    stop_dist_pct = (stop - price_for_calc) / price_for_calc * 100
+                    target = price_for_calc * (1 - (stop_dist_pct * RISK_REWARD_MULT) / 100)
 
-            # ---- Slippage risk-ballooning safety check (BUG FIX) ----
-            # Position SIZE above was computed assuming `intended_stop_dist_pct`
-            # (a small, tight risk % relative to the SIGNAL price). The swing-
-            # based stop is an ABSOLUTE price level that doesn't move just
-            # because the real fill came in far from the signal price — so if
-            # a large slippage/gap happens on entry (testnet price anomalies
-            # have been observed at 1-3%+), the REAL stop_dist_pct relative to
-            # the ACTUAL entry can balloon to several times what was intended,
-            # meaning the real dollar-risk on this trade is now much bigger
-            # than RISK_PER_TRADE_PCT of the account was ever meant to allow —
-            # this actually happened in practice (0.51% intended -> 3.41%
-            # realized, a 6.7x risk blowup, contributing to a real ~10%
-            # single-trade account loss that tripped the daily circuit
-            # breaker). Rather than holding a position whose real risk no
-            # longer matches what it was sized for, close it immediately here.
-            if stop_dist_pct > intended_stop_dist_pct * MAX_SLIPPAGE_RISK_MULT:
-                print(f"    [WARN] Real stop distance ({stop_dist_pct:.2f}%) is "
-                      f"{stop_dist_pct / intended_stop_dist_pct:.1f}x the intended "
-                      f"({intended_stop_dist_pct:.2f}%) this position's size was "
-                      f"calculated for — the slippage on this fill made the real "
-                      f"risk far bigger than sized for. Closing immediately instead "
-                      f"of holding an oversized-risk position.")
-                close_side = "sell" if side == "long" else "buy"
-                try:
-                    close_resp, close_method = place_order_with_fallback(
-                        product["id"], close_side, size, price_for_calc, reduce_only=True)
-                    exit_price = _extract_fill_price(close_resp) or price_for_calc
-                except Exception as e:
-                    print(f"    [WARN] Emergency close order failed ({e}) — falling back "
-                          f"to normal position tracking with the wide stop instead; "
-                          f"monitor this trade manually.")
-                    exit_price = None
-                if exit_price is not None:
-                    if side == "long":
-                        emergency_pnl_pct = (exit_price - price_for_calc) / price_for_calc * 100
-                    else:
-                        emergency_pnl_pct = (price_for_calc - exit_price) / price_for_calc * 100
-                    net_pnl_pct = estimate_net_pnl_pct(emergency_pnl_pct, "A")
-                    log_trade_event(
-                        time=str(now_ist()), symbol=sym, action="CLOSE",
-                        side=close_side, size=size, reason="aborted_slippage_risk",
-                        entry_price=price_for_calc, exit_price=exit_price,
-                        approx_gross_pnl_pct=round(emergency_pnl_pct, 4),
-                        approx_net_pnl_pct_after_fees=round(net_pnl_pct, 4),
-                        fill_method=close_method, strategy="A",
-                    )
-                    print(f"    Closed immediately due to slippage risk. Approx P&L: "
-                          f"{emergency_pnl_pct:+.3f}% (net after fees: {net_pnl_pct:+.3f}%)")
-                    continue  # skip attaching a bracket / opening state["position"] below
+                    # ---- Slippage risk-ballooning safety check (BUG FIX) ----
+                # Position SIZE above was computed assuming `intended_stop_dist_pct`
+                # (a small, tight risk % relative to the SIGNAL price). The swing-
+                # based stop is an ABSOLUTE price level that doesn't move just
+                # because the real fill came in far from the signal price — so if
+                # a large slippage/gap happens on entry (testnet price anomalies
+                # have been observed at 1-3%+), the REAL stop_dist_pct relative to
+                # the ACTUAL entry can balloon to several times what was intended,
+                # meaning the real dollar-risk on this trade is now much bigger
+                # than RISK_PER_TRADE_PCT of the account was ever meant to allow —
+                # this actually happened in practice (0.51% intended -> 3.41%
+                # realized, a 6.7x risk blowup, contributing to a real ~10%
+                # single-trade account loss that tripped the daily circuit
+                # breaker). Rather than holding a position whose real risk no
+                # longer matches what it was sized for, close it immediately here.
+                if stop_dist_pct > intended_stop_dist_pct * MAX_SLIPPAGE_RISK_MULT:
+                    print(f"    [WARN] Real stop distance ({stop_dist_pct:.2f}%) is "
+                          f"{stop_dist_pct / intended_stop_dist_pct:.1f}x the intended "
+                          f"({intended_stop_dist_pct:.2f}%) this position's size was "
+                          f"calculated for — the slippage on this fill made the real "
+                          f"risk far bigger than sized for. Closing immediately instead "
+                          f"of holding an oversized-risk position.")
+                    close_side = "sell" if side == "long" else "buy"
+                    try:
+                        close_resp, close_method = place_order_with_fallback(
+                            product["id"], close_side, size, price_for_calc, reduce_only=True)
+                        exit_price = _extract_fill_price(close_resp) or price_for_calc
+                    except Exception as e:
+                        print(f"    [WARN] Emergency close order failed ({e}) — falling back "
+                              f"to normal position tracking with the wide stop instead; "
+                              f"monitor this trade manually.")
+                        exit_price = None
+                    if exit_price is not None:
+                        if side == "long":
+                            emergency_pnl_pct = (exit_price - price_for_calc) / price_for_calc * 100
+                        else:
+                            emergency_pnl_pct = (price_for_calc - exit_price) / price_for_calc * 100
+                        net_pnl_pct = estimate_net_pnl_pct(emergency_pnl_pct, "A")
+                        log_trade_event(
+                            time=str(now_ist()), symbol=sym, action="CLOSE",
+                            side=close_side, size=size, reason="aborted_slippage_risk",
+                            entry_price=price_for_calc, exit_price=exit_price,
+                            approx_gross_pnl_pct=round(emergency_pnl_pct, 4),
+                            approx_net_pnl_pct_after_fees=round(net_pnl_pct, 4),
+                            fill_method=close_method, strategy="A",
+                        )
+                        print(f"    Closed immediately due to slippage risk. Approx P&L: "
+                              f"{emergency_pnl_pct:+.3f}% (net after fees: {net_pnl_pct:+.3f}%)")
+                        continue  # skip attaching a bracket / opening state["position"] below
 
         # ---- Safety-net exchange-side stop (NEW) ----
         # Logic A's staircase-trailing stop previously lived ONLY inside
