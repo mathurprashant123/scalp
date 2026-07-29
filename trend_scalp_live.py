@@ -143,6 +143,19 @@ LIMIT_OFFSET_PCT = 0.02
 MAX_CLOSE_SLIPPAGE_PCT = 3.0
 BOUNDED_CLOSE_WAIT_SECONDS = 10
 
+# Logic B safety net: if the exchange-side bracket sync has been failing
+# continuously for this many seconds (e.g. persistent CloudFront 403s
+# blocking the lookup needed to update it — observed in practice lasting
+# 30+ minutes straight), and price crosses the LOCALLY-intended (tighter)
+# stop in the meantime, close the position directly via our own market
+# order instead of waiting indefinitely for the exchange sync to succeed.
+# The OLD, wider bracket level is still live on the exchange the whole
+# time as a backstop — this just adds protection at the INTENDED tighter
+# level too, closing the gap Logic A already had via its own local
+# candle-based stop check (which Logic B never had, since B was designed
+# to rely entirely on the exchange-side bracket).
+LOGIC_B_LOCAL_FALLBACK_SECONDS = 120
+
 # Sanity check: if a reported fill price differs from the signal price by
 # more than this %, treat it as corrupted/wrong exchange data rather than
 # a genuine slippage event (real market-order slippage this large in under
@@ -1317,6 +1330,63 @@ def manage_bracket_position_b(state, pos, symbol_data):
 
     if pd.isna(current_atr) or entry_atr is None or entry_atr <= 0:
         return
+
+    # ---- NEW: Local safety-net fallback for persistent exchange-sync
+    # failures. Track how long pos["stop"] (our locally-intended level)
+    # has differed from pos["exchange_stop_synced"] (what's actually
+    # confirmed live on the exchange). If that gap has persisted for
+    # LOGIC_B_LOCAL_FALLBACK_SECONDS or more (observed in practice:
+    # CloudFront 403s blocking the sync lookup for 30+ minutes straight)
+    # AND price has now crossed the intended (tighter) stop, close the
+    # position ourselves directly — don't keep waiting indefinitely for
+    # the exchange sync to succeed. The OLD, wider exchange-side bracket
+    # is still live as a backstop the whole time regardless; this adds
+    # protection at the level we actually intended, closing the exact
+    # gap Logic A already covered via its own local candle-based check
+    # (which Logic B never had, having been designed to rely entirely on
+    # the exchange-side bracket).
+    stop_confirmed_synced = pos.get("exchange_stop_synced") == pos["stop"]
+    if stop_confirmed_synced:
+        pos["stop_sync_failing_since"] = None
+    else:
+        if pos.get("stop_sync_failing_since") is None:
+            pos["stop_sync_failing_since"] = time.time()
+        failing_for = time.time() - pos["stop_sync_failing_since"]
+        stop_hit_locally = ((side == "long" and current_price <= pos["stop"]) or
+                             (side == "short" and current_price >= pos["stop"]))
+        if failing_for >= LOGIC_B_LOCAL_FALLBACK_SECONDS and stop_hit_locally:
+            print(f"  [WARN] {sym}: exchange-side bracket sync has been failing for "
+                  f"{failing_for:.0f}s AND price ({current_price:.6f}) has now crossed "
+                  f"the intended stop ({pos['stop']:.6f}) — closing directly via a local "
+                  f"market order instead of waiting any longer for the exchange sync.")
+            try:
+                close_resp, close_method = place_market_order_direct(
+                    pos["product_id"], ("sell" if side == "long" else "buy"),
+                    pos["size"], reduce_only=True)
+                exit_price = _extract_fill_price(close_resp) or current_price
+                entry_price = pos["entry_price"]
+                if side == "long":
+                    pnl_pct = (exit_price - entry_price) / entry_price * 100
+                else:
+                    pnl_pct = (entry_price - exit_price) / entry_price * 100
+                net_pnl_pct = estimate_net_pnl_pct(pnl_pct, "B")
+                log_trade_event(
+                    time=str(now_ist()), symbol=sym, action="CLOSE",
+                    side=("sell" if side == "long" else "buy"), size=pos["size"],
+                    reason="local_fallback_stop", entry_price=entry_price, exit_price=exit_price,
+                    approx_gross_pnl_pct=round(pnl_pct, 4),
+                    approx_net_pnl_pct_after_fees=round(net_pnl_pct, 4),
+                    fill_method=close_method, strategy="B",
+                )
+                print(f"  {sym}: closed via local fallback. Approx gross P&L: {pnl_pct:+.3f}% "
+                      f"(net after fees: {net_pnl_pct:+.3f}%)")
+                state["last_trade_close_time_b"] = time.time()
+                state["position"] = None
+                return
+            except Exception as e:
+                print(f"  [WARN] {sym}: local fallback close attempt failed too ({e}) — "
+                      f"will retry next loop. The original exchange-side bracket is still "
+                      f"live as a backstop in the meantime.")
 
     # Track the best (most favorable) price seen so far
     extreme = pos.get("extreme_price", pos["entry_price"])
