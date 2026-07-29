@@ -1434,12 +1434,38 @@ def manage_bracket_position_b(state, pos, symbol_data):
             else:
                 # Couldn't find the bracket's stop-loss leg — fall back to the
                 # cancel+recreate approach as a last resort.
+                #
+                # ---- BUG FIX: fetch the REAL, current size from the exchange
+                # first, rather than trusting our own tracked pos["size"].
+                # If this position ever merged with another trade opened on
+                # the same symbol (Delta nets same-direction positions
+                # together automatically — observed in practice: a Logic-B
+                # entry combined with an existing untracked position into
+                # one bigger position), our local pos["size"] could be
+                # SMALLER than the real size. Recreating the bracket using
+                # the stale, smaller size would leave the extra (merged-in)
+                # portion of the position completely UNPROTECTED. ----
                 print(f"  [WARN] {sym}: couldn't find the bracket's stop-loss leg order — "
                       f"falling back to cancel+recreate.")
+                real_size = pos["size"]
+                try:
+                    live_pos = client.get_position(pos["product_id"])
+                    if isinstance(live_pos, dict) and live_pos.get("size"):
+                        real_size = abs(float(live_pos["size"]))
+                        if real_size != pos["size"]:
+                            print(f"  [INFO] {sym}: real exchange size ({real_size}) differs "
+                                  f"from locally tracked size ({pos['size']}) — likely merged "
+                                  f"with another position. Using the real size for the "
+                                  f"recreated bracket so the FULL position stays protected.")
+                            pos["size"] = real_size
+                except Exception as e:
+                    print(f"  [WARN] {sym}: couldn't verify real position size before "
+                          f"recreating bracket ({e}) — using last-known local size "
+                          f"({real_size}) as a fallback.")
                 cancel_all_orders_for_product(pos["product_id"])
                 place_bracket_with_retry(
                     pos["product_id"], sym, ("buy" if side == "long" else "sell"),
-                    pos["size"], pos["stop"], far_tp, side)
+                    real_size, pos["stop"], far_tp, side)
             pos["exchange_stop_synced"] = pos["stop"]
             print(f"  {sym}: exchange-side bracket synced: SL -> {pos['stop']:.6f}")
         except Exception as e:
