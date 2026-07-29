@@ -64,15 +64,18 @@ from trend_scalp_indicators import (compute_ema, compute_vwap, compute_cvd, cvd_
 
 # ---------------- SETTINGS ----------------
 SYMBOLS_TO_WATCH = [
-    # RESTRICTED to BTC/ETH only (matches LOGIC_B_SYMBOLS below). Every
-    # real incident hit in practice — the DOGEUSD entry-price doubling/
-    # corruption, the ADAUSD near-zero catastrophic fill, repeated
-    # bracket_order_immediate_execution rejections — happened specifically
-    # on the smaller/thinner altcoins (SOL/XRP/DOGE/ADA), never on BTC/ETH.
-    # Those coins previously watched (still left here, commented, in case
-    # testnet liquidity/data quality improves later and you want them back):
-    #   "SOLUSD", "XRPUSD", "DOGEUSD", "ADAUSD",
-    "BTCUSD", "ETHUSD",
+    # TEMPORARY (see conversation, 2026-07-29): BTC and ETH both have stuck
+    # residual positions on the exchange right now (testnet data-corruption,
+    # same issue DOGE had earlier) that won't close, blocking new trades on
+    # those two symbols entirely. Added SOLUSD/XRPUSD back TEMPORARILY so
+    # testing isn't blocked overnight. Once BTC/ETH residuals clear (or get
+    # resolved another way), remove these two again and go back to
+    # BTC/ETH-only — they were removed originally because every real
+    # incident (entry-price corruption, near-zero catastrophic fill,
+    # repeated bracket rejections) happened specifically on these thinner
+    # altcoins, never on BTC/ETH.
+    "BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD",
+    # Still excluded (were also problematic): "DOGEUSD", "ADAUSD",
 ]
 
 # Logic B specifically only watches these — the smaller, low-priced coins
