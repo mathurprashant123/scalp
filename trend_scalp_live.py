@@ -222,7 +222,10 @@ COOLDOWN_SECONDS = 10      # min gap after any close before a new entry
                             # LOOP_INTERVAL_SECONDS=60s anyway, so a 10s
                             # cooldown has no extra effect beyond that —
                             # kept here for transparency/config completeness)
-FIXED_SIZE = 0             # 0 = use risk-based sizing (not a fixed lot count)
+FIXED_SIZE = 0             # 0 = use risk-based sizing (not a fixed lot count).
+                           # (Fixed-1-lot mode was tried and reverted per user
+                           # request — code support for it is left in place
+                           # below in case it's wanted again later.)
 # ================================================================
 
 
@@ -507,15 +510,23 @@ def get_authoritative_entry_price(product_id, retries=5, delay=1.0):
 def _extract_fill_price(response):
     """
     Tries to find the actual average fill price from an order response.
-    Field names are checked defensively (average_fill_price, avg_fill_price,
-    price) since the exact SDK response shape wasn't verified against a
-    live account from this build environment (no internet access here).
-    Returns None if no usable price field is found — caller should fall
-    back to the pre-order signal price in that case.
+
+    IMPORTANT: 'limit_price' is deliberately NOT in this list. It used to
+    be, as a defensive fallback — but that caused a real, serious bug:
+    for MARKET orders, 'limit_price' in Delta's response is just a
+    meaningless placeholder (observed in practice: Delta echoes back
+    something like 0.1 for market sell orders, visible in the exported
+    order-history CSV's "Order Price" column too). When the real fill
+    fields weren't found, this function was grabbing that placeholder
+    and treating it as the actual fill price — producing a fabricated
+    "-100% loss" trade-log entry (entry ~63781, "exit" 0.1) that never
+    actually happened. If none of the REAL fill-price fields below are
+    present, return None and let the caller fall back to its own
+    reference price (e.g. the recent candle close) instead.
     """
     if not isinstance(response, dict):
         return None
-    for key in ("average_fill_price", "avg_fill_price", "price", "limit_price"):
+    for key in ("average_fill_price", "avg_fill_price", "price"):
         val = response.get(key)
         if val is not None:
             try:
@@ -2114,13 +2125,16 @@ def look_for_entry_a(state, symbol_data, products):
                   else price * (1 - target_move_pct / 100))
 
         available = get_wallet_available_balance()
-        risk_amount = available * (RISK_PER_TRADE_PCT / 100)
-        max_notional = available * LEVERAGE * MARGIN_SAFETY_FACTOR
-        notional = min(risk_amount / (stop_dist_pct / 100), max_notional)
-
         product = products[sym]
-        contract_value = float(product.get("contract_value", 1))
-        size = max(1, round(notional / (contract_value * price)))
+        if FIXED_SIZE and FIXED_SIZE > 0:
+            size = FIXED_SIZE
+        else:
+            risk_amount = available * (RISK_PER_TRADE_PCT / 100)
+            max_notional = available * LEVERAGE * MARGIN_SAFETY_FACTOR
+            notional = min(risk_amount / (stop_dist_pct / 100), max_notional)
+
+            contract_value = float(product.get("contract_value", 1))
+            size = max(1, round(notional / (contract_value * price)))
 
         order_side = "buy" if side == "long" else "sell"
         limit_price = (price * (1 - LIMIT_OFFSET_PCT / 100) if side == "long"
