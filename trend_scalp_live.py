@@ -190,7 +190,14 @@ TRADES_LOG_B = "trend_trades_log_B.csv"  # Logic B trades — kept separate
 # ================================================================
 # Controls which logic(s) are active — changeable LIVE from the dashboard
 # without restarting the algo. Values: "A", "B", or "BOTH".
-LOGIC_MODE = {"active": "BOTH"}
+LOGIC_MODE = {"active": "A"}  # Default changed from "BOTH" to "A" per user
+                              # request — even in a worst-case where the
+                              # saved state file is somehow completely lost
+                              # (e.g. a full Render redeploy that wipes the
+                              # ephemeral disk), the bot now falls back to
+                              # Logic A only, not silently to BOTH. Combined
+                              # with the state-persistence fix above, this
+                              # is now protected on two independent levels.
 
 # "crossover" = only signal on a FRESH EMA cross (fewer, more selective entries)
 # "trend"     = signal on EVERY loop where price/EMAs stay aligned with the
@@ -1836,9 +1843,33 @@ def _close_position(state, pos, price, reason, size):
     except Exception as e:
         if "no_position_for_reduce_only" in str(e):
             print(f"  [INFO] {sym}: exchange says there's no position left to close "
-                  f"(it must have already been closed — possibly by a duplicate "
-                  f"running instance of this script, or manually). Clearing local "
-                  f"tracking, no action needed.")
+                  f"(it must have already been closed — possibly by the exchange-side "
+                  f"bracket triggering just before our own attempt, a duplicate running "
+                  f"instance of this script, or manually). Clearing local tracking.")
+            # ---- BUG FIX: this used to just clear state and return, WITHOUT
+            # ever logging a trade-close-event — meaning any trade closed
+            # this way (observed to happen often, since Logic B especially
+            # relies on the exchange bracket for the real execution) was
+            # completely invisible in our own trades-log (Logic A/B dashboard
+            # pages), even though it genuinely happened and is recorded in
+            # Delta's own order history. We don't know the EXACT fill price
+            # here, so we log using the last-known reference price as a
+            # reasonable approximation — better than the trade vanishing
+            # from our records entirely. ----
+            entry_price = pos["entry_price"]
+            if side == "long":
+                approx_pnl_pct = (price - entry_price) / entry_price * 100
+            else:
+                approx_pnl_pct = (entry_price - price) / entry_price * 100
+            net_pnl_pct = estimate_net_pnl_pct(approx_pnl_pct, strategy)
+            log_trade_event(
+                time=str(now_ist()), symbol=sym, action="CLOSE",
+                side=close_side, size=size,
+                reason="closed_before_our_order_approx", entry_price=entry_price,
+                exit_price=price, approx_gross_pnl_pct=round(approx_pnl_pct, 4),
+                approx_net_pnl_pct_after_fees=round(net_pnl_pct, 4),
+                fill_method="unknown_exchange_side", strategy=strategy,
+            )
             if strategy == "B":
                 state["last_trade_close_time_b"] = time.time()
             state["position"] = None
@@ -2624,6 +2655,17 @@ def main_loop(stop_event=None):
         return stop_event is not None and stop_event.is_set()
 
     state = load_state()
+
+    # ---- BUG FIX: restore the last-chosen Active Logic mode (A/B/BOTH)
+    # from the saved state. Previously LOGIC_MODE only lived in memory,
+    # so any restart silently reverted it to "BOTH" — meaning a user who
+    # explicitly selected "Logic A Only" could have Logic B quietly start
+    # trading again after any restart, without them re-selecting it. ----
+    saved_mode = state.get("logic_mode")
+    if saved_mode in ("A", "B", "BOTH"):
+        LOGIC_MODE["active"] = saved_mode
+        print(f"Restored Active Logic mode from saved state: {saved_mode}")
+
     products = get_product_map()
     print(f"Loaded products: {list(products.keys())}")
     print(f"Fee-aware minimum target: {MIN_TARGET_PCT:.3f}% "

@@ -568,6 +568,7 @@ PAGE_TEMPLATE = """
                     <div id="pnlValue" class="${pnlClass}">${pnlText}</div>
                     <div class="pnl-row"><span>Strategy</span><span><b>Logic ${data.strategy}</b></span></div>
                     <div class="pnl-row"><span>${data.symbol}</span><span>${data.side.toUpperCase()}</span></div>
+                    <div class="pnl-row"><span>Lot Size</span><span>${data.size}</span></div>
                     <div class="pnl-row"><span>Entry</span><span>${data.entry_price}</span></div>
                     <div class="pnl-row"><span>Current</span><span>${data.current_price ?? '—'}</span></div>
                     <div class="pnl-row"><span>Stop</span><span>${data.stop}</span></div>
@@ -671,6 +672,17 @@ def set_logic_mode():
     if mode not in ("A", "B", "BOTH"):
         return jsonify({"ok": False, "error": "mode must be A, B, or BOTH"}), 400
     algo.LOGIC_MODE["active"] = mode
+    # ---- BUG FIX: this used to live ONLY in memory (algo.LOGIC_MODE), never
+    # saved anywhere — so any restart (STOP/START, or the process getting
+    # recycled) silently reset it back to the "BOTH" default, even if the
+    # user had explicitly chosen "Logic A Only". Now persisted into the
+    # state file too, so a restart picks up the last choice instead of
+    # silently reverting. (Note: a full Render REDEPLOY that wipes the
+    # ephemeral disk would still reset this — always worth checking the
+    # dashboard's Active Logic buttons right after a fresh deploy.) ----
+    state = algo.load_state()
+    state["logic_mode"] = mode
+    algo.save_state(state)
     return jsonify({"ok": True, "mode": mode})
 
 
