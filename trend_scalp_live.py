@@ -64,18 +64,18 @@ from trend_scalp_indicators import (compute_ema, compute_vwap, compute_cvd, cvd_
 
 # ---------------- SETTINGS ----------------
 SYMBOLS_TO_WATCH = [
-    # TEMPORARY (see conversation, 2026-07-29): BTC and ETH both have stuck
-    # residual positions on the exchange right now (testnet data-corruption,
-    # same issue DOGE had earlier) that won't close, blocking new trades on
-    # those two symbols entirely. Added SOLUSD/XRPUSD back TEMPORARILY so
-    # testing isn't blocked overnight. Once BTC/ETH residuals clear (or get
-    # resolved another way), remove these two again and go back to
-    # BTC/ETH-only — they were removed originally because every real
-    # incident (entry-price corruption, near-zero catastrophic fill,
-    # repeated bracket rejections) happened specifically on these thinner
-    # altcoins, never on BTC/ETH.
-    "BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD",
-    # Still excluded (were also problematic): "DOGEUSD", "ADAUSD",
+    # RESTRICTED back to BTC/ETH only (2026-07-30). SOL/XRP were added
+    # temporarily on 2026-07-29 while BTC/ETH had stuck residual positions
+    # blocking new trades — that issue has since cleared. Meanwhile SOLUSD
+    # just produced ANOTHER catastrophic-fill incident (three LONG entries
+    # in ~20 minutes, real fill ~$77.85 vs signal price ~$73.95 — a ~5.2%
+    # jump), confirming the same testnet-liquidity problem that caused
+    # every prior incident on the thinner altcoins (DOGE, ADA). The
+    # slippage safety-net caught each one and closed immediately, so no
+    # major loss occurred — but the underlying cause (SOL's testnet
+    # liquidity) hasn't improved, so back to BTC/ETH-only.
+    "BTCUSD", "ETHUSD",
+    # Still excluded (all previously problematic): "DOGEUSD", "ADAUSD", "SOLUSD", "XRPUSD",
 ]
 
 # Logic B specifically only watches these — the smaller, low-priced coins
@@ -269,9 +269,19 @@ client = DeltaRestClient(base_url=config.BASE_URL, api_key=config.API_KEY, api_s
 TRADE_LOG_COLUMNS = [
     "time", "symbol", "action", "side", "size", "entry_price", "exit_price",
     "stop", "target", "reason", "approx_gross_pnl_pct",
-    "approx_net_pnl_pct_after_fees", "fill_method",
-    "order_response", "strategy",
+    "approx_net_pnl_pct_after_fees", "gross_pnl_amount", "fees_amount",
+    "net_pnl_amount", "fill_method", "order_response", "strategy",
 ]
+
+# Known contract-values for the symbols this bot trades — used to convert
+# %-based P&L into actual dollar amounts for the trades log. These are
+# stable, well-known constants (confirmed repeatedly via the exchange's
+# own "Setting leverage..." startup log each run), not fetched live here
+# to keep log_trade_event() simple and independent of any API call.
+CONTRACT_VALUES = {
+    "BTCUSD": 0.001, "ETHUSD": 0.01, "XRPUSD": 1, "SOLUSD": 1,
+    "DOGEUSD": 1, "ADAUSD": 1,
+}
 
 
 def estimate_net_pnl_pct(gross_pnl_pct, strategy):
@@ -315,8 +325,31 @@ def log_trade_event(**fields):
     MISALIGNMENT (values silently shift into the wrong columns) since the
     file's header is only written once, from whichever row happened to
     be first — a real bug this fixes.
+
+    ---- NEW: also computes actual DOLLAR-amount P&L and fees (not just
+    %), using entry_price * size * contract_value as the notional. This
+    is computed here centrally (rather than at every call site) so every
+    CLOSE event automatically gets both percentage and dollar figures. ----
     """
     row = {col: fields.get(col, "") for col in TRADE_LOG_COLUMNS}
+
+    gross_pct = fields.get("approx_gross_pnl_pct")
+    net_pct = fields.get("approx_net_pnl_pct_after_fees")
+    entry_price = fields.get("entry_price")
+    size = fields.get("size")
+    symbol = fields.get("symbol")
+    if gross_pct is not None and entry_price and size and symbol:
+        cv = CONTRACT_VALUES.get(symbol, 1)
+        try:
+            notional = float(entry_price) * float(size) * cv
+            gross_amount = float(gross_pct) / 100 * notional
+            net_amount = (float(net_pct) / 100 * notional) if net_pct is not None else gross_amount
+            row["gross_pnl_amount"] = round(gross_amount, 4)
+            row["net_pnl_amount"] = round(net_amount, 4)
+            row["fees_amount"] = round(gross_amount - net_amount, 4)
+        except (TypeError, ValueError):
+            pass  # leave the $ columns blank if inputs are malformed
+
     strategy = fields.get("strategy", "A")
     if strategy == "B":
         append_csv(TRADES_LOG_B, row, fallback_key="log_b")
