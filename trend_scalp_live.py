@@ -129,6 +129,10 @@ RISK_REWARD_MULT = 2.5
 # and the target/staircase milestones become real, capturable moves.
 MIN_STOP_DIST_PCT_A = 0.30
 LOOKBACK_HOURS = 8              # Logic B (1-min candles) lookback
+
+# ---- BUG FIX (Logic B): early-exit delayed from 1.0R to 1.5R ----
+# See the full explanation next to its usage in manage_bracket_position_b.
+EARLY_EXIT_R_MULTIPLE = 1.5
 LOGIC_A_RESOLUTION = "15m"      # Logic A now runs on 15-min candles (better fit for 200 EMA)
 LOGIC_A_LOOKBACK_HOURS = 60     # 60 hours = 240 fifteen-min candles, comfortably > 200 needed for EMA200
 LOOP_INTERVAL_SECONDS = 20
@@ -1590,8 +1594,17 @@ def manage_bracket_position_b(state, pos, symbol_data):
     expansion_pct = ((current_atr - entry_atr) / entry_atr) * 100.0
 
     # ---- R-multiple early exit (matches reference bot design) ----
-    # Once the trade reaches 1R profit (moved one SL-distance in its
-    # favor), take the modest guaranteed profit now — UNLESS ATR has
+    # ---- BUG FIX: delayed from 1.0R to 1.5R (handoff-doc's known Logic-B
+    # fix #3). At exactly 1R, the "modest guaranteed profit" being locked
+    # in was often barely bigger than round-trip fees once slippage from
+    # the market-order entry/exit was accounted for — so this early exit
+    # was frequently taking a near-breakeven trade off the table instead
+    # of letting genuinely-working setups run further. 1.5R gives the
+    # trade more room to prove itself before the "lock in profit now"
+    # decision, while still protecting against a full round-trip back to
+    # breakeven/loss on setups that stall. ----
+    # Once the trade reaches 1.5R profit (moved 1.5x its SL-distance in
+    # its favor), take the modest guaranteed profit now — UNLESS ATR has
     # expanded significantly, which signals the move may have more room,
     # in which case we skip the early exit and let the ATR-expansion
     # trailing logic below manage it instead (riding toward the full TP).
@@ -1602,15 +1615,15 @@ def manage_bracket_position_b(state, pos, symbol_data):
         else:
             r_multiple = (pos["entry_price"] - current_price) / r_basis
 
-        if r_multiple >= 1.0:
+        if r_multiple >= EARLY_EXIT_R_MULTIPLE:
             if expansion_pct >= ATR_EXPANSION_TRIGGER_PCT:
-                print(f"  {sym}: reached 1R profit AND ATR expanded {expansion_pct:.1f}% "
-                      f"— skipping early exit, letting the trailing stop manage this "
-                      f"trade for potentially more than 1R.")
+                print(f"  {sym}: reached {EARLY_EXIT_R_MULTIPLE}R profit AND ATR expanded "
+                      f"{expansion_pct:.1f}% — skipping early exit, letting the trailing "
+                      f"stop manage this trade for potentially more than {EARLY_EXIT_R_MULTIPLE}R.")
                 pos["early_exit_done"] = True  # don't re-check every loop once decided
             else:
-                print(f"  {sym}: reached 1R profit (r_multiple={r_multiple:.2f}), ATR has "
-                      f"NOT expanded — taking the early exit now instead of risking a "
+                print(f"  {sym}: reached {EARLY_EXIT_R_MULTIPLE}R profit (r_multiple={r_multiple:.2f}), "
+                      f"ATR has NOT expanded — taking the early exit now instead of risking a "
                       f"round-trip back to breakeven/loss.")
                 try:
                     cancel_all_orders_for_product(pos["product_id"])
@@ -1627,12 +1640,12 @@ def manage_bracket_position_b(state, pos, symbol_data):
                     log_trade_event(
                         time=str(now_ist()), symbol=sym, action="CLOSE",
                         side=("sell" if side == "long" else "buy"), size=pos["size"],
-                        reason="early_exit_1R", entry_price=entry_price, exit_price=current_price,
+                        reason="early_exit_1_5R", entry_price=entry_price, exit_price=current_price,
                         approx_gross_pnl_pct=round(pnl_pct, 4),
                         approx_net_pnl_pct_after_fees=round(net_pnl_pct, 4),
                         fill_method=method, strategy="B",
                     )
-                    print(f"  {sym}: CLOSED early at 1R, approx gross P&L: {pnl_pct:+.3f}% "
+                    print(f"  {sym}: CLOSED early at {EARLY_EXIT_R_MULTIPLE}R, approx gross P&L: {pnl_pct:+.3f}% "
                           f"(approx net after fees: {net_pnl_pct:+.3f}%)")
                     state["last_trade_close_time_b"] = time.time()
                     state["position"] = None
@@ -2269,7 +2282,19 @@ def look_for_entry_b(state, symbol_data, products):
         product = products[sym]
         order_side = "buy" if side == "long" else "sell"
 
-        resp, method = place_market_order_direct(product["id"], order_side, size)
+        # ---- BUG FIX: limit-first entry (was: instant market order) ----
+        # Handoff-doc's known Logic-B fix #1. Logic B previously always used
+        # an instant market order for entries, unlike Logic A's "limit-
+        # first, market-fallback" approach — paying the (usually pricier)
+        # taker fee and taking on slippage risk on every single entry, even
+        # though a small limit-offset would often fill just fine within the
+        # timeout window. Switched to the same place_order_with_fallback()
+        # Logic A uses: try a LIMIT order near the current price first
+        # (cheaper maker fee, no slippage), and only fall back to a market
+        # order if it doesn't fill within LIMIT_ORDER_TIMEOUT_SECONDS.
+        limit_price = (exec_price * (1 - LIMIT_OFFSET_PCT / 100) if side == "long"
+                       else exec_price * (1 + LIMIT_OFFSET_PCT / 100))
+        resp, method = place_order_with_fallback(product["id"], order_side, size, limit_price)
         entry_order_id = resp.get("id") if isinstance(resp, dict) else None
         if entry_order_id is None:
             # try the nested "result" shape defensively too
