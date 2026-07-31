@@ -110,6 +110,24 @@ CVD_LOOKBACK = 10
 SWING_LOOKBACK = 15
 STOP_BUFFER_PCT = 0.05
 RISK_REWARD_MULT = 2.5
+
+# ---- Minimum stop-distance floor (Logic A) ----
+# Logic B already has this (MIN_STOP_DIST_PCT_B below) — Logic A never
+# had the equivalent. Found in practice (comparing dashboard trades vs
+# exchange history): during quiet/low-volatility stretches, the raw
+# swing-based stop (swing_low/swing_high over SWING_LOOKBACK candles)
+# can end up razor-tight (e.g. 0.05-0.10%). Since position size below is
+# risk_amount / stop_dist_pct, a razor-tight stop makes size balloon
+# straight to the max-leverage cap (verified: one BTCUSD trade's notional
+# landed within $6 of the exact max_notional ceiling) — and since target
+# = stop_dist_pct * RISK_REWARD_MULT, the target ends up just as tiny,
+# so ordinary market noise (and the staircase trailing-stop's early
+# milestones) satisfies it almost immediately. Net effect: heavy lots,
+# but tiny realized gains, trades "cut" almost as soon as they open.
+# Same fix as Logic B: WIDEN the stop to this floor instead of skipping
+# the trade — position size shrinks accordingly to keep the same $ risk,
+# and the target/staircase milestones become real, capturable moves.
+MIN_STOP_DIST_PCT_A = 0.30
 LOOKBACK_HOURS = 8              # Logic B (1-min candles) lookback
 LOGIC_A_RESOLUTION = "15m"      # Logic A now runs on 15-min candles (better fit for 200 EMA)
 LOGIC_A_LOOKBACK_HOURS = 60     # 60 hours = 240 fifteen-min candles, comfortably > 200 needed for EMA200
@@ -338,15 +356,51 @@ def log_trade_event(**fields):
     entry_price = fields.get("entry_price")
     size = fields.get("size")
     symbol = fields.get("symbol")
+
+    # ---- BUG FIX: prefer REAL exit price / REAL fee from Delta's own
+    # /v2/fills endpoint (see get_real_fill_and_fee()) over the old
+    # candle-price proxy and flat-%-estimate fee, whenever the caller
+    # managed to fetch them. This is what actually corrects the two
+    # mismatches found by comparing this log against Delta's exported
+    # Trade-History/Wallet-History CSVs (wrong exit price on bracket-
+    # closed trades; estimated-not-real fees on every trade). If the
+    # caller couldn't fetch real data (e.g. CloudFront blocked the
+    # lookup), real_exit_price/real_fee_amount are simply absent here
+    # and everything falls back to the exact old estimate-based
+    # behavior — a close is never blocked or left un-logged over this.
+    real_exit_price = fields.get("real_exit_price")
+    real_fee_amount = fields.get("real_fee_amount")
+    if real_exit_price is not None and entry_price:
+        try:
+            entry_f = float(entry_price)
+            real_exit_f = float(real_exit_price)
+            was_long = fields.get("side") == "sell"  # close-side "sell" means the
+                                                       # position being closed was long
+            if was_long:
+                gross_pct = (real_exit_f - entry_f) / entry_f * 100
+            else:
+                gross_pct = (entry_f - real_exit_f) / entry_f * 100
+            row["exit_price"] = real_exit_f
+            row["approx_gross_pnl_pct"] = round(gross_pct, 4)
+        except (TypeError, ValueError):
+            pass  # malformed real data — keep whatever the caller originally passed
+
     if gross_pct is not None and entry_price and size and symbol:
         cv = CONTRACT_VALUES.get(symbol, 1)
         try:
             notional = float(entry_price) * float(size) * cv
             gross_amount = float(gross_pct) / 100 * notional
-            net_amount = (float(net_pct) / 100 * notional) if net_pct is not None else gross_amount
+            if real_fee_amount is not None:
+                fees_amount = float(real_fee_amount)
+                net_amount = gross_amount - fees_amount
+                net_pct = (net_amount / notional * 100) if notional else net_pct
+                row["approx_net_pnl_pct_after_fees"] = round(net_pct, 4) if net_pct is not None else ""
+            else:
+                net_amount = (float(net_pct) / 100 * notional) if net_pct is not None else gross_amount
+                fees_amount = gross_amount - net_amount
             row["gross_pnl_amount"] = round(gross_amount, 4)
             row["net_pnl_amount"] = round(net_amount, 4)
-            row["fees_amount"] = round(gross_amount - net_amount, 4)
+            row["fees_amount"] = round(fees_amount, 4)
         except (TypeError, ValueError):
             pass  # leave the $ columns blank if inputs are malformed
 
@@ -621,6 +675,71 @@ def _extract_order_id(response):
         if "result" in response and isinstance(response["result"], dict):
             return response["result"].get("id")
     return None
+
+
+def get_real_fill_and_fee(product_id, retries=6, delay=1.5):
+    """
+    ---- BUG FIX (found via comparing dashboard trade log against Delta's
+    own exported Trade-History / Wallet-History CSVs): ----
+
+    Two separate accuracy problems this fixes, both by pulling the
+    exchange's own /v2/fills record (the SAME data source Delta's app
+    uses to generate the Trade-History CSV export) right after a
+    position closes:
+
+      1. EXIT PRICE proxy bug: a few close paths (exchange-side bracket
+         silently closing the position, or the exchange saying
+         "no_position_for_reduce_only" before our own close order landed)
+         had no real fill to read from OUR order response, so they fell
+         back to using the latest CANDLE close price as a stand-in exit
+         price. Verified in practice: one BTCUSD bracket-close was logged
+         at 64643.0, but the REAL exchange fill was 64601.50 — a $41.5
+         difference, because the candle price moves in the ~20-40s gap
+         before this script notices the exchange-side close on the next
+         loop. Using the real fill removes this gap entirely.
+
+      2. FEE estimate bug: even for NORMAL closes with a correct exit
+         price, this script's dashboard $-fee figures came from a flat
+         ASSUMED round-trip fee % (estimate_net_pnl_pct — maker*2 for
+         Logic A, taker*2 for Logic B), not Delta's real per-fill fee.
+         Verified in practice: real fees varied fill-to-fill (maker/taker
+         mix isn't always what's assumed), causing the dashboard's Net
+         P&L to be off by anywhere from $0.06 to over $2 per trade.
+
+    Returns (real_exit_price, real_total_round_trip_fee) using the most
+    recent 2 fills for this product (this bot only ever holds ONE
+    position at a time, so the last 2 fills on a given product ARE this
+    trade's entry + exit) — or (None, None) if the fills endpoint can't
+    be reached or doesn't have fresh data yet in time (e.g. the same
+    CloudFront 403 issue that affects other API calls on this testnet).
+    Callers MUST fall back to their old proxy/estimate behaviour if this
+    returns (None, None) — a close should never go un-logged just
+    because this extra lookup failed.
+    """
+    for attempt in range(retries):
+        try:
+            response = client.fills({"product_ids": str(product_id)}, page_size=2)
+            if isinstance(response, dict):
+                result = response.get("result", [])
+            elif isinstance(response, list):
+                result = response
+            else:
+                result = []
+            if isinstance(result, list) and len(result) >= 2:
+                # Delta's /v2/fills returns newest-first.
+                exit_fill, entry_fill = result[0], result[1]
+                exit_price = exit_fill.get("price")
+                exit_fee = exit_fill.get("commission")
+                entry_fee = entry_fill.get("commission")
+                if exit_price is not None and exit_fee is not None and entry_fee is not None:
+                    return float(exit_price), float(exit_fee) + float(entry_fee)
+        except Exception as e:
+            print(f"  [WARN] get_real_fill_and_fee: couldn't fetch real fill/fee "
+                  f"data from /v2/fills on attempt {attempt + 1}/{retries}: {e}")
+        time.sleep(delay)
+    print(f"  [WARN] get_real_fill_and_fee: gave up after {retries} attempts — "
+          f"falling back to the old estimated exit-price/fee for this close.")
+    return None, None
 
 
 def _order_is_still_open(product_id, order_id):
@@ -1343,8 +1462,15 @@ def manage_bracket_position_b(state, pos, symbol_data):
         else:
             approx_pnl_pct = (entry_price - current_price) / entry_price * 100
         net_pnl_pct = estimate_net_pnl_pct(approx_pnl_pct, "B")
+
+        # ---- BUG FIX: try to get the REAL exit price + REAL fee from
+        # Delta's own /v2/fills before falling back to the candle-price
+        # proxy above (see get_real_fill_and_fee for the full story). ----
+        real_exit_price, real_fee_amount = get_real_fill_and_fee(pos["product_id"])
+        log_exit_price = real_exit_price if real_exit_price is not None else current_price
         print(f"  {sym}: bracket order already closed this position on the exchange "
-              f"(SL or TP triggered). Approx exit ~{current_price:.6f}, "
+              f"(SL or TP triggered). Exit ~{log_exit_price:.6f}"
+              f"{' (real fill)' if real_exit_price is not None else ' (approx — real fill lookup failed)'}, "
               f"approx gross P&L: {approx_pnl_pct:+.3f}% "
               f"(approx net after fees: {net_pnl_pct:+.3f}%)")
         log_trade_event(
@@ -1353,7 +1479,7 @@ def manage_bracket_position_b(state, pos, symbol_data):
             reason="bracket_closed", entry_price=entry_price, exit_price=current_price,
             approx_gross_pnl_pct=round(approx_pnl_pct, 4),
             approx_net_pnl_pct_after_fees=round(net_pnl_pct, 4), fill_method="bracket",
-            strategy="B",
+            strategy="B", real_exit_price=real_exit_price, real_fee_amount=real_fee_amount,
         )
         state["last_trade_close_time_b"] = time.time()
         state["position"] = None
@@ -1727,17 +1853,27 @@ def manage_open_position(state, symbol_data):
             else:
                 approx_pnl_pct = (entry_price - approx_exit_price) / entry_price * 100
             net_pnl_pct = estimate_net_pnl_pct(approx_pnl_pct, "A")
+
+            # ---- BUG FIX: try to get the REAL exit price + REAL fee from
+            # Delta's own /v2/fills before falling back to the candle-price
+            # proxy above. This is the exact bug found in practice: a BTCUSD
+            # bracket-close logged here at the candle price ~64643.0 while
+            # the real exchange fill was 64601.50 (a $41.5 difference,
+            # which alone was skewing that trade's logged P&L by ~$0.81). ----
+            real_exit_price, real_fee_amount = get_real_fill_and_fee(pos["product_id"])
+            log_exit_price = real_exit_price if real_exit_price is not None else approx_exit_price
             print(f"  {sym}: exchange-side safety bracket already closed this position "
                   f"(SL or TP triggered there before the local check caught it). "
-                  f"Approx exit ~{approx_exit_price:.6f}, approx gross P&L: "
-                  f"{approx_pnl_pct:+.3f}% (approx net after fees: {net_pnl_pct:+.3f}%)")
+                  f"Exit ~{log_exit_price:.6f}"
+                  f"{' (real fill)' if real_exit_price is not None else ' (approx — real fill lookup failed)'}, "
+                  f"approx gross P&L: {approx_pnl_pct:+.3f}% (approx net after fees: {net_pnl_pct:+.3f}%)")
             log_trade_event(
                 time=str(now_ist()), symbol=sym, action="CLOSE",
                 side=("sell" if side == "long" else "buy"), size=pos["size"],
                 reason="exchange_bracket_closed", entry_price=entry_price,
                 exit_price=approx_exit_price, approx_gross_pnl_pct=round(approx_pnl_pct, 4),
                 approx_net_pnl_pct_after_fees=round(net_pnl_pct, 4), fill_method="bracket",
-                strategy="A",
+                strategy="A", real_exit_price=real_exit_price, real_fee_amount=real_fee_amount,
             )
             state["position"] = None
             return
@@ -1895,6 +2031,11 @@ def _close_position(state, pos, price, reason, size):
             else:
                 approx_pnl_pct = (entry_price - price) / entry_price * 100
             net_pnl_pct = estimate_net_pnl_pct(approx_pnl_pct, strategy)
+
+            # ---- BUG FIX: try to get the REAL exit price + REAL fee from
+            # Delta's own /v2/fills before falling back to the reference-
+            # price proxy above (same fix as the bracket-closed paths). ----
+            real_exit_price, real_fee_amount = get_real_fill_and_fee(pos["product_id"])
             log_trade_event(
                 time=str(now_ist()), symbol=sym, action="CLOSE",
                 side=close_side, size=size,
@@ -1902,6 +2043,7 @@ def _close_position(state, pos, price, reason, size):
                 exit_price=price, approx_gross_pnl_pct=round(approx_pnl_pct, 4),
                 approx_net_pnl_pct_after_fees=round(net_pnl_pct, 4),
                 fill_method="unknown_exchange_side", strategy=strategy,
+                real_exit_price=real_exit_price, real_fee_amount=real_fee_amount,
             )
             if strategy == "B":
                 state["last_trade_close_time_b"] = time.time()
@@ -1943,6 +2085,16 @@ def _close_position(state, pos, price, reason, size):
     # any internal calculation bugs.
 
     net_pnl_pct = estimate_net_pnl_pct(gross_pnl_pct, strategy)
+
+    # ---- BUG FIX: exit_price here is already the real fill (from
+    # _extract_fill_price above), but the FEE was still a flat assumed
+    # round-trip % (estimate_net_pnl_pct) rather than Delta's real
+    # per-fill fee — found in practice to be off by $0.06-$2.36/trade.
+    # Fetch the real total fee from /v2/fills and use it if available;
+    # falls back to the old %-estimate fee if the lookup fails. We pass
+    # the already-correct actual_fill_price as real_exit_price too, so
+    # log_trade_event's dollar-figure recompute stays internally consistent. ----
+    _, real_fee_amount = get_real_fill_and_fee(pos["product_id"])
     log_trade_event(
         time=str(now_ist()), symbol=sym, action="CLOSE",
         side=close_side, size=size, reason=reason,
@@ -1951,6 +2103,7 @@ def _close_position(state, pos, price, reason, size):
         approx_net_pnl_pct_after_fees=round(net_pnl_pct, 4),
         fill_method=method, order_response=json.dumps(resp),
         strategy=pos.get("strategy", "A"),
+        real_exit_price=actual_fill_price, real_fee_amount=real_fee_amount,
     )
     print(f"  CLOSED {sym} due to {reason} (filled via {method}), "
           f"approx gross P&L: {gross_pnl_pct:+.3f}% "
@@ -2347,6 +2500,22 @@ def look_for_entry_a(state, symbol_data, products):
         if stop_dist_pct <= 0:
             print(f"    -> SKIP: invalid stop distance")
             continue
+
+        # ---- Minimum stop-distance floor (WIDEN, don't skip) ----
+        # See MIN_STOP_DIST_PCT_A definition above for the full story.
+        # Widening here (rather than skipping) keeps every genuinely-
+        # signaled setup tradeable, same as Logic B's identical fix —
+        # just with position size shrinking afterward to keep the same
+        # $ risk, instead of the size ballooning toward max-leverage on
+        # a razor-tight, noise-level stop.
+        if stop_dist_pct < MIN_STOP_DIST_PCT_A:
+            print(f"    [INFO] swing-based stop distance {stop_dist_pct:.3f}% is tinier than "
+                  f"the {MIN_STOP_DIST_PCT_A}% floor — widening the stop to the floor "
+                  f"(position size will shrink to keep the same $ risk) instead of skipping.")
+            stop_dist_pct = MIN_STOP_DIST_PCT_A
+            stop = (price * (1 - stop_dist_pct / 100) if side == "long"
+                    else price * (1 + stop_dist_pct / 100))
+
         target_move_pct = stop_dist_pct * RISK_REWARD_MULT
         if target_move_pct < MIN_TARGET_PCT:
             print(f"    -> SKIP: target move {target_move_pct:.3f}% < fee-aware "
