@@ -1430,8 +1430,26 @@ def manage_bracket_position_b(state, pos, symbol_data):
         live_pos = client.get_position(pos["product_id"])
         size_now = float(live_pos.get("size", 0)) if isinstance(live_pos, dict) else 0
     except Exception as e:
-        print(f"  [WARN] {sym}: couldn't check live position status ({e}) — will retry next loop")
-        return
+        # ---- BUG FIX: don't just give up on the whole loop here. ----
+        # This used to `return` immediately on any failure of this single
+        # exchange call — which meant EVERYTHING below (external-close
+        # detection, staircase progress, ATR-expansion trailing, the 1.5R
+        # early-exit) was skipped too, not just this one status check.
+        # Found in practice: a 27+ minute run of consecutive 504 Gateway
+        # Timeouts on this call left a position sitting at ~53% progress
+        # toward its target with ZERO staircase milestones locked, purely
+        # because this early return kept blocking the staircase logic
+        # further down from ever running — even though that logic doesn't
+        # actually need this exchange call at all (it works off local
+        # candle data). Now matches Logic A's identical fix: assume the
+        # position is still open (its exchange-side bracket keeps
+        # protecting it regardless) and fall through to the candle-based
+        # management below, instead of freezing everything on one flaky
+        # API call.
+        print(f"  [WARN] {sym}: couldn't check live position status ({e}) — "
+              f"falling back to local candle-based management for now (the "
+              f"exchange-side bracket still protects the position either way).")
+        size_now = pos["size"]  # assume still open this loop; try again next loop
 
     if size_now == 0:
         # ---- BUG FIX: require confirmation on a SECOND consecutive loop
@@ -2782,13 +2800,72 @@ def look_for_entry_a(state, symbol_data, products):
 # Main loop — wrapped so it NEVER stops on its own
 # ============================================================
 
+def compute_market_regime(symbol_data_a):
+    """
+    ---- NEW FEATURE: market-regime indicator ----
+    Surfaces, every loop, which strategy CURRENT market conditions favor
+    right now — Logic A (mean-reversion, wants price close to VWAP) or
+    Logic B (trend-following, thrives when price is running away from
+    VWAP with real momentum) — regardless of which one is actually
+    running. The algo already computes VWAP-distance every loop for its
+    own entry-scan; this just surfaces that same number to the dashboard
+    instead of leaving it buried in the console log ("algo se kuch
+    chhupa nahi hai" — nothing the algo already knows should stay hidden
+    from the person watching it).
+
+    Uses the SAME VWAP_PROXIMITY_PCT threshold Logic A's own entry-check
+    already uses: price close to VWAP = range-bound = Logic A's natural
+    environment. Price running far from VWAP = a real directional trend
+    — the exact condition observed in practice keeping Logic A flat all
+    day, while being exactly the kind of move Logic B's EMA-crossover is
+    built to catch. This is a simple, cheap heuristic (not a guarantee)
+    — it's meant to explain WHY Logic A is or isn't finding setups, not
+    to replace either strategy's own entry logic.
+    """
+    dists = {}
+    for sym in SYMBOLS_TO_WATCH:
+        df = symbol_data_a.get(sym)
+        if df is None or len(df) == 0:
+            continue
+        latest = df.iloc[-1]
+        price, vwap = latest["close"], latest["vwap"]
+        if price:
+            dists[sym] = abs(price - vwap) / price * 100
+
+    if not dists:
+        LATEST_STATE["market_regime"] = None
+        return
+
+    avg_dist = sum(dists.values()) / len(dists)
+
+    if avg_dist <= VWAP_PROXIMITY_PCT:
+        favors, label = "A", "Range-bound / price near VWAP"
+    elif avg_dist >= VWAP_PROXIMITY_PCT * 2:
+        favors, label = "B", "Strong trend / price far from VWAP"
+    else:
+        favors, label = "NEUTRAL", "Mixed / transitioning"
+
+    LATEST_STATE["market_regime"] = {
+        "favors": favors, "label": label,
+        "avg_vwap_dist_pct": round(avg_dist, 3),
+        "threshold_pct": VWAP_PROXIMITY_PCT,
+        "per_symbol": {s: round(d, 3) for s, d in dists.items()},
+    }
+
+
 def run_one_loop_iteration(state, products):
     symbol_data_a = {}  # Logic A: 15-min candles
     symbol_data_b = {}  # Logic B: 1-min candles
 
     mode = LOGIC_MODE["active"]
     active_strategy = state["position"].get("strategy") if state["position"] else None
-    need_a = mode in ("A", "BOTH") or active_strategy == "A"
+    # ---- Logic A data is now ALWAYS fetched (cheap, public, read-only
+    # endpoint), regardless of active mode — needed for the market-regime
+    # indicator above, which shows whether conditions favor A or B no
+    # matter which is actually running. This does NOT change which logic
+    # actually takes trades — that stays strictly gated by `mode` further
+    # down in this function. ----
+    need_a = True
     need_b = mode in ("B", "BOTH") or active_strategy == "B"
 
     # ---- Logic A data (15-min) — watches all of SYMBOLS_TO_WATCH ----
@@ -2804,6 +2881,8 @@ def run_one_loop_iteration(state, products):
                 df_a = compute_vwap(df_a)
                 df_a = compute_cvd(df_a)
                 symbol_data_a[sym] = df_a
+
+    compute_market_regime(symbol_data_a)
 
     # ---- Logic B data (1-min) — watches only LOGIC_B_SYMBOLS (BTC/ETH) ----
     if need_b:
@@ -2874,7 +2953,7 @@ def run_one_loop_iteration(state, products):
     save_state(state)
 
 
-LATEST_STATE = {"position": None, "equity_note": None}
+LATEST_STATE = {"position": None, "equity_note": None, "market_regime": None}
 
 
 def main_loop(stop_event=None):
