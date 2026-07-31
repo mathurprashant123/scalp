@@ -1406,8 +1406,38 @@ def compute_progress(position, current_price):
 
 
 def cancel_all_orders_for_product(product_id):
-    body = {"product_id": product_id}
-    return client.request("DELETE", "/v2/orders/all", body, auth=True)
+    # ---- BUG FIX: product_id must be a QUERY param, not a JSON body ----
+    # Delta's own API docs show DELETE /orders/all taking product_id as a
+    # query-string filter (like the GET /v2/positions?product_id=... calls
+    # elsewhere in this file), not as a request body. Sending it as a body
+    # (the old code) meant this call was silently succeeding (200 OK, no
+    # exception — so the pre-entry sweep never warned or skipped) while
+    # NOT actually cancelling anything, because the exchange couldn't read
+    # the product_id filter from the wrong place. Confirmed in practice:
+    # 5 stray BTCUSD orders kept accumulating even with the sweep running
+    # (and "succeeding") before every single entry attempt.
+    return client.request("DELETE", "/v2/orders/all", query={"product_id": product_id}, auth=True)
+
+
+def confirm_no_open_orders(product_id):
+    """
+    Actually VERIFIES (via a fresh GET) that no open orders remain for
+    this product — rather than just trusting that the DELETE call above
+    didn't raise an exception. That trust was exactly what let 5 stray
+    orders pile up silently: the DELETE was hitting the wrong parameter
+    location and "succeeding" while doing nothing. Returns True only if
+    we positively confirmed zero open orders; False/None (fetch failed
+    or orders still present) means the caller should NOT proceed with a
+    new entry this loop.
+    """
+    try:
+        live_orders = client.get_live_orders({"product_id": product_id})
+        if isinstance(live_orders, dict):
+            live_orders = live_orders.get("result", [])
+        return len(live_orders) == 0
+    except Exception as e:
+        print(f"    [WARN] couldn't verify open-orders are clean ({e})")
+        return False
 
 
 def manage_bracket_position_b(state, pos, symbol_data):
@@ -2333,6 +2363,16 @@ def look_for_entry_b(state, symbol_data, products):
                   f"duplicates. Will retry the sweep next loop.")
             continue
 
+        # ---- BUG FIX: actually VERIFY the sweep worked ----
+        # The DELETE call above can "succeed" (no exception) without
+        # actually cancelling anything (see its own comment) — so trusting
+        # that alone let stray orders keep accumulating. Explicitly
+        # re-check via GET before proceeding.
+        if not confirm_no_open_orders(product["id"]):
+            print(f"    -> SKIP: {sym} still has open orders resting after the sweep "
+                  f"— NOT placing a new order this loop to avoid stacking duplicates.")
+            continue
+
         order_side = "buy" if side == "long" else "sell"
 
         # ---- BUG FIX: limit-first entry (was: instant market order) ----
@@ -2662,6 +2702,14 @@ def look_for_entry_a(state, symbol_data, products):
             print(f"    -> SKIP: couldn't confirm no stray orders remain on {sym} "
                   f"({e}) — NOT placing a new order this loop to avoid stacking "
                   f"duplicates. Will retry the sweep next loop.")
+            continue
+
+        # ---- BUG FIX: actually VERIFY the sweep worked (see Logic B's
+        # identical comment for the full story — the DELETE call could
+        # silently "succeed" without cancelling anything). ----
+        if not confirm_no_open_orders(product["id"]):
+            print(f"    -> SKIP: {sym} still has open orders resting after the sweep "
+                  f"— NOT placing a new order this loop to avoid stacking duplicates.")
             continue
 
         resp, method = place_order_with_fallback(product["id"], order_side, size, limit_price)
