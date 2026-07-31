@@ -2313,11 +2313,25 @@ def look_for_entry_b(state, symbol_data, products):
         # leftover open orders on this exact product right before placing
         # a fresh one caps the damage at one stray order at a time
         # instead of letting them accumulate indefinitely across loops.
+        # ---- BUG FIX v2: if the sweep itself fails, DO NOT proceed ----
+        # v1 of this fix (see comment above) still placed a fresh order
+        # even when the cancel-sweep failed — but in practice CANCEL
+        # requests time out on this testnet just as often as CREATE
+        # requests do, so "proceed anyway" meant the sweep was silently
+        # doing nothing useful most of the time. Result: 10 stray orders
+        # stacked up in a single ~6-minute run despite v1 being deployed.
+        # Now: if we can't CONFIRM the slate is clean, skip this symbol
+        # for this loop entirely rather than gambling on a duplicate
+        # order — the next loop will try the sweep again before any new
+        # entry is attempted, so a temporarily-flaky exchange just delays
+        # entries instead of stacking orders.
         try:
             cancel_all_orders_for_product(product["id"])
         except Exception as e:
-            print(f"    [WARN] couldn't sweep stray orders on {sym} before entry ({e}) — "
-                  f"proceeding anyway.")
+            print(f"    -> SKIP: couldn't confirm no stray orders remain on {sym} "
+                  f"({e}) — NOT placing a new order this loop to avoid stacking "
+                  f"duplicates. Will retry the sweep next loop.")
+            continue
 
         order_side = "buy" if side == "long" else "sell"
 
@@ -2636,11 +2650,19 @@ def look_for_entry_a(state, symbol_data, products):
         # resting on the exchange while this script believes it failed;
         # without this sweep, retries stack up multiple orphaned orders
         # and eventually exhaust available margin).
+        # ---- BUG FIX v2: if the sweep fails, DO NOT proceed ----
+        # Same fix as Logic B — see its identical comment for the full
+        # story. v1 ("proceed anyway" on sweep failure) still let orders
+        # stack up, because CANCEL requests fail on this testnet just as
+        # often as CREATE requests do — "proceed anyway" made the sweep
+        # a no-op exactly when it mattered most.
         try:
             cancel_all_orders_for_product(product["id"])
         except Exception as e:
-            print(f"    [WARN] couldn't sweep stray orders on {sym} before entry ({e}) — "
-                  f"proceeding anyway.")
+            print(f"    -> SKIP: couldn't confirm no stray orders remain on {sym} "
+                  f"({e}) — NOT placing a new order this loop to avoid stacking "
+                  f"duplicates. Will retry the sweep next loop.")
+            continue
 
         resp, method = place_order_with_fallback(product["id"], order_side, size, limit_price)
 
