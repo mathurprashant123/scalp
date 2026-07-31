@@ -2298,6 +2298,27 @@ def look_for_entry_b(state, symbol_data, products):
             size = max(1, round(notional / (contract_value * exec_price)))
 
         product = products[sym]
+
+        # ---- BUG FIX: sweep stray leftover orders before entering ----
+        # Found in practice: when the create_order call for a NEW entry
+        # times out on the network side (client.create_order raising a
+        # read-timeout), this script has no way to know whether the
+        # order actually landed on the exchange before the timeout — so
+        # the NEXT loop just tries again with a brand-new order. Observed
+        # result: FIVE separate stray limit orders piling up unfilled on
+        # the exchange at the same price (visible in "Open Orders"), each
+        # one eating into available margin, until entries started failing
+        # with "insufficient_margin" — even though this script's own
+        # state showed "no position" the whole time. Cancelling any
+        # leftover open orders on this exact product right before placing
+        # a fresh one caps the damage at one stray order at a time
+        # instead of letting them accumulate indefinitely across loops.
+        try:
+            cancel_all_orders_for_product(product["id"])
+        except Exception as e:
+            print(f"    [WARN] couldn't sweep stray orders on {sym} before entry ({e}) — "
+                  f"proceeding anyway.")
+
         order_side = "buy" if side == "long" else "sell"
 
         # ---- BUG FIX: limit-first entry (was: instant market order) ----
@@ -2608,6 +2629,18 @@ def look_for_entry_a(state, symbol_data, products):
         # placement to detect if a large slippage fill silently made the
         # REAL risk much bigger than what this size was computed for.
         intended_stop_dist_pct = stop_dist_pct
+
+        # ---- BUG FIX: sweep stray leftover orders before entering ----
+        # Same fix as Logic B — see its identical comment for the full
+        # story (a create_order timeout can leave an order actually
+        # resting on the exchange while this script believes it failed;
+        # without this sweep, retries stack up multiple orphaned orders
+        # and eventually exhaust available margin).
+        try:
+            cancel_all_orders_for_product(product["id"])
+        except Exception as e:
+            print(f"    [WARN] couldn't sweep stray orders on {sym} before entry ({e}) — "
+                  f"proceeding anyway.")
 
         resp, method = place_order_with_fallback(product["id"], order_side, size, limit_price)
 
