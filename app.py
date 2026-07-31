@@ -428,9 +428,15 @@ PAGE_TEMPLATE = """
         #pnlValue.pos { color:#4CAF50; }
         #pnlValue.neg { color:#E85D5D; }
         .pnl-row { display:flex; justify-content:space-between; margin-top:4px; color:#bbb; font-size:12px; }
+        #regimeBanner { background:#8a1f1f; color:white; text-align:center; padding:12px 20px;
+                         border-radius:8px; margin-bottom:18px; font-size:15px; font-weight:bold;
+                         border: 2px solid #d94f4f; box-shadow: 0 0 10px rgba(217,79,79,0.5); }
+        #regimeBanner .sub { font-size:12px; font-weight:normal; color:#f0c6c6; margin-top:4px; }
+        #regimeBanner.hidden { display:none; }
     </style>
 </head>
 <body>
+    <div id="regimeBanner" class="hidden"></div>
     <div id="pnlWidget" class="flat">
         <h3>Live Trade P&amp;L</h3>
         <div class="pnl-row" style="border-bottom:1px solid #333; padding-bottom:6px; margin-bottom:6px;">
@@ -585,6 +591,30 @@ PAGE_TEMPLATE = """
                 `;
             });
         }
+        function refreshRegime() {
+            fetch('/market_regime').then(r => r.json()).then(data => {
+                const banner = document.getElementById('regimeBanner');
+                if (!data || !data.favors) {
+                    banner.className = 'hidden';
+                    return;
+                }
+                banner.className = '';
+                let mainText;
+                if (data.favors === 'A') {
+                    mainText = `Market Condition: ${data.label} \u2014 LOGIC A environment right now`;
+                } else if (data.favors === 'B') {
+                    mainText = `Market Condition: ${data.label} \u2014 LOGIC B environment right now`;
+                } else {
+                    mainText = `Market Condition: ${data.label} \u2014 mixed, neither logic strongly favored`;
+                }
+                const perSymbol = Object.entries(data.per_symbol || {})
+                    .map(([sym, d]) => `${sym} ${d}% from VWAP`).join(' | ');
+                banner.innerHTML = `${mainText}<div class="sub">Avg VWAP-distance: ${data.avg_vwap_dist_pct}% ` +
+                    `(Logic A needs \u2264${data.threshold_pct}%) &mdash; ${perSymbol}</div>`;
+            });
+        }
+        setInterval(refreshRegime, 5000);
+        refreshRegime();
         setInterval(refreshStatus, 2000);
         setInterval(refreshLogs, 2000);
         setInterval(refreshPnl, 3000);
@@ -692,6 +722,14 @@ def set_logic_mode():
     state["logic_mode"] = mode
     algo.save_state(state)
     return jsonify({"ok": True, "mode": mode})
+
+
+@app.route("/market_regime")
+def market_regime():
+    regime = algo.LATEST_STATE.get("market_regime")
+    if regime is None:
+        return jsonify({"favors": None})
+    return jsonify(regime)
 
 
 @app.route("/live_pnl")
