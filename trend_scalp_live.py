@@ -564,11 +564,24 @@ def fetch_candles(symbol, hours=LOOKBACK_HOURS, resolution="1m"):
 
 
 def get_wallet_available_balance():
+    # ---- BUG FIX: filter by asset_symbol == 'USD' explicitly ----
+    # Delta's /v2/wallet/balances returns ONE entry PER ASSET the account
+    # holds (this account trades USD-margined perpetuals, but could also
+    # have leftover/dust balances in other assets — e.g. from a testnet
+    # faucet claim, or a different settling asset). The old code just
+    # grabbed the FIRST entry in the list with a positive value, with NO
+    # check on which asset it belonged to — meaning if a non-USD entry
+    # happened to sit earlier in the array (order isn't guaranteed), this
+    # would silently return the WRONG number, since every $-based
+    # calculation in this script (position sizing, circuit breakers, the
+    # dashboard) assumes this is the USD balance.
     response = client.request("GET", "/v2/wallet/balances", auth=True)
     balances = response.json().get("result", [])
     for b in balances:
-        if float(b.get("available_balance", 0)) > 0:
-            return float(b["available_balance"])
+        if b.get("asset_symbol") == "USD":
+            return float(b.get("available_balance", 0))
+    print("  [WARN] No 'USD' entry found in wallet balances — returning 0.0 "
+          "(check /v2/wallet/balances response; asset_symbol may differ).")
     return 0.0
 
 
@@ -581,20 +594,23 @@ def get_wallet_total_balance():
     huge instant "loss" even though no money was actually lost. Total
     balance only changes with genuine realized P&L, not margin allocation.
     """
+    # ---- BUG FIX: filter by asset_symbol == 'USD' explicitly ----
+    # Same fix as get_wallet_available_balance() above — see its comment
+    # for the full story. This function had the identical bug.
     response = client.request("GET", "/v2/wallet/balances", auth=True)
     balances = response.json().get("result", [])
     for b in balances:
-        total = b.get("balance")
-        if total is not None and float(total) > 0:
-            return float(total)
-    # Fallback: if "balance" field isn't present for some reason, fall back
-    # to available_balance rather than crashing (logged clearly so this is
-    # visible if it ever happens).
-    for b in balances:
-        if float(b.get("available_balance", 0)) > 0:
-            print("  [WARN] Wallet response had no 'balance' field — falling back to "
+        if b.get("asset_symbol") == "USD":
+            total = b.get("balance")
+            if total is not None:
+                return float(total)
+            # Fallback: if "balance" field isn't present for some reason,
+            # fall back to available_balance rather than crashing.
+            print("  [WARN] USD wallet entry had no 'balance' field — falling back to "
                   "available_balance for circuit-breaker (may misread margin-lock as loss).")
-            return float(b["available_balance"])
+            return float(b.get("available_balance", 0))
+    print("  [WARN] No 'USD' entry found in wallet balances — returning 0.0 "
+          "(check /v2/wallet/balances response; asset_symbol may differ).")
     return 0.0
 
 
@@ -1406,17 +1422,31 @@ def compute_progress(position, current_price):
 
 
 def cancel_all_orders_for_product(product_id):
-    # ---- BUG FIX: product_id must be a QUERY param, not a JSON body ----
-    # Delta's own API docs show DELETE /orders/all taking product_id as a
-    # query-string filter (like the GET /v2/positions?product_id=... calls
-    # elsewhere in this file), not as a request body. Sending it as a body
-    # (the old code) meant this call was silently succeeding (200 OK, no
-    # exception — so the pre-entry sweep never warned or skipped) while
-    # NOT actually cancelling anything, because the exchange couldn't read
-    # the product_id filter from the wrong place. Confirmed in practice:
-    # 5 stray BTCUSD orders kept accumulating even with the sweep running
-    # (and "succeeding") before every single entry attempt.
-    return client.request("DELETE", "/v2/orders/all", query={"product_id": product_id}, auth=True)
+    """
+    ---- BUG FIX v4: stop using the /v2/orders/all bulk endpoint ----
+    v3 (product_id as a query param, matching Delta's docs) fixed the
+    "silently does nothing" problem, but uncovered a NEW issue: this
+    specific bulk-DELETE endpoint returns "401 Signature Mismatch" for
+    this account when product_id is passed as a query param — likely an
+    account/endpoint-specific quirk in how the request signature is
+    validated for this route. A 401 is even worse than v1/v2's problem,
+    since it means we could NEVER confirm a clean slate through this path.
+
+    Fix: stop relying on the bulk endpoint entirely. Instead, fetch this
+    product's live open orders (a plain GET — proven reliable elsewhere
+    in this file) and cancel each one individually via the same
+    single-order cancel_order() call already used successfully (from a
+    signature standpoint) in startup reconciliation. Raises on any
+    failure so callers correctly skip this loop's entry rather than
+    proceeding on an unconfirmed state.
+    """
+    live_orders = client.get_live_orders({"product_id": product_id})
+    if isinstance(live_orders, dict):
+        live_orders = live_orders.get("result", [])
+    for o in live_orders:
+        oid = o.get("id")
+        if oid is not None:
+            client.cancel_order(product_id, oid)
 
 
 def confirm_no_open_orders(product_id):
