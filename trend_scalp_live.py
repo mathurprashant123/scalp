@@ -1466,7 +1466,26 @@ def cancel_all_orders_for_product(product_id):
     for o in live_orders:
         oid = o.get("id")
         if oid is not None:
-            client.cancel_order(product_id, oid)
+            try:
+                client.cancel_order(product_id, oid)
+            except Exception as e:
+                # ---- BUG FIX: 'open_order_not_found' means the order is
+                # ALREADY gone — that's success for our purposes (nothing
+                # left to cancel), not a failure. Without this, a single
+                # stale/ghost order-id returned by get_live_orders (that
+                # the exchange itself no longer recognizes when we try to
+                # cancel it) caused an INFINITE false-skip loop: every
+                # entry attempt saw this same "failure" forever, even
+                # though Positions/Open Orders/Stop Orders on the exchange
+                # were all completely empty (confirmed directly against
+                # the exchange UI). Only re-raise for genuine uncertainty
+                # (timeouts, other errors) where we truly can't confirm
+                # the state — those should still cause a cautious skip.
+                if "open_order_not_found" in str(e):
+                    print(f"    [INFO] order {oid} on product {product_id} was already "
+                          f"gone (open_order_not_found) — treating as already-cancelled.")
+                    continue
+                raise
 
 
 def confirm_no_open_orders(product_id):
