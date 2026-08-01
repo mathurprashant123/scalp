@@ -291,6 +291,54 @@ def reset_abnormal_fill_breaker():
     return jsonify({"ok": True, "message": "Abnormal-fill breaker reset. New entries allowed again."})
 
 
+@app.route("/recalibrate_balance_floor", methods=["POST"])
+def recalibrate_balance_floor():
+    """
+    Deliberately DIFFERENT from the reset-buttons above — those only clear
+    a tripped flag, they never move the baseline. This one re-baselines
+    BOTH the daily-loss-breaker's start_of_day_balance AND the min-balance-
+    floor's all_time_starting_balance to whatever the account's REAL
+    balance is right now.
+
+    Meant for exactly one situation: a deposit (or withdrawal) just
+    happened, so the old baseline (recorded before the deposit) no longer
+    reflects a meaningful floor — e.g. depositing $25 into an account that
+    had $0.13 leaves the floor frozen at 50% of $0.13, which will never
+    realistically trip again and gives no real protection for the new
+    money. Re-run this any time you deposit/withdraw funds so the safety
+    nets stay meaningful. Requires a live balance fetch, so it can fail
+    if the exchange API is unreachable at that moment — safe to just
+    retry in that case, nothing is changed until it succeeds.
+    """
+    try:
+        current_balance = algo.get_wallet_total_balance()
+    except Exception as e:
+        return jsonify({"ok": False, "message": f"Couldn't fetch current balance to "
+                        f"recalibrate against ({e}) — try again in a moment."}), 503
+
+    state = algo.load_state()
+    old_all_time = state.get("all_time_starting_balance")
+    old_start_of_day = state.get("start_of_day_balance")
+
+    state["all_time_starting_balance"] = current_balance
+    state["start_of_day_balance"] = current_balance
+    state["min_balance_breaker_tripped"] = False
+    state["daily_breaker_tripped"] = False
+    algo.save_state(state)
+
+    new_floor = current_balance * (algo.MIN_BALANCE_FLOOR_PCT / 100)
+    return jsonify({
+        "ok": True,
+        "message": (
+            f"Recalibrated: baseline was ${old_all_time:.2f} (floor was "
+            f"${(old_all_time or 0) * algo.MIN_BALANCE_FLOOR_PCT / 100:.2f}) -> "
+            f"now ${current_balance:.2f} (new floor: ${new_floor:.2f}). "
+            f"Daily-loss baseline also reset to today's actual balance."
+        ) if old_all_time is not None else
+        f"Baseline set for the first time: ${current_balance:.2f} (floor: ${new_floor:.2f})."
+    })
+
+
 @app.route("/force_clear_position", methods=["POST"])
 def force_clear_position():
     """EMERGENCY escape hatch. Clears this script's LOCAL tracking of an
@@ -469,6 +517,10 @@ PAGE_TEMPLATE = """
                 padding:8px 18px; border-radius:6px; cursor:pointer; font-size:13px; margin-left:8px;">
             &#9888; Reset Abnormal-Fill Breaker
         </button>
+        <button onclick="recalibrateBalanceFloor()" style="background:#0a4a2a; color:white; border:none;
+                padding:8px 18px; border-radius:6px; cursor:pointer; font-size:13px; margin-left:8px;">
+            &#128176; Recalibrate Balance Floor (after deposit/withdrawal)
+        </button>
         <button onclick="forceClearPosition()" style="background:#333333; color:white; border:2px solid #ff4444;
                 padding:8px 18px; border-radius:6px; cursor:pointer; font-size:13px; margin-left:8px;">
             &#9940; Force-Clear Stuck Position (emergency)
@@ -490,6 +542,12 @@ PAGE_TEMPLATE = """
         function resetAbnormalFillBreaker() {
             if (!confirm('Ye tabhi reset karo jab tumne exchange ke Order History mein dekh liya ho ki abnormal fill kya thi. Sure?')) return;
             fetch('/reset_abnormal_fill_breaker', {method:'POST'}).then(r => r.json()).then(data => {
+                alert(data.message || 'Done');
+            });
+        }
+        function recalibrateBalanceFloor() {
+            if (!confirm('Ye daily-loss aur min-balance-floor DONO ki baseline ko ABHI ke real balance par reset kar dega. Sirf tab use karo jab tumne abhi deposit/withdraw kiya ho. Sure?')) return;
+            fetch('/recalibrate_balance_floor', {method:'POST'}).then(r => r.json()).then(data => {
                 alert(data.message || 'Done');
             });
         }
