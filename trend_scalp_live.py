@@ -274,7 +274,14 @@ COOLDOWN_SECONDS = 10      # min gap after any close before a new entry
                             # LOOP_INTERVAL_SECONDS=60s anyway, so a 10s
                             # cooldown has no extra effect beyond that —
                             # kept here for transparency/config completeness)
-FIXED_SIZE = 0             # 0 = use risk-based sizing (not a fixed lot count).
+FIXED_SIZE = 1             # ---- CHANGED for real-account initial verification ----
+                           # 1 = hamesha exactly 1 lot, risk-based-sizing formula
+                           # bypass karke. Maksad: real-account pe execution-mechanics
+                           # (order-placement, bracket-attach, close) ko chhote,
+                           # controlled risk (~$0.06-$0.19 per trade) ke saath verify
+                           # karna, sizing-formula ko ek saath test kiye bina. Jab
+                           # confidence build ho jaaye, ise wapas 0 par set karke
+                           # risk-based-sizing on karo.
                            # (Fixed-1-lot mode was tried and reverted per user
                            # request — code support for it is left in place
                            # below in case it's wanted again later.)
