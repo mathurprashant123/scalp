@@ -1495,18 +1495,47 @@ def confirm_no_open_orders(product_id):
     didn't raise an exception. That trust was exactly what let 5 stray
     orders pile up silently: the DELETE was hitting the wrong parameter
     location and "succeeding" while doing nothing. Returns True only if
-    we positively confirmed zero open orders; False/None (fetch failed
-    or orders still present) means the caller should NOT proceed with a
-    new entry this loop.
+    we positively confirmed the product is clean; False/None (fetch
+    failed or a GENUINE order still present) means the caller should NOT
+    proceed with a new entry this loop.
+
+    ---- BUG FIX: don't just count the raw list length ----
+    Found in practice: Delta's own GET /v2/orders kept returning the SAME
+    order-id for ETHUSD in every single call, indefinitely — but actually
+    trying to cancel that exact id always came back "open_order_not_found"
+    (i.e. it doesn't really exist; it's a stale/ghost entry in the list
+    response itself). A raw "len(live_orders) == 0" check can NEVER pass
+    while that ghost entry keeps showing up, causing an infinite false
+    "still has open orders" skip — even though the exchange's own
+    Positions/Open-Orders/Stop-Orders UI showed completely empty. Now:
+    for anything still listed, try to cancel it and tolerate
+    "open_order_not_found" the same way cancel_all_orders_for_product
+    does — only a GENUINE, cancelable (or otherwise-erroring) order
+    counts as "not clean".
     """
     try:
         live_orders = client.get_live_orders({"product_id": product_id})
         if isinstance(live_orders, dict):
             live_orders = live_orders.get("result", [])
-        return len(live_orders) == 0
     except Exception as e:
         print(f"    [WARN] couldn't verify open-orders are clean ({e})")
         return False
+
+    for o in live_orders:
+        oid = o.get("id")
+        if oid is None:
+            continue
+        try:
+            client.cancel_order(product_id, oid)
+        except Exception as e:
+            if "open_order_not_found" in str(e):
+                print(f"    [INFO] order {oid} on product {product_id} is a stale/ghost "
+                      f"list-entry (open_order_not_found on cancel) — not a real blocker.")
+                continue
+            print(f"    [WARN] order {oid} on product {product_id} still couldn't be "
+                  f"cancelled ({e}) — treating as genuinely not clean.")
+            return False
+    return True
 
 
 def manage_bracket_position_b(state, pos, symbol_data):
