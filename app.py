@@ -23,6 +23,7 @@ import os
 import threading
 import queue
 import time
+import requests
 from datetime import datetime
 
 from flask import Flask, render_template_string, jsonify, request, Response
@@ -59,6 +60,15 @@ if not DASHBOARD_USERNAME or not DASHBOARD_PASSWORD:
 
 @app.before_request
 def require_login():
+    # ---- BUG FIX: exempt /keepalive from password-protection ----
+    # Without this, the self-ping thread's request would get a 401 (since
+    # it sends no credentials) — a 401 still likely resets Render's idle
+    # timer since the request IS received, but it would print a confusing
+    # "failed" line in the logs every 10 minutes for what's actually
+    # working fine. /keepalive reveals nothing sensitive (just {"ok":true})
+    # so there's no security reason to require login for it.
+    if request.path == "/keepalive":
+        return None
     # If credentials aren't configured, skip auth entirely (so local dev
     # without a .env still works) — but this means it's WIDE OPEN, so
     # always set these in production (Render).
@@ -814,6 +824,60 @@ def live_pnl():
     })
 
 
+@app.route("/keepalive")
+def keepalive():
+    """
+    Deliberately tiny and fast — this exists ONLY to be hit by our own
+    self-ping thread below (see _self_ping_loop), so Render's free-tier
+    web service keeps seeing regular inbound traffic and doesn't spin the
+    instance down as idle. Returns almost nothing on purpose — no need to
+    touch algo.LATEST_STATE or do any real work for a keepalive.
+    """
+    return jsonify({"ok": True})
+
+
+def _self_ping_loop():
+    """
+    ---- NEW: bot's OWN internal keepalive, replacing reliance on an
+    external service (cron-job.org) ----
+    Render's free-tier web services spin down after a period with no
+    inbound HTTP traffic, and spinning back up loses this process's
+    in-memory state (LATEST_STATE, any position the main loop was
+    tracking) — this was observed directly, multiple times, as
+    "Adopting untracked real position" appearing in the logs right after
+    an unplanned restart, on a position that was still genuinely open on
+    the exchange the whole time.
+
+    This runs forever in the background, sleeping most of the time, and
+    just GETs our own /keepalive endpoint every 10 minutes — the same
+    idea as the external cron-job.org pings, just self-contained so the
+    bot doesn't depend on a separate third-party service staying
+    configured/active. Every failure is caught and logged, never allowed
+    to crash this thread or the main app.
+
+    Does nothing (and prints why) if RENDER_EXTERNAL_URL isn't set — e.g.
+    when running locally, where this isn't needed at all.
+    """
+    external_url = os.getenv("RENDER_EXTERNAL_URL")
+    if not external_url:
+        print("[keepalive] RENDER_EXTERNAL_URL not set (probably running "
+              "locally) — self-ping thread will not run.")
+        return
+
+    ping_url = external_url.rstrip("/") + "/keepalive"
+    print(f"[keepalive] Self-ping thread started — will GET {ping_url} every 10 minutes.")
+    while True:
+        time.sleep(600)  # 10 minutes
+        try:
+            resp = requests.get(ping_url, timeout=15)
+            print(f"[keepalive] Self-ping OK ({resp.status_code}) at {algo.now_ist()}")
+        except Exception as e:
+            print(f"[keepalive] Self-ping failed ({e}) — will retry in 10 minutes. "
+                  f"Not fatal on its own, but if this keeps failing the service "
+                  f"may still get spun down as idle.")
+
+
 if __name__ == "__main__":
     print("Starting web dashboard at http://localhost:5000 ...")
+    threading.Thread(target=_self_ping_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=5000, debug=False)
