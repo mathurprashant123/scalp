@@ -704,6 +704,48 @@ def _extract_order_id(response):
     return None
 
 
+def _extract_bracket_sl_leg_id(bracket_response):
+    """
+    ---- NEW: optimistic, zero-extra-API-call attempt ----
+    Tries to read the newly-created bracket's own stop-loss leg order-id
+    directly out of the POST /v2/orders/bracket response, to avoid the
+    separate, fragile follow-up GET /v2/orders lookup
+    (get_bracket_stop_loss_order_id) for the common case — that lookup
+    was observed hitting a SUSTAINED CloudFront 403 for 2+ hours straight
+    on one occasion, which no reasonable amount of quick-retry can ride
+    out, leaving the staircase unable to sync to the exchange the whole
+    time. Delta's public docs don't show a concrete example response body
+    for this endpoint, so this tries a few plausible shapes defensively.
+
+    Returns None if no shape matches — callers MUST still fall back to
+    the existing, proven get_bracket_stop_loss_order_id() lookup in that
+    case; this is a pure best-effort optimization on top of it, never a
+    replacement. Logs clearly whether it worked so this can be verified
+    against real responses rather than assumed.
+    """
+    try:
+        data = bracket_response.json()
+    except Exception:
+        return None
+    result = data.get("result", data) if isinstance(data, dict) else None
+    if not isinstance(result, dict):
+        return None
+    for key in ("stop_loss_order", "bracket_stop_loss_order"):
+        leg = result.get(key)
+        if isinstance(leg, dict) and leg.get("id") is not None:
+            print(f"    [INFO] Got the bracket's stop-loss leg id ({leg['id']}) directly "
+                  f"from the create-response — skipping the separate GET lookup.")
+            return leg["id"]
+    children = result.get("orders") or result.get("children")
+    if isinstance(children, list):
+        for o in children:
+            if isinstance(o, dict) and o.get("stop_order_type") == "stop_loss_order":
+                print(f"    [INFO] Got the bracket's stop-loss leg id ({o.get('id')}) directly "
+                      f"from the create-response — skipping the separate GET lookup.")
+                return o.get("id")
+    return None
+
+
 def get_real_fill_and_fee(product_id, retries=6, delay=1.5):
     """
     ---- BUG FIX (found via comparing dashboard trade log against Delta's
@@ -1321,15 +1363,17 @@ def adopt_real_position(state, sym, product, pos, size):
         bracket_active = False
         bracket_sl_order_id = None
         try:
-            place_bracket_with_retry(product["id"], sym, order_side, abs(size), stop, target, side)
+            bracket_response = place_bracket_with_retry(product["id"], sym, order_side, abs(size), stop, target, side)
             bracket_active = True
             print(f"    Exchange-side bracket attached for adopted Logic B "
                   f"position: SL={stop:.6f} TP={target:.6f}")
-            try:
-                bracket_sl_order_id = get_bracket_stop_loss_order_id(product["id"])
-            except Exception as e:
-                print(f"    [WARN] Could not cache the bracket's stop-loss leg id "
-                      f"yet ({e}) — will try again if/when trailing needs it.")
+            bracket_sl_order_id = _extract_bracket_sl_leg_id(bracket_response)
+            if bracket_sl_order_id is None:
+                try:
+                    bracket_sl_order_id = get_bracket_stop_loss_order_id(product["id"])
+                except Exception as e:
+                    print(f"    [WARN] Could not cache the bracket's stop-loss leg id "
+                          f"yet ({e}) — will try again if/when trailing needs it.")
         except Exception as e:
             print(f"    [WARN] Could not attach bracket for adopted Logic B "
                   f"position ({e}) — will rely on the polling loop for this trade.")
@@ -1393,15 +1437,17 @@ def adopt_real_position(state, sym, product, pos, size):
         exchange_safety_stop_active = False
         bracket_sl_order_id = None
         try:
-            place_bracket_with_retry(product["id"], sym, order_side, abs(size), stop, target, side)
+            bracket_response = place_bracket_with_retry(product["id"], sym, order_side, abs(size), stop, target, side)
             exchange_safety_stop_active = True
             print(f"    Exchange-side safety-net bracket attached for adopted "
                   f"position: SL={stop:.6f} TP={target:.6f}")
-            try:
-                bracket_sl_order_id = get_bracket_stop_loss_order_id(product["id"])
-            except Exception as e:
-                print(f"    [WARN] Could not cache the bracket's stop-loss leg id "
-                      f"yet ({e}) — will try again if/when the staircase needs it.")
+            bracket_sl_order_id = _extract_bracket_sl_leg_id(bracket_response)
+            if bracket_sl_order_id is None:
+                try:
+                    bracket_sl_order_id = get_bracket_stop_loss_order_id(product["id"])
+                except Exception as e:
+                    print(f"    [WARN] Could not cache the bracket's stop-loss leg id "
+                          f"yet ({e}) — will try again if/when the staircase needs it.")
         except Exception as e:
             print(f"    [WARN] Could not attach safety-net bracket for adopted "
                   f"position ({e}) — will rely on the polling loop for this trade.")
@@ -2983,7 +3029,7 @@ def look_for_entry_a(state, symbol_data, products):
         exchange_safety_stop_active = False
         bracket_sl_order_id = None
         try:
-            place_bracket_with_retry(product["id"], sym, order_side, size, stop, target, side)
+            bracket_response = place_bracket_with_retry(product["id"], sym, order_side, size, stop, target, side)
             exchange_safety_stop_active = True
             print(f"    Exchange-side safety-net bracket attached: SL={stop:.6f} TP={target:.6f}")
             # ---- BUG FIX: cache the bracket's OWN stop-loss leg id now,
@@ -2992,12 +3038,21 @@ def look_for_entry_a(state, symbol_data, products):
             # original MARKET/LIMIT entry order) — which becomes 'closed'
             # the moment it fills, so Delta rejects edits to it with
             # 'open_order_not_found' (observed in practice: every staircase
-            # move after entry silently failed to reach the exchange). ----
-            try:
-                bracket_sl_order_id = get_bracket_stop_loss_order_id(product["id"])
-            except Exception as e:
-                print(f"    [WARN] Could not cache the bracket's stop-loss leg id yet "
-                      f"({e}) — will try again if/when the staircase needs to update it.")
+            # move after entry silently failed to reach the exchange).
+            #
+            # ---- FURTHER FIX: try reading the id directly out of the
+            # bracket-creation response first (zero extra API calls) —
+            # the fallback GET-lookup below was observed hitting a
+            # SUSTAINED CloudFront 403 for 2+ hours straight on one
+            # occasion, during which the staircase's local level kept
+            # improving but could never reach the real exchange bracket. ----
+            bracket_sl_order_id = _extract_bracket_sl_leg_id(bracket_response)
+            if bracket_sl_order_id is None:
+                try:
+                    bracket_sl_order_id = get_bracket_stop_loss_order_id(product["id"])
+                except Exception as e:
+                    print(f"    [WARN] Could not cache the bracket's stop-loss leg id yet "
+                          f"({e}) — will try again if/when the staircase needs to update it.")
         except Exception as e:
             # ---- BUG FIX (was a real incident) ----
             # Previously this just printed a warning and let the trade run
