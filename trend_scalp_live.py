@@ -291,6 +291,31 @@ FIXED_SIZE = 1             # ---- CHANGED for real-account initial verification 
 client = DeltaRestClient(base_url=config.BASE_URL, api_key=config.API_KEY, api_secret=config.API_SECRET)
 
 
+# ---- EXPERIMENTAL: override the outgoing User-Agent header ----
+# Found via Delta's own community forum: another trader reported that a
+# generic library-signature User-Agent (this library sends
+# "delta-rest-client-v1.0.14" by default) triggered CloudFront-level 403s,
+# and switching to a plainer "rest-client" User-Agent resolved it for
+# them. This is NOT confirmed/documented behavior — it's one anecdotal
+# report, not a guaranteed fix — but it's zero-risk to try: it only
+# changes an HTTP header, nothing about request-signing, order-placement,
+# or any trading logic. Delta's own request() method (inside
+# delta_rest_client) hardcodes its own headers dict for every authenticated
+# call, ignoring any headers passed into it — so overriding needs to
+# happen one level deeper, on the actual HTTP transport call itself.
+_UNPATCHED_SESSION_REQUEST = client.session.request
+
+
+def _session_request_with_custom_user_agent(method, url, **kwargs):
+    headers = dict(kwargs.get("headers") or {})
+    headers["User-Agent"] = "rest-client"
+    kwargs["headers"] = headers
+    return _UNPATCHED_SESSION_REQUEST(method, url, **kwargs)
+
+
+client.session.request = _session_request_with_custom_user_agent
+
+
 # ============================================================
 # Basic helpers
 # ============================================================
