@@ -2417,6 +2417,29 @@ def look_for_entry_b(state, symbol_data, products):
     settings (LOGIC_B_RISK_PER_TRADE_PCT, LOGIC_B_LEVERAGE) — independent
     from Logic A's sizing.
     """
+    # ---- NEW: regime gate. Logic B is a trend-following strategy — well-
+    # documented in trading literature that these lose money in choppy /
+    # range-bound conditions via repeated small whipsaw losses, and only
+    # become viable with a regime filter that keeps them out of unfavorable
+    # conditions (source: multiple independent trading-strategy guides,
+    # reviewed 2026-08-04). We already compute exactly this signal every
+    # loop for the dashboard's "Market Condition" banner
+    # (LATEST_STATE["market_regime"]) — this was previously informational
+    # only. Now it actually gates entries: Logic B only takes NEW trades
+    # when the regime explicitly favors it ("B" — strong trend, price far
+    # from VWAP). Deliberately strict: both "A" (range-bound) and
+    # "NEUTRAL" (mixed/transitioning) are treated as NOT-favorable here,
+    # since the whole point is to only trade B in its clear comfort zone.
+    # If regime data isn't available yet for some reason, fails OPEN
+    # (proceeds as before) rather than silently blocking every entry. ----
+    regime = LATEST_STATE.get("market_regime")
+    if regime is not None and regime.get("favors") != "B":
+        print(f"  [REGIME-GATE] Logic B: market condition currently favors "
+              f"'{regime.get('favors')}' ({regime.get('label')}, avg VWAP-dist "
+              f"{regime.get('avg_vwap_dist_pct')}% vs {regime.get('threshold_pct')}% "
+              f"threshold) — not Logic B's environment, skipping entry scan this loop.")
+        return False
+
     last_close_ts = state.get("last_trade_close_time_b")
     if last_close_ts is not None:
         elapsed = time.time() - last_close_ts
