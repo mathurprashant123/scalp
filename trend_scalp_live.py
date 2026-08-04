@@ -1921,8 +1921,24 @@ def manage_bracket_position_b(state, pos, symbol_data):
         print(f"  {sym}: {trigger_desc} -> trailing stop from {old_stop:.6f} to {new_stop:.6f}")
         pos["stop"] = new_stop
         pos["target"] = new_tp
+        pos["last_sync_attempt_time"] = None  # force an immediate sync attempt for this new level
 
     if pos.get("exchange_stop_synced") != pos["stop"]:
+      # ---- NEW: same retry-throttle as Logic A. When CloudFront blocks
+      # this lookup, it can stay blocked for 1+ hour straight — retrying
+      # every ~20-25s (the normal loop interval) during that window just
+      # hammers the same endpoint 150+ times for nothing, and floods the
+      # logs. Once an attempt has failed, wait SYNC_RETRY_THROTTLE_SECONDS
+      # before trying again. A fresh trailing-stop move (above) resets
+      # this timer to None so the FIRST attempt for any new stop-level is
+      # always immediate — only repeated failures on the same level get
+      # slowed down. ----
+      SYNC_RETRY_THROTTLE_SECONDS = 300  # 5 minutes
+      last_attempt = pos.get("last_sync_attempt_time")
+      should_attempt_sync = (last_attempt is None or
+                              time.time() - last_attempt >= SYNC_RETRY_THROTTLE_SECONDS)
+      if should_attempt_sync:
+        pos["last_sync_attempt_time"] = time.time()
         far_tp = pos["target"]
         try:
             bracket_sl_order_id = pos.get("bracket_sl_order_id")
@@ -1958,6 +1974,7 @@ def manage_bracket_position_b(state, pos, symbol_data):
                 #
                 # ---- BUG FIX: fetch the REAL, current size from the exchange
                 # first, rather than trusting our own tracked pos["size"].
+
                 # If this position ever merged with another trade opened on
                 # the same symbol (Delta nets same-direction positions
                 # together automatically — observed in practice: a Logic-B
@@ -2159,6 +2176,7 @@ def manage_open_position(state, symbol_data):
         # Only ever move the stop in the favorable direction, never loosen it
         if (side == "long" and new_stop > old_stop) or (side == "short" and new_stop < old_stop):
             pos["stop"] = new_stop
+            pos["last_sync_attempt_time"] = None  # force an immediate sync attempt for this new level
             print(f"  {sym}: progress reached {pos['max_progress']:.2f} (>= {trigger}) -> "
                   f"stop moved to the {lock_level:.0%} level ({old_stop:.5f} -> {new_stop:.5f})")
         pos["milestones_locked"] = i + 1
@@ -2188,6 +2206,21 @@ def manage_open_position(state, symbol_data):
     # regardless of whether our own attach succeeded earlier. ----
     if pos.get("strategy") == "A":
         if pos.get("exchange_stop_synced") != pos["stop"]:
+            # ---- NEW: throttle retry-frequency for this specific attempt ----
+            # Observed in practice: when CloudFront blocks this lookup, it can
+            # stay blocked for 1+ hour straight — retrying every ~20-25s (the
+            # normal loop interval) during that window just hammers the same
+            # endpoint 150+ times for nothing, and floods the logs. Once an
+            # attempt has failed, wait SYNC_RETRY_THROTTLE_SECONDS before
+            # trying again. A fresh staircase move (see above) resets this
+            # timer to None so the FIRST attempt for any new stop-level is
+            # always immediate — only repeated failures on the same level
+            # get slowed down.
+            SYNC_RETRY_THROTTLE_SECONDS = 300  # 5 minutes
+            last_attempt = pos.get("last_sync_attempt_time")
+            should_attempt_sync = (last_attempt is None or
+                                    time.time() - last_attempt >= SYNC_RETRY_THROTTLE_SECONDS)
+
             # ---- BUG FIX: use the bracket's OWN stop-loss leg id (same
             # correct pattern Logic B already uses), not entry_order_id —
             # the original entry order is already 'closed' the instant it
@@ -2195,40 +2228,42 @@ def manage_open_position(state, symbol_data):
             # (observed in practice: every staircase move after entry was
             # silently failing to reach the exchange for exactly this
             # reason). Cache it once, refresh on failure, same as Logic B. ----
-            bracket_sl_order_id = pos.get("bracket_sl_order_id")
-            if bracket_sl_order_id is None:
-                try:
-                    bracket_sl_order_id = get_bracket_stop_loss_order_id(pos["product_id"])
-                    pos["bracket_sl_order_id"] = bracket_sl_order_id
-                except Exception as e:
-                    bracket_sl_order_id = None
-                    print(f"    [WARN] Couldn't look up the bracket's stop-loss leg id "
-                          f"({e}) — will retry next loop.")
-            if bracket_sl_order_id is not None:
-                try:
-                    edit_bracket_order(bracket_sl_order_id, pos["product_id"], sym, pos["stop"], target)
-                    pos["exchange_stop_synced"] = pos["stop"]
-                    # Now confirmed a real bracket exists and is manageable —
-                    # this also unlocks the external-close-detection check
-                    # above, which was gated on this same flag.
-                    pos["exchange_safety_stop_active"] = True
-                    print(f"    Exchange-side safety-net bracket synced: SL -> {pos['stop']:.6f}")
-                except Exception as e:
-                    # The cached id might have gone stale — refresh once and retry.
-                    print(f"    [WARN] Edit with cached bracket id failed ({e}) — "
-                          f"refreshing the id and retrying once.")
+            if should_attempt_sync:
+                pos["last_sync_attempt_time"] = time.time()
+                bracket_sl_order_id = pos.get("bracket_sl_order_id")
+                if bracket_sl_order_id is None:
                     try:
                         bracket_sl_order_id = get_bracket_stop_loss_order_id(pos["product_id"])
                         pos["bracket_sl_order_id"] = bracket_sl_order_id
-                        if bracket_sl_order_id is not None:
-                            edit_bracket_order(bracket_sl_order_id, pos["product_id"], sym, pos["stop"], target)
-                            pos["exchange_stop_synced"] = pos["stop"]
-                            pos["exchange_safety_stop_active"] = True
-                            print(f"    Exchange-side safety-net bracket synced: SL -> {pos['stop']:.6f}")
-                    except Exception as e2:
-                        print(f"    [WARN] Exchange-side bracket still out of sync with local "
-                              f"stop ({pos['stop']:.6f}) — will keep retrying every loop until "
-                              f"this succeeds ({e2})")
+                    except Exception as e:
+                        bracket_sl_order_id = None
+                        print(f"    [WARN] Couldn't look up the bracket's stop-loss leg id "
+                              f"({e}) — will retry in {SYNC_RETRY_THROTTLE_SECONDS//60} min.")
+                if bracket_sl_order_id is not None:
+                    try:
+                        edit_bracket_order(bracket_sl_order_id, pos["product_id"], sym, pos["stop"], target)
+                        pos["exchange_stop_synced"] = pos["stop"]
+                        # Now confirmed a real bracket exists and is manageable —
+                        # this also unlocks the external-close-detection check
+                        # above, which was gated on this same flag.
+                        pos["exchange_safety_stop_active"] = True
+                        print(f"    Exchange-side safety-net bracket synced: SL -> {pos['stop']:.6f}")
+                    except Exception as e:
+                        # The cached id might have gone stale — refresh once and retry.
+                        print(f"    [WARN] Edit with cached bracket id failed ({e}) — "
+                              f"refreshing the id and retrying once.")
+                        try:
+                            bracket_sl_order_id = get_bracket_stop_loss_order_id(pos["product_id"])
+                            pos["bracket_sl_order_id"] = bracket_sl_order_id
+                            if bracket_sl_order_id is not None:
+                                edit_bracket_order(bracket_sl_order_id, pos["product_id"], sym, pos["stop"], target)
+                                pos["exchange_stop_synced"] = pos["stop"]
+                                pos["exchange_safety_stop_active"] = True
+                                print(f"    Exchange-side safety-net bracket synced: SL -> {pos['stop']:.6f}")
+                        except Exception as e2:
+                            print(f"    [WARN] Exchange-side bracket still out of sync with local "
+                                  f"stop ({pos['stop']:.6f}) — will retry in "
+                                  f"{SYNC_RETRY_THROTTLE_SECONDS//60} min ({e2})")
 
     state["position"] = pos  # persist progress-tracking updates
 
