@@ -202,6 +202,7 @@ STAIRCASE_LOCKS =    [0.00, 0.20, 0.50, 0.75]   # where the stop locks to, for e
 STATE_FILE = "trend_live_state.json"
 TRADES_LOG = "trend_trades_log.csv"     # Logic A trades
 TRADES_LOG_B = "trend_trades_log_B.csv"  # Logic B trades — kept separate
+TRADES_LOG_C = "trend_trades_log_C.csv"  # Logic C trades — kept separate
 
 # ================================================================
 # LOGIC B — fast trend-following scalper (EMA 5/13 cross + RSI + ATR)
@@ -274,6 +275,40 @@ COOLDOWN_SECONDS = 10      # min gap after any close before a new entry
                             # LOOP_INTERVAL_SECONDS=60s anyway, so a 10s
                             # cooldown has no extra effect beyond that —
                             # kept here for transparency/config completeness)
+
+# ---- Logic C: 9/20 EMA multi-timeframe (1-hour bias + 15-min entry) ----
+# NEW, EXPERIMENTAL — added 2026-08-05 for small (1-lot) real-money testing.
+# Source: a YouTube trading-education video's whiteboard sketch (see
+# Logic_C_Strategy_Notes.md for full context, honest caveats, and the rough
+# — NOT rigorously backtested — visual estimate that motivated trying this).
+#
+# IMPORTANT — two things below were NOT specified by the video and were
+# DECIDED HERE instead, deliberately following this bot's own existing
+# design philosophy rather than guessing at what the video "meant":
+#   1. Entry trigger: the video's live demo looked like an EMA-touch-and-
+#      REJECT pattern, not necessarily the exact crossover candle. This
+#      implementation uses a plain EMA9/EMA20 crossover instead (same
+#      pattern as Logic B's "crossover" mode) because it's a precise,
+#      already-proven-reliable rule in this codebase — touch-and-reject
+#      would need a new, unverified detection rule.
+#   2. Stop/target: the video never showed this at all. Uses the same
+#      ATR-based approach as Logic B (this bot's own established method),
+#      not anything from the video.
+# Reuses Logic A's 15-min data (same resolution) for the entry EMAs/ATR,
+# and Logic A's existing staircase/bracket/CloudFront-retry management
+# machinery (see manage_open_position — Logic C positions fall through to
+# the same generic path Logic A uses, since only strategy=="B" gets its
+# own separate management branch).
+EMA_FAST_C = 9
+EMA_SLOW_C = 20
+LOGIC_C_BIAS_RESOLUTION = "1h"
+LOGIC_C_RISK_PER_TRADE_PCT = 1.5   # unused while FIXED_SIZE > 0, kept for
+                                     # when this eventually moves to risk-
+                                     # based sizing like A/B
+LOGIC_C_LEVERAGE = 10
+MIN_STOP_DIST_PCT_C = 0.30
+LOGIC_C_SYMBOLS = ["BTCUSD", "ETHUSD"]
+
 FIXED_SIZE = 1             # ---- CHANGED for real-account initial verification ----
                            # 1 = hamesha exactly 1 lot, risk-based-sizing formula
                            # bypass karke. Maksad: real-account pe execution-mechanics
@@ -443,6 +478,8 @@ def log_trade_event(**fields):
     strategy = fields.get("strategy", "A")
     if strategy == "B":
         append_csv(TRADES_LOG_B, row, fallback_key="log_b")
+    elif strategy == "C":
+        append_csv(TRADES_LOG_C, row, fallback_key="log_c")
     else:
         append_csv(TRADES_LOG, row, fallback_key="log")
 
@@ -2055,16 +2092,17 @@ def manage_open_position(state, symbol_data):
         manage_bracket_position_b(state, pos, symbol_data)
         return
 
-    # ---- Logic A with an active exchange-side safety bracket: check FIRST
-    # whether that bracket already closed the position on the exchange
-    # (SL or TP triggered there) before relying on our own candle-based
-    # stop/target check below. This closes a real gap that was found in
-    # practice: the safety bracket correctly stopped out a losing trade,
-    # but this script's own local state kept showing the position as
-    # still open (since the candle-based check alone never "saw" the
-    # exchange-side close), leaving the dashboard stale and blocking new
-    # Logic A entries until a manual restart forced a reconciliation. ----
-    if pos.get("strategy") == "A" and pos.get("exchange_safety_stop_active"):
+    # ---- Logic A (and Logic C, which reuses this same generic path) with
+    # an active exchange-side safety bracket: check FIRST whether that
+    # bracket already closed the position on the exchange (SL or TP
+    # triggered there) before relying on our own candle-based stop/target
+    # check below. This closes a real gap that was found in practice: the
+    # safety bracket correctly stopped out a losing trade, but this
+    # script's own local state kept showing the position as still open
+    # (since the candle-based check alone never "saw" the exchange-side
+    # close), leaving the dashboard stale and blocking new entries until a
+    # manual restart forced a reconciliation. ----
+    if pos.get("strategy") in ("A", "C") and pos.get("exchange_safety_stop_active"):
         try:
             live_pos = client.get_position(pos["product_id"])
             size_now = float(live_pos.get("size", 0)) if isinstance(live_pos, dict) else pos["size"]
@@ -2204,7 +2242,7 @@ def manage_open_position(state, symbol_data):
     # anything for real." Now this always tries to find and edit WHATEVER
     # bracket currently exists on this position (ours or a leftover one),
     # regardless of whether our own attach succeeded earlier. ----
-    if pos.get("strategy") == "A":
+    if pos.get("strategy") in ("A", "C"):
         if pos.get("exchange_stop_synced") != pos["stop"]:
             # ---- NEW: throttle retry-frequency for this specific attempt ----
             # Observed in practice: when CloudFront blocks this lookup, it can
@@ -3202,6 +3240,240 @@ def look_for_entry_a(state, symbol_data, products):
 
 
 # ============================================================
+# Logic C: 9/20 EMA multi-timeframe (1-hour bias + 15-min entry)
+# See the constants block above (search EMA_FAST_C) and
+# Logic_C_Strategy_Notes.md for full context/caveats.
+# ============================================================
+
+def look_for_entry_c(state, symbol_data, bias_data, products):
+    """
+    Logic C: 1-hour EMA9/20 bias + 15-min EMA9/20 crossover entry.
+    Only checked if Logic A AND Logic B both found nothing this loop
+    (cascade order: A -> B -> C).
+    """
+    regime = LATEST_STATE.get("market_regime")
+    if regime is not None and regime.get("favors") != "B":
+        print(f"  [REGIME-GATE] Logic C: market condition currently favors "
+              f"'{regime.get('favors')}' ({regime.get('label')}) — Logic C is "
+              f"also a trend-following approach, so it uses the same gate as "
+              f"Logic B — skipping entry scan this loop.")
+        return False
+
+    print("  --- Logic C entry scan detail (per coin) ---")
+    for sym, df in symbol_data.items():
+        if sym not in bias_data:
+            print(f"  {sym}: no 1-hour bias data yet")
+            continue
+        i = len(df) - 1
+        if i < 1 or f"ema_{EMA_FAST_C}" not in df.columns:
+            print(f"  {sym}: Logic C 15-min indicators not ready yet")
+            continue
+
+        fast_col, slow_col = f"ema_{EMA_FAST_C}", f"ema_{EMA_SLOW_C}"
+        prev_fast, prev_slow = df[fast_col].iloc[i - 1], df[slow_col].iloc[i - 1]
+        curr_fast, curr_slow = df[fast_col].iloc[i], df[slow_col].iloc[i]
+        atr = df["atr"].iloc[i]
+        price = df["close"].iloc[i]
+
+        if pd.isna(prev_fast) or pd.isna(curr_slow) or pd.isna(atr):
+            print(f"  {sym}: Logic C 15-min indicators not ready yet")
+            continue
+
+        bullish_cross = prev_fast <= prev_slow and curr_fast > curr_slow
+        bearish_cross = prev_fast >= prev_slow and curr_fast < curr_slow
+
+        # ---- 1-hour bias check ----
+        bdf = bias_data[sym]
+        bi = len(bdf) - 1
+        b_fast, b_slow = bdf[fast_col].iloc[bi], bdf[slow_col].iloc[bi]
+        b_price = bdf["close"].iloc[bi]
+        if pd.isna(b_fast) or pd.isna(b_slow):
+            print(f"  {sym}: 1-hour bias indicators not ready yet")
+            continue
+        bias_up = b_price > b_fast > b_slow
+        bias_down = b_price < b_fast < b_slow
+        bias_label = "UP" if bias_up else ("DOWN" if bias_down else "NONE")
+
+        print(f"  {sym}: 15m EMA{EMA_FAST_C}={curr_fast:.5f} EMA{EMA_SLOW_C}={curr_slow:.5f} "
+              f"bullish_cross={bullish_cross} bearish_cross={bearish_cross} | "
+              f"1h bias={bias_label} (price={b_price:.5f} EMA{EMA_FAST_C}={b_fast:.5f} "
+              f"EMA{EMA_SLOW_C}={b_slow:.5f})")
+
+        side = None
+        if bullish_cross and bias_up:
+            side = "long"
+        elif bearish_cross and bias_down:
+            side = "short"
+        else:
+            if bullish_cross or bearish_cross:
+                print(f"    -> SKIP: 15-min crossover happened but doesn't match "
+                      f"the 1-hour bias ({bias_label})")
+            continue
+
+        stop = price - SL_ATR_MULT * atr if side == "long" else price + SL_ATR_MULT * atr
+        target = price + TP_ATR_MULT * atr if side == "long" else price - TP_ATR_MULT * atr
+        stop_dist_pct = abs(price - stop) / price * 100
+
+        print(f"    -> Logic C CONDITIONS MET: {side.upper()} entry "
+              f"(15-min crossover confirmed by 1-hour {bias_label} bias)")
+
+        if stop_dist_pct < MIN_STOP_DIST_PCT_C:
+            print(f"    [INFO] ATR-based stop distance {stop_dist_pct:.3f}% is tinier than "
+                  f"the {MIN_STOP_DIST_PCT_C}% floor — widening the stop to the floor "
+                  f"(position size will shrink to keep the same $ risk) instead of skipping.")
+            stop_dist_pct = MIN_STOP_DIST_PCT_C
+            stop = price * (1 - stop_dist_pct / 100) if side == "long" else price * (1 + stop_dist_pct / 100)
+            target = (price * (1 + stop_dist_pct * TP_RR_MULT / 100) if side == "long"
+                      else price * (1 - stop_dist_pct * TP_RR_MULT / 100))
+
+        final_target_move_pct = stop_dist_pct * TP_RR_MULT
+        if final_target_move_pct < MIN_TARGET_PCT_B:  # reuse Logic B's fee-aware floor (same fee structure)
+            print(f"    -> SKIP: target move ({final_target_move_pct:.3f}%) is smaller than "
+                  f"the fee-aware minimum ({MIN_TARGET_PCT_B:.3f}%).")
+            continue
+
+        if sym not in products:
+            print(f"    -> SKIP: {sym} not available on this account")
+            continue
+        product = products[sym]
+
+        if FIXED_SIZE and FIXED_SIZE > 0:
+            size = FIXED_SIZE
+        else:
+            available = get_wallet_available_balance()
+            risk_amount = available * (LOGIC_C_RISK_PER_TRADE_PCT / 100)
+            max_notional = available * LOGIC_C_LEVERAGE * MARGIN_SAFETY_FACTOR
+            notional = min(risk_amount / (stop_dist_pct / 100), max_notional)
+            contract_value = float(product.get("contract_value", 1))
+            size = max(1, round(notional / (contract_value * price)))
+
+        order_side = "buy" if side == "long" else "sell"
+        limit_price = (price * (1 - LIMIT_OFFSET_PCT / 100) if side == "long"
+                       else price * (1 + LIMIT_OFFSET_PCT / 100))
+        intended_stop_dist_pct = stop_dist_pct
+
+        # ---- Same stray-order sweep + adopt-on-timeout + real-fill-price
+        # recalculation pattern already proven in Logic A/B (see their
+        # identical comments for the full history of why each check exists) ----
+        try:
+            cancel_all_orders_for_product(product["id"])
+        except Exception as e:
+            print(f"    -> SKIP: couldn't confirm no stray orders remain on {sym} "
+                  f"({e}) — NOT placing a new order this loop.")
+            continue
+        if not confirm_no_open_orders(product["id"]):
+            print(f"    -> SKIP: {sym} still has open orders resting after the sweep.")
+            continue
+
+        try:
+            resp, method = place_order_with_fallback(product["id"], order_side, size, limit_price)
+        except Exception as e:
+            print(f"    [WARN] create_order for {sym} raised an error/timeout ({e}) — "
+                  f"checking whether it actually landed on the exchange anyway...")
+            try:
+                real_pos = client.get_position(product["id"])
+                real_size = float(real_pos.get("size", 0)) if isinstance(real_pos, dict) else 0
+            except Exception as e2:
+                print(f"    [WARN] couldn't verify position for {sym} either ({e2}) — will re-check next loop.")
+                continue
+            if real_size != 0:
+                print(f"    [INFO] Found a REAL position on {sym} (size={real_size}) despite "
+                      f"the timeout — adopting it now.")
+                adopt_real_position(state, sym, product, real_pos, real_size)
+            continue
+
+        entry_order_id = resp.get("id") if isinstance(resp, dict) else None
+        if entry_order_id is None and isinstance(resp, dict) and isinstance(resp.get("result"), dict):
+            entry_order_id = resp["result"].get("id")
+
+        price_for_calc, real_size = get_authoritative_entry_price(product["id"])
+        if price_for_calc is None:
+            fallback = _extract_fill_price(resp)
+            price_for_calc = fallback if fallback is not None else price
+            print(f"    [WARN] Couldn't confirm entry price from the exchange's position "
+                  f"record — using {price_for_calc:.5f} as a fallback (verify manually).")
+        else:
+            if real_size is not None and real_size != size:
+                print(f"    [INFO] Real resulting size ({real_size}) differs from requested "
+                      f"({size}) — using the real size for tracking.")
+                size = real_size
+            if abs(price_for_calc - price) / price * 100 > 0.02:
+                print(f"    [INFO] Signal price was {price:.5f}, exchange confirms REAL entry "
+                      f"was {price_for_calc:.5f} — recalculating stop/target from this real "
+                      f"entry price (same % distance, not re-derived from ATR again).")
+                sl_dist = price_for_calc * (stop_dist_pct / 100)
+                tp_dist = sl_dist * TP_RR_MULT
+                if side == "long":
+                    stop = price_for_calc - sl_dist
+                    target = price_for_calc + tp_dist
+                else:
+                    stop = price_for_calc + sl_dist
+                    target = price_for_calc - tp_dist
+
+        exchange_safety_stop_active = False
+        bracket_sl_order_id = None
+        try:
+            bracket_response = place_bracket_with_retry(product["id"], sym, order_side, size, stop, target, side)
+            exchange_safety_stop_active = True
+            print(f"    Exchange-side safety-net bracket attached: SL={stop:.6f} TP={target:.6f}")
+            bracket_sl_order_id = _extract_bracket_sl_leg_id(bracket_response)
+            if bracket_sl_order_id is None:
+                try:
+                    bracket_sl_order_id = get_bracket_stop_loss_order_id(product["id"])
+                except Exception as e:
+                    print(f"    [WARN] Could not cache the bracket's stop-loss leg id yet ({e}).")
+        except Exception as e:
+            print(f"    [WARN] Could not attach safety-net bracket ({e}) — this position "
+                  f"would have NO exchange-side stop protection. Closing immediately.")
+            close_side = "sell" if side == "long" else "buy"
+            try:
+                close_resp, close_method = place_order_with_fallback(
+                    product["id"], close_side, size, price_for_calc, reduce_only=True)
+                exit_price = _extract_fill_price(close_resp) or price_for_calc
+            except Exception as close_e:
+                print(f"    [WARN] Emergency close also failed ({close_e}) — position is "
+                      f"now unprotected and UNTRACKED locally; check the exchange manually.")
+                exit_price = None
+            if exit_price is not None:
+                abort_pnl_pct = ((exit_price - price_for_calc) / price_for_calc * 100 if side == "long"
+                                  else (price_for_calc - exit_price) / price_for_calc * 100)
+                net_pnl_pct = estimate_net_pnl_pct(abort_pnl_pct, "C")
+                log_trade_event(
+                    time=str(now_ist()), symbol=sym, action="CLOSE",
+                    side=close_side, size=size, reason="aborted_no_bracket_protection",
+                    entry_price=price_for_calc, exit_price=exit_price,
+                    approx_gross_pnl_pct=round(abort_pnl_pct, 4),
+                    approx_net_pnl_pct_after_fees=round(net_pnl_pct, 4),
+                    fill_method=close_method, strategy="C",
+                )
+                print(f"    Closed immediately (no bracket protection available). "
+                      f"Approx P&L: {abort_pnl_pct:+.3f}% (net after fees: {net_pnl_pct:+.3f}%)")
+                return True
+
+        state["position"] = {
+            "symbol": sym, "product_id": product["id"], "side": side,
+            "size": size, "original_size": size,
+            "entry_price": price_for_calc, "stop": stop, "target": target,
+            "entry_time": str(now_ist()), "milestones_locked": 0,
+            "max_progress": 0.0, "strategy": "C",
+            "entry_order_id": entry_order_id,
+            "exchange_safety_stop_active": exchange_safety_stop_active,
+            "exchange_stop_synced": stop if exchange_safety_stop_active else None,
+            "bracket_sl_order_id": bracket_sl_order_id,
+        }
+        log_trade_event(
+            time=str(now_ist()), symbol=sym, action="OPEN",
+            side=order_side, size=size, entry_price=price_for_calc,
+            stop=stop, target=target, fill_method=method,
+            order_response=json.dumps(resp), strategy="C",
+        )
+        print(f"  OPENED {sym} {side} size={size} @ ~{price:.4f} (filled via {method}) [Logic C]")
+        return True
+
+    return False
+
+
+# ============================================================
 # Main loop — wrapped so it NEVER stops on its own
 # ============================================================
 
@@ -3272,8 +3544,15 @@ def run_one_loop_iteration(state, products):
     # down in this function. ----
     need_a = True
     need_b = mode in ("B", "BOTH") or active_strategy == "B"
+    # Logic C only runs as part of "BOTH" mode (cascades after A, then B,
+    # then C find nothing) — see Logic_C_Strategy_Notes.md for why this
+    # was kept simple rather than adding a separate selectable "C" mode.
+    need_c = mode in ("C", "BOTH") or active_strategy == "C"
 
     # ---- Logic A data (15-min) — watches all of SYMBOLS_TO_WATCH ----
+    # Also computes EMA9/EMA20/ATR on this SAME 15-min data for Logic C's
+    # use (same resolution, no extra fetch needed) — only actually used
+    # when need_c is True, but cheap enough to just always compute.
     if need_a:
         for sym in SYMBOLS_TO_WATCH:
             try:
@@ -3285,9 +3564,27 @@ def run_one_loop_iteration(state, products):
                 df_a = compute_ema(df_a, period=EMA_PERIOD)
                 df_a = compute_vwap(df_a)
                 df_a = compute_cvd(df_a)
+                if len(df_a) >= EMA_SLOW_C + ATR_PERIOD + 5:
+                    df_a = compute_ema(df_a, period=EMA_FAST_C)
+                    df_a = compute_ema(df_a, period=EMA_SLOW_C)
+                    df_a = compute_atr(df_a, period=ATR_PERIOD)
                 symbol_data_a[sym] = df_a
 
     compute_market_regime(symbol_data_a)
+
+    # ---- Logic C bias data (1-hour) — only fetched when actually needed ----
+    symbol_data_c_bias = {}
+    if need_c:
+        for sym in LOGIC_C_SYMBOLS:
+            try:
+                df_c1h = fetch_candles(sym, hours=24 * 20, resolution=LOGIC_C_BIAS_RESOLUTION)
+            except Exception as e:
+                print(f"  [ERROR] {sym}: Logic C (1h bias) fetch failed ({e}) — skipping")
+                df_c1h = None
+            if df_c1h is not None and len(df_c1h) >= EMA_SLOW_C + 5:
+                df_c1h = compute_ema(df_c1h, period=EMA_FAST_C)
+                df_c1h = compute_ema(df_c1h, period=EMA_SLOW_C)
+                symbol_data_c_bias[sym] = df_c1h
 
     # ---- Logic B data (1-min) — watches only LOGIC_B_SYMBOLS (BTC/ETH) ----
     if need_b:
@@ -3317,7 +3614,10 @@ def run_one_loop_iteration(state, products):
     # should ever be blocked by the circuit breaker.) ----
     if state["position"] is not None:
         active_strategy = state["position"].get("strategy", "A")
-        symbol_data_for_management = symbol_data_a if active_strategy == "A" else symbol_data_b
+        # Logic C reuses Logic A's 15-min data for management (same
+        # candle-based stop/target/staircase check) — only Logic B uses
+        # the separate 1-min data.
+        symbol_data_for_management = symbol_data_b if active_strategy == "B" else symbol_data_a
         manage_open_position(state, symbol_data_for_management)
 
     if not check_daily_loss_circuit_breaker(state):
@@ -3352,6 +3652,8 @@ def run_one_loop_iteration(state, products):
             took_trade = look_for_entry_a(state, symbol_data_a, products)
         if not took_trade and mode in ("B", "BOTH"):
             took_trade = look_for_entry_b(state, symbol_data_b, products)
+        if not took_trade and mode in ("C", "BOTH"):
+            took_trade = look_for_entry_c(state, symbol_data_a, symbol_data_c_bias, products)
         if not took_trade:
             print(f"  No tradeable setup this loop (mode={mode}) — staying flat.")
 

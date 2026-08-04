@@ -94,7 +94,12 @@ state_info = {"running": False, "stop_event": None, "thread": None}
 def find_trades_csv_path(strategy="A"):
     """Checks the primary location first, then the fallback temp location
     (in case the algo switched to it due to a permission issue)."""
-    log_file = algo.TRADES_LOG if strategy == "A" else algo.TRADES_LOG_B
+    if strategy == "B":
+        log_file = algo.TRADES_LOG_B
+    elif strategy == "C":
+        log_file = algo.TRADES_LOG_C
+    else:
+        log_file = algo.TRADES_LOG
     if os.path.exists(log_file):
         return log_file
     fallback_path = os.path.join(algo.FALLBACK_DIR, os.path.basename(log_file))
@@ -186,6 +191,8 @@ TRADES_PAGE_TEMPLATE = """
            background:{{ '#1a3c6e' if strategy=='A' else '#333' }}; color:white; font-size:13px;">Logic A (200EMA+VWAP+CVD)</a>
         <a href="/trades?strategy=B" style="padding:8px 18px; margin:0 5px; border-radius:6px; text-decoration:none;
            background:{{ '#1a3c6e' if strategy=='B' else '#333' }}; color:white; font-size:13px;">Logic B (EMA5/13+RSI+ATR)</a>
+        <a href="/trades?strategy=C" style="padding:8px 18px; margin:0 5px; border-radius:6px; text-decoration:none;
+           background:{{ '#1a3c6e' if strategy=='C' else '#333' }}; color:white; font-size:13px;">Logic C (9/20EMA multi-TF)</a>
     </div>
     <div style="text-align:center; margin-bottom:15px;">
         <button onclick="clearLog()" style="background:#8a1f1f; color:white; border:none;
@@ -387,7 +394,12 @@ def clear_trades_log():
     from flask import request
     strategy = request.args.get("strategy", "A")
     deleted = []
-    primary = algo.TRADES_LOG if strategy == "A" else algo.TRADES_LOG_B
+    if strategy == "B":
+        primary = algo.TRADES_LOG_B
+    elif strategy == "C":
+        primary = algo.TRADES_LOG_C
+    else:
+        primary = algo.TRADES_LOG
     fallback = os.path.join(algo.FALLBACK_DIR, os.path.basename(primary))
     for path in (primary, fallback):
         if os.path.exists(path):
@@ -512,7 +524,8 @@ PAGE_TEMPLATE = """
         <span style="color:#aaa; font-size:13px; margin-right:10px;">Active Logic:</span>
         <button id="modeABtn" onclick="setMode('A')" class="modeBtn">Logic A Only</button>
         <button id="modeBBtn" onclick="setMode('B')" class="modeBtn">Logic B Only</button>
-        <button id="modeBothBtn" onclick="setMode('BOTH')" class="modeBtn">Both</button>
+        <button id="modeCBtn" onclick="setMode('C')" class="modeBtn">Logic C Only</button>
+        <button id="modeBothBtn" onclick="setMode('BOTH')" class="modeBtn">All (A+B+C)</button>
     </div>
     <div style="text-align:center; margin-bottom:15px;">
         <button onclick="resetBreaker()" style="background:#7a4a00; color:white; border:none;
@@ -626,6 +639,7 @@ PAGE_TEMPLATE = """
             fetch('/logic_mode').then(r => r.json()).then(data => {
                 document.getElementById('modeABtn').classList.toggle('active', data.mode === 'A');
                 document.getElementById('modeBBtn').classList.toggle('active', data.mode === 'B');
+                document.getElementById('modeCBtn').classList.toggle('active', data.mode === 'C');
                 document.getElementById('modeBothBtn').classList.toggle('active', data.mode === 'BOTH');
             });
         }
@@ -775,8 +789,8 @@ def set_logic_mode():
     from flask import request
     data = request.get_json(force=True)
     mode = data.get("mode")
-    if mode not in ("A", "B", "BOTH"):
-        return jsonify({"ok": False, "error": "mode must be A, B, or BOTH"}), 400
+    if mode not in ("A", "B", "C", "BOTH"):
+        return jsonify({"ok": False, "error": "mode must be A, B, C, or BOTH"}), 400
     algo.LOGIC_MODE["active"] = mode
     # ---- BUG FIX: this used to live ONLY in memory (algo.LOGIC_MODE), never
     # saved anywhere — so any restart (STOP/START, or the process getting
