@@ -521,13 +521,22 @@ PAGE_TEMPLATE = """
         </a>
     </div>
     <div style="text-align:center; margin-bottom:15px;">
-        <span style="color:#aaa; font-size:13px; margin-right:10px;">Active Logic:</span>
-        <button id="modeABtn" onclick="setMode('A')" class="modeBtn">Logic A Only</button>
-        <button id="modeBBtn" onclick="setMode('B')" class="modeBtn">Logic B Only</button>
-        <button id="modeCBtn" onclick="setMode('C')" class="modeBtn">Logic C Only</button>
-        <button id="modeBothBtn" onclick="setMode('BOTH')" class="modeBtn">All (A+B+C)</button>
+        <span style="color:#aaa; font-size:13px; margin-right:10px;">Active Logic (tick any combination):</span>
+        <label style="color:white; font-size:13px; margin:0 10px; cursor:pointer;">
+            <input type="checkbox" id="logicChkA" onchange="toggleLogic('A')" style="margin-right:5px;">Logic A</label>
+        <label style="color:white; font-size:13px; margin:0 10px; cursor:pointer;">
+            <input type="checkbox" id="logicChkB" onchange="toggleLogic('B')" style="margin-right:5px;">Logic B</label>
+        <label style="color:white; font-size:13px; margin:0 10px; cursor:pointer;">
+            <input type="checkbox" id="logicChkC" onchange="toggleLogic('C')" style="margin-right:5px;">Logic C</label>
     </div>
     <div style="text-align:center; margin-bottom:15px;">
+        <button onclick="setMode('A')" class="modeBtn" style="font-size:11px; padding:4px 10px;">A Only</button>
+        <button onclick="setMode('B')" class="modeBtn" style="font-size:11px; padding:4px 10px;">B Only</button>
+        <button onclick="setMode('C')" class="modeBtn" style="font-size:11px; padding:4px 10px;">C Only</button>
+        <button onclick="setMode('BOTH')" class="modeBtn" style="font-size:11px; padding:4px 10px;">All (A+B+C)</button>
+    </div>
+    <div style="text-align:center; margin-bottom:15px;">
+
         <button onclick="resetBreaker()" style="background:#7a4a00; color:white; border:none;
                 padding:8px 18px; border-radius:6px; cursor:pointer; font-size:13px;">
             &#9888; Reset Daily Circuit Breaker
@@ -626,10 +635,31 @@ PAGE_TEMPLATE = """
                 if (wasAtBottom) logDiv.scrollTop = logDiv.scrollHeight;
             });
         }
+        // Quick-preset buttons — set the FULL enabled-set in one click
         function setMode(mode) {
+            let enabled;
+            if (mode === 'BOTH') enabled = ['A', 'B', 'C'];
+            else enabled = [mode];
+            applyEnabled(enabled);
+        }
+        // Checkbox toggle — flips just ONE logic on/off, keeping the rest as-is
+        function toggleLogic(logic) {
+            fetch('/logic_mode').then(r => r.json()).then(data => {
+                let enabled = new Set(data.enabled);
+                if (enabled.has(logic)) enabled.delete(logic);
+                else enabled.add(logic);
+                if (enabled.size === 0) {
+                    alert('At least one logic must stay enabled.');
+                    refreshMode();  // revert the checkbox visually
+                    return;
+                }
+                applyEnabled(Array.from(enabled));
+            });
+        }
+        function applyEnabled(enabled) {
             fetch('/logic_mode', {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({mode: mode})
+                body: JSON.stringify({enabled: enabled})
             }).then(r => r.json()).then(data => {
                 if (data.ok) refreshMode();
                 else alert('Error: ' + data.error);
@@ -637,10 +667,10 @@ PAGE_TEMPLATE = """
         }
         function refreshMode() {
             fetch('/logic_mode').then(r => r.json()).then(data => {
-                document.getElementById('modeABtn').classList.toggle('active', data.mode === 'A');
-                document.getElementById('modeBBtn').classList.toggle('active', data.mode === 'B');
-                document.getElementById('modeCBtn').classList.toggle('active', data.mode === 'C');
-                document.getElementById('modeBothBtn').classList.toggle('active', data.mode === 'BOTH');
+                const enabled = new Set(data.enabled);
+                document.getElementById('logicChkA').checked = enabled.has('A');
+                document.getElementById('logicChkB').checked = enabled.has('B');
+                document.getElementById('logicChkC').checked = enabled.has('C');
             });
         }
         function refreshPnl() {
@@ -780,30 +810,30 @@ def logs():
 
 
 @app.route("/logic_mode", methods=["GET"])
+@app.route("/logic_mode", methods=["GET"])
 def get_logic_mode():
-    return jsonify({"mode": algo.LOGIC_MODE["active"]})
+    return jsonify({"enabled": sorted(algo.LOGIC_MODE["enabled"])})
 
 
 @app.route("/logic_mode", methods=["POST"])
 def set_logic_mode():
     from flask import request
     data = request.get_json(force=True)
-    mode = data.get("mode")
-    if mode not in ("A", "B", "C", "BOTH"):
-        return jsonify({"ok": False, "error": "mode must be A, B, C, or BOTH"}), 400
-    algo.LOGIC_MODE["active"] = mode
-    # ---- BUG FIX: this used to live ONLY in memory (algo.LOGIC_MODE), never
-    # saved anywhere — so any restart (STOP/START, or the process getting
-    # recycled) silently reset it back to the "BOTH" default, even if the
-    # user had explicitly chosen "Logic A Only". Now persisted into the
-    # state file too, so a restart picks up the last choice instead of
-    # silently reverting. (Note: a full Render REDEPLOY that wipes the
-    # ephemeral disk would still reset this — always worth checking the
-    # dashboard's Active Logic buttons right after a fresh deploy.) ----
+    enabled = data.get("enabled")
+    if not isinstance(enabled, list):
+        return jsonify({"ok": False, "error": "enabled must be a list, e.g. [\"A\",\"C\"]"}), 400
+    valid = {"A", "B", "C"} & set(enabled)
+    if not valid:
+        return jsonify({"ok": False, "error": "at least one of A, B, C must be enabled"}), 400
+    algo.LOGIC_MODE["enabled"] = valid
+    # ---- Persisted into the state file too, so a restart picks up the
+    # last choice instead of silently reverting (same reasoning as the
+    # old single-mode version — see git history for the original bug this
+    # fixed). Stored as a sorted LIST since JSON has no native set type. ----
     state = algo.load_state()
-    state["logic_mode"] = mode
+    state["logic_mode_enabled"] = sorted(valid)
     algo.save_state(state)
-    return jsonify({"ok": True, "mode": mode})
+    return jsonify({"ok": True, "enabled": sorted(valid)})
 
 
 @app.route("/market_regime")

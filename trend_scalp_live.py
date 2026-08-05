@@ -242,7 +242,13 @@ TRADES_LOG_C = "trend_trades_log_C.csv"  # Logic C trades — kept separate
 # ================================================================
 # Controls which logic(s) are active — changeable LIVE from the dashboard
 # without restarting the algo. Values: "A", "B", or "BOTH".
-LOGIC_MODE = {"active": "A"}  # Default changed from "BOTH" to "A" per user
+LOGIC_MODE = {"enabled": {"A"}}  # ---- CHANGED 2026-08-05: was a single "active"
+                                    # string (A/B/C/BOTH) — now a SET of independently
+                                    # toggleable logics, so any combination (e.g. just
+                                    # A+C, or just B+C) can run together, not only the
+                                    # fixed presets that existed before. Default kept
+                                    # to just {"A"} for safety (same as the previous
+                                    # single-mode default).
                               # request — even in a worst-case where the
                               # saved state file is somehow completely lost
                               # (e.g. a full Render redeploy that wipes the
@@ -1358,14 +1364,12 @@ def guess_strategy_for_adopted_position(sym, product_id, entry_price, side):
                   f"{TP_RR_MULT}x) -> guessing Logic {guess}.")
             return guess
 
-    mode = LOGIC_MODE.get("active", "BOTH")
-    if mode == "A":
-        return "A"
-    if mode == "B":
-        return "B"
-    print(f"    [WARN] Couldn't fingerprint {sym} (no bracket found and both logics "
-          f"are active) — defaulting to Logic A as a guess. Please verify manually "
-          f"against the exchange's own order history if this matters.")
+    enabled = LOGIC_MODE.get("enabled", {"A"})
+    if len(enabled) == 1:
+        return next(iter(enabled))
+    print(f"    [WARN] Couldn't fingerprint {sym} (no bracket found and multiple logics "
+          f"are enabled: {sorted(enabled)}) — defaulting to Logic A as a guess. Please "
+          f"verify manually against the exchange's own order history if this matters.")
     return "A"
 
 
@@ -3631,20 +3635,20 @@ def run_one_loop_iteration(state, products):
     symbol_data_a = {}  # Logic A: 15-min candles
     symbol_data_b = {}  # Logic B: 1-min candles
 
-    mode = LOGIC_MODE["active"]
+    enabled = LOGIC_MODE["enabled"]
     active_strategy = state["position"].get("strategy") if state["position"] else None
     # ---- Logic A data is now ALWAYS fetched (cheap, public, read-only
-    # endpoint), regardless of active mode — needed for the market-regime
-    # indicator above, which shows whether conditions favor A or B no
-    # matter which is actually running. This does NOT change which logic
-    # actually takes trades — that stays strictly gated by `mode` further
-    # down in this function. ----
+    # endpoint), regardless of which logics are enabled — needed for the
+    # market-regime indicator, which shows whether conditions favor A or B
+    # no matter which is actually running. This does NOT change which
+    # logic actually takes trades — that stays strictly gated by the
+    # `enabled` set further down in this function. ----
     need_a = True
-    need_b = mode in ("B", "BOTH") or active_strategy == "B"
-    # Logic C only runs as part of "BOTH" mode (cascades after A, then B,
-    # then C find nothing) — see Logic_C_Strategy_Notes.md for why this
-    # was kept simple rather than adding a separate selectable "C" mode.
-    need_c = mode in ("C", "BOTH") or active_strategy == "C"
+    need_b = "B" in enabled or active_strategy == "B"
+    # ---- CHANGED 2026-08-05: any combination of A/B/C can now be enabled
+    # independently via the dashboard's checkboxes (was fixed presets:
+    # A-only, B-only, C-only, or all three via "BOTH"). ----
+    need_c = "C" in enabled or active_strategy == "C"
 
     # ---- Logic A data (15-min) — watches all of SYMBOLS_TO_WATCH ----
     # Also computes EMA9/EMA20/ATR on this SAME 15-min data for Logic C's
@@ -3743,16 +3747,16 @@ def run_one_loop_iteration(state, products):
     #      so the other logic is never even checked that same loop
     # ============================================================
     if state["position"] is None:
-        mode = LOGIC_MODE["active"]
+        enabled = LOGIC_MODE["enabled"]
         took_trade = False
-        if mode in ("A", "BOTH"):
+        if "A" in enabled:
             took_trade = look_for_entry_a(state, symbol_data_a, products)
-        if not took_trade and mode in ("B", "BOTH"):
+        if not took_trade and "B" in enabled:
             took_trade = look_for_entry_b(state, symbol_data_b, products)
-        if not took_trade and mode in ("C", "BOTH"):
+        if not took_trade and "C" in enabled:
             took_trade = look_for_entry_c(state, symbol_data_a, symbol_data_c_bias, products)
         if not took_trade:
-            print(f"  No tradeable setup this loop (mode={mode}) — staying flat.")
+            print(f"  No tradeable setup this loop (enabled={sorted(enabled)}) — staying flat.")
 
     save_state(state)
 
@@ -3766,15 +3770,19 @@ def main_loop(stop_event=None):
 
     state = load_state()
 
-    # ---- BUG FIX: restore the last-chosen Active Logic mode (A/B/BOTH)
-    # from the saved state. Previously LOGIC_MODE only lived in memory,
-    # so any restart silently reverted it to "BOTH" — meaning a user who
-    # explicitly selected "Logic A Only" could have Logic B quietly start
-    # trading again after any restart, without them re-selecting it. ----
-    saved_mode = state.get("logic_mode")
-    if saved_mode in ("A", "B", "BOTH"):
-        LOGIC_MODE["active"] = saved_mode
-        print(f"Restored Active Logic mode from saved state: {saved_mode}")
+    # ---- BUG FIX: restore the last-chosen enabled-logics set from the
+    # saved state. Previously LOGIC_MODE only lived in memory, so any
+    # restart silently reverted it to the default — meaning a user who
+    # explicitly chose a specific combination could have a DIFFERENT set
+    # of logics quietly start trading again after any restart, without
+    # them re-selecting it. Stored as a LIST in the state file (JSON has
+    # no native set type) and converted back to a set here. ----
+    saved_enabled = state.get("logic_mode_enabled")
+    if isinstance(saved_enabled, list) and saved_enabled:
+        valid = {"A", "B", "C"} & set(saved_enabled)
+        if valid:
+            LOGIC_MODE["enabled"] = valid
+            print(f"Restored enabled-logics from saved state: {sorted(valid)}")
 
     products = get_product_map()
     print(f"Loaded products: {list(products.keys())}")
