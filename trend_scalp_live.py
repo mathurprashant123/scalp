@@ -567,7 +567,7 @@ import tempfile
 # folders, etc.). This is always writable.
 FALLBACK_DIR = os.path.join(tempfile.gettempdir(), "trend_scalp_algo_data")
 os.makedirs(FALLBACK_DIR, exist_ok=True)
-_using_fallback = {"state": False, "log": False, "log_b": False}
+_using_fallback = {"state": False, "log": False, "log_b": False, "log_c": False}
 
 
 def _safe_write_json(primary_path, fallback_key, data):
