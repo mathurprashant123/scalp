@@ -148,7 +148,36 @@ MIN_TARGET_PCT = ROUND_TRIP_FEE_PCT * SAFETY_MARGIN_MULT  # Logic A (limit-first
 MIN_TARGET_PCT_B = (TAKER_FEE_PCT * 2) * SAFETY_MARGIN_MULT
 
 LIMIT_ORDER_TIMEOUT_SECONDS = 45
+# ---- NEW 2026-08-05: Logic A's entries specifically wait longer for a
+# limit-fill before falling back to market — see place_order_with_fallback
+# docstring for the full reasoning (reduces taker-fee fallbacks). Does NOT
+# affect Logic B/C entries or ANY close (all still use the 45s default).
+LOGIC_A_ENTRY_TIMEOUT_SECONDS = 90
+
+# ---- NEW 2026-08-05: VWAP-slope filter for Logic A ----
+# Research + our own real trade data both point at the same problem:
+# mean-reversion entries (which is what Logic A fundamentally is — "price
+# is near VWAP, fade back toward it") are dangerous specifically when the
+# session is actually TRENDING, because price can briefly touch VWAP
+# during a strong trend (satisfying the near_vwap check) without the
+# market genuinely being range-bound — VWAP itself is still drifting hard
+# in one direction. This matches the "exchange_bracket_closed" pattern
+# seen repeatedly in real trades (much worse average P&L than local-close
+# "stop" trades) — those look like cases where price kept moving against
+# the position right after entry, consistent with catching a trend's
+# temporary VWAP-touch rather than a genuine range-bound pullback.
+# Chosen values are a reasonable FIRST-PASS estimate, not backtested —
+# meant to be revisited once real trades show whether this helps.
+VWAP_SLOPE_LOOKBACK = 20      # 15-min candles = 5 hours
+MAX_VWAP_SLOPE_PCT = 0.15     # if VWAP moved more than this over the lookback,
+                                # treat the session as trending, not range-bound
 LIMIT_OFFSET_PCT = 0.02
+# ---- NEW 2026-08-05: buffer between a bracket's stop-TRIGGER price and
+# its actual LIMIT price (see place_bracket_order_raw / edit_bracket_order
+# docstrings). Gives the stop-limit order room to still fill during
+# normal volatility after triggering, without capping the worst-case
+# slippage nearly as loosely as a pure stop-market order would.
+STOP_LIMIT_BUFFER_PCT = 0.05
 
 # Safety bound for CLOSING a position when the limit-first attempt above
 # doesn't fill in time. Previously this fell back to a true, UNBOUNDED
@@ -943,12 +972,36 @@ def place_bracket_order_raw(product_id, product_symbol, side, size, sl_price, tp
     Attaches a stop-loss + take-profit bracket to an EXISTING position via
     Delta's native /v2/orders/bracket endpoint. Does NOT open a position —
     must be called right after a market entry.
+
+    ---- CHANGED 2026-08-05: stop-loss is now a stop-LIMIT order (was
+    stop-MARKET). Research + Delta's own docs confirm stop-market orders
+    can fill at a worse price than the trigger level during fast moves
+    (the trigger fires, then it executes as a market order against
+    whatever price is available) — this lines up with what we saw in
+    real trades: closes tagged "exchange_bracket_closed" (this bracket
+    triggering, as opposed to our own local check catching it first)
+    had noticeably worse average P&L than local "stop" closes across
+    A/B, consistent with extra market-order slippage on top of the
+    intended stop distance.
+    A stop-LIMIT caps the worst-case fill (won't sell/buy past the limit
+    price), at the honest cost that in a genuinely fast gap it might not
+    fill at all — same trade-off used industry-wide, not unique to us.
+    STOP_LIMIT_BUFFER_PCT gives the limit order some room past the
+    trigger to actually fill during normal volatility rather than
+    sitting unfilled after a trigger. ----
     """
+    long_side = sl_price < tp_price  # LONG: stop below entry below target; SHORT: stop above entry above target
+    sl_limit = (sl_price * (1 - STOP_LIMIT_BUFFER_PCT / 100) if long_side
+                else sl_price * (1 + STOP_LIMIT_BUFFER_PCT / 100))
+    tp_limit = (tp_price * (1 - STOP_LIMIT_BUFFER_PCT / 100) if long_side
+                else tp_price * (1 + STOP_LIMIT_BUFFER_PCT / 100))
     body = {
         "product_id": product_id,
         "product_symbol": product_symbol,
-        "stop_loss_order": {"order_type": "market_order", "stop_price": str(round(sl_price, 6))},
-        "take_profit_order": {"order_type": "market_order", "stop_price": str(round(tp_price, 6))},
+        "stop_loss_order": {"order_type": "limit_order", "stop_price": str(round(sl_price, 6)),
+                             "limit_price": str(round(sl_limit, 6))},
+        "take_profit_order": {"order_type": "limit_order", "stop_price": str(round(tp_price, 6)),
+                               "limit_price": str(round(tp_limit, 6))},
         "bracket_stop_trigger_method": trigger_method,
     }
     return client.request("POST", "/v2/orders/bracket", body, auth=True)
@@ -1054,13 +1107,26 @@ def edit_bracket_order(order_id, product_id, product_symbol, sl_price, tp_price,
     doesn't need to be (and can't be) specified here — an existing
     bracket automatically covers however much of the position is
     currently open, so this call updates SL/TP levels only.
+
+    ---- CHANGED 2026-08-05: added *_limit_price fields to match the
+    stop-limit change in place_bracket_order_raw (see its docstring for
+    the full reasoning) — a trailing-stop update needs to stay
+    consistent with the ORIGINAL bracket's order-type, otherwise editing
+    could silently revert this leg back to market-style execution. ----
     """
+    long_side = sl_price < tp_price
+    sl_limit = (sl_price * (1 - STOP_LIMIT_BUFFER_PCT / 100) if long_side
+                else sl_price * (1 + STOP_LIMIT_BUFFER_PCT / 100))
+    tp_limit = (tp_price * (1 - STOP_LIMIT_BUFFER_PCT / 100) if long_side
+                else tp_price * (1 + STOP_LIMIT_BUFFER_PCT / 100))
     body = {
         "id": order_id,
         "product_id": product_id,
         "product_symbol": product_symbol,
         "bracket_stop_loss_price": str(round(sl_price, 6)),
+        "bracket_stop_loss_limit_price": str(round(sl_limit, 6)),
         "bracket_take_profit_price": str(round(tp_price, 6)),
+        "bracket_take_profit_limit_price": str(round(tp_limit, 6)),
         "bracket_stop_trigger_method": trigger_method,
     }
     return client.request("PUT", "/v2/orders/bracket", body, auth=True)
@@ -1101,14 +1167,27 @@ def place_bracket_with_retry(product_id, product_symbol, side, size, sl_price, t
             time.sleep(0.5)
 
 
-def place_order_with_fallback(product_id, side, size, limit_price, reduce_only=False):
+def place_order_with_fallback(product_id, side, size, limit_price, reduce_only=False,
+                               timeout_seconds=None):
     """
     Places a LIMIT order first (cheaper maker fee). If not filled within
-    LIMIT_ORDER_TIMEOUT_SECONDS, cancels it and places a MARKET order
-    instead. reduce_only=True must be used for CLOSING/reducing a position
-    so the exchange doesn't treat it as a fresh trade requiring new margin.
+    timeout_seconds (defaults to LIMIT_ORDER_TIMEOUT_SECONDS if not given),
+    cancels it and places a MARKET order instead. reduce_only=True must be
+    used for CLOSING/reducing a position so the exchange doesn't treat it
+    as a fresh trade requiring new margin.
     Used by Logic A (limit-first philosophy — cheaper fees, willing to wait).
+
+    ---- NEW 2026-08-05: optional timeout_seconds override. Logic A's own
+    ENTRY calls now pass a longer wait (see LOGIC_A_ENTRY_TIMEOUT_SECONDS)
+    to reduce how often it falls back to a market/taker-fee fill — real
+    trade data showed several Logic A entries hitting the old 45s timeout
+    and going to market, and market-fallback fills paid taker fees on top
+    of contributing to the exit-side slippage issue fixed separately
+    (stop-limit change). All OTHER callers (Logic B/C entries, all closes)
+    are unaffected — they simply don't pass this argument, so they keep
+    using the original LIMIT_ORDER_TIMEOUT_SECONDS exactly as before. ----
     """
+    effective_timeout = timeout_seconds if timeout_seconds is not None else LIMIT_ORDER_TIMEOUT_SECONDS
     order = {
         "product_id": product_id, "size": size, "side": side,
         "order_type": "limit_order", "limit_price": str(round(limit_price, 6)),
@@ -1126,7 +1205,7 @@ def place_order_with_fallback(product_id, side, size, limit_price, reduce_only=F
 
     waited = 0
     filled = False
-    while waited < LIMIT_ORDER_TIMEOUT_SECONDS:
+    while waited < effective_timeout:
         time.sleep(5)
         waited += 5
         if order_id is None:
@@ -1140,7 +1219,7 @@ def place_order_with_fallback(product_id, side, size, limit_price, reduce_only=F
     if filled:
         return response, "limit"
 
-    print(f"  Limit order not filled after {LIMIT_ORDER_TIMEOUT_SECONDS}s — "
+    print(f"  Limit order not filled after {effective_timeout}s — "
           f"cancelling and using market order.")
     if order_id is not None:
         try:
@@ -2907,6 +2986,23 @@ def look_for_entry_a(state, symbol_data, products):
             print(f"    -> SKIP: price not close enough to VWAP")
             continue
 
+        # ---- NEW: VWAP-slope filter. See VWAP_SLOPE_LOOKBACK/
+        # MAX_VWAP_SLOPE_PCT definitions above for the full reasoning —
+        # skips entries where VWAP itself has been moving fast (genuinely
+        # trending session), even though price happens to be near it
+        # RIGHT NOW. Fails OPEN (doesn't block) if there isn't enough
+        # history yet for the lookback. ----
+        if i >= VWAP_SLOPE_LOOKBACK:
+            vwap_then = df["vwap"].iloc[i - VWAP_SLOPE_LOOKBACK]
+            if pd.notna(vwap_then) and vwap_then != 0:
+                vwap_slope_pct = abs(vwap - vwap_then) / vwap_then * 100
+                if vwap_slope_pct > MAX_VWAP_SLOPE_PCT:
+                    print(f"    -> SKIP: VWAP itself has moved {vwap_slope_pct:.3f}% over the last "
+                          f"{VWAP_SLOPE_LOOKBACK} candles (> {MAX_VWAP_SLOPE_PCT}% threshold) — "
+                          f"this looks like a trending session, not genuine range-bound "
+                          f"conditions, even though price is near VWAP right now.")
+                    continue
+
         side = None
         if bullish and cvd_rising_flag:
             side = "long"
@@ -3024,7 +3120,8 @@ def look_for_entry_a(state, symbol_data, products):
         # story. Without this, a real filled position from a timed-out
         # create_order call was silently forgotten by this script.
         try:
-            resp, method = place_order_with_fallback(product["id"], order_side, size, limit_price)
+            resp, method = place_order_with_fallback(product["id"], order_side, size, limit_price,
+                                                       timeout_seconds=LOGIC_A_ENTRY_TIMEOUT_SECONDS)
         except Exception as e:
             print(f"    [WARN] create_order for {sym} raised an error/timeout ({e}) — "
                   f"checking whether it actually landed on the exchange anyway...")
