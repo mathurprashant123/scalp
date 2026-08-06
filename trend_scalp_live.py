@@ -220,12 +220,19 @@ MAX_REASONABLE_SLIPPAGE_PCT = 2.0
 # No partial position closing — pure stop-loss trailing, full close only at
 # hard stop or full target (100%). Stop only ever moves in the favorable
 # direction, never loosens.
-#   Reach 20% progress -> stop locks at breakeven (0%)
+#   Reach 35% progress -> stop locks at breakeven (0%)
 #   Reach 50% progress -> stop locks at the 20% level
 #   Reach 75% progress -> stop locks at the 50% level
 #   Reach 90% progress -> stop locks at the 75% level
 #   Reach 100% (target) -> full close, booked
-STAIRCASE_TRIGGERS = [0.20, 0.50, 0.75, 0.90]   # progress levels that trigger a stop move
+# ---- CHANGED 2026-08-06: first trigger widened from 20% to 35% (a
+# "middle ground" — user wanted 20-25% removed entirely, keeping it fully
+# would leave the position with NO early protection at all until 50%; 35%
+# gives normal market noise more room to breathe before locking to
+# breakeven, while still providing SOME early protection, not none. Shared
+# across Logic A, B, and C — all three use this same staircase mechanism,
+# so this affects all of them uniformly, not just A. ----
+STAIRCASE_TRIGGERS = [0.35, 0.50, 0.75, 0.90]   # progress levels that trigger a stop move
 STAIRCASE_LOCKS =    [0.00, 0.20, 0.50, 0.75]   # where the stop locks to, for each trigger above
 
 STATE_FILE = "trend_live_state.json"
