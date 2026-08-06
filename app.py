@@ -514,6 +514,9 @@ PAGE_TEMPLATE = """
         </div>
         <div id="pnlBody">No open position</div>
     </div>
+    <div style="text-align:center; color:#ff9933; font-size:22px; font-weight:bold; margin-bottom:8px; letter-spacing:1px;">
+        🔱 जय महाकाल 🔱
+    </div>
     <h1>Trend-Scalp Algo — Dashboard</h1>
     <div style="text-align:center; margin-bottom:15px;">
         <a href="/trades" style="color:#4A90D9; font-size:15px; text-decoration:none;">
