@@ -3383,6 +3383,26 @@ def look_for_entry_c(state, symbol_data, bias_data, products):
         bullish_cross = prev_fast <= prev_slow and curr_fast > curr_slow
         bearish_cross = prev_fast >= prev_slow and curr_fast < curr_slow
 
+        # ---- BUG FIX 2026-08-06: a 15-min candle stays the "current" one
+        # for up to 15 minutes, but this loop runs roughly every 20-30
+        # seconds — so a single crossover could be seen as "True" on
+        # dozens of consecutive loops. Without a guard, ANY stop-out
+        # immediately re-entered on the SAME still-open candle's
+        # crossover, over and over (confirmed in real trades: 4 entries
+        # in ~5 minutes, all near-instant stop-outs, same ETHUSD
+        # crossover each time). Track the candle timestamp that last
+        # triggered a Logic C entry per symbol, and require a genuinely
+        # NEW candle before firing again — mirrors the same protection
+        # Logic B already has via its close-cooldown, just candle-based
+        # instead of time-based (more appropriate here since the signal
+        # itself is candle-bound). ----
+        candle_ts = df["timestamp"].iloc[i] if "timestamp" in df.columns else None
+        last_signal_candle = state.get("logic_c_last_signal_candle", {}).get(sym)
+        if (bullish_cross or bearish_cross) and candle_ts is not None and last_signal_candle == candle_ts:
+            print(f"    -> SKIP: {sym} crossover already acted on for this same 15-min "
+                  f"candle ({candle_ts}) — waiting for a genuinely new candle.")
+            continue
+
         # ---- 1-hour bias check ----
         bdf = bias_data[sym]
         bi = len(bdf) - 1
@@ -3417,6 +3437,12 @@ def look_for_entry_c(state, symbol_data, bias_data, products):
 
         print(f"    -> Logic C CONDITIONS MET: {side.upper()} entry "
               f"(15-min crossover confirmed by 1-hour {bias_label} bias)")
+
+        # Mark this candle as acted-upon for this symbol, BEFORE attempting
+        # the order — even if the order attempt below fails/errors out, we
+        # don't want to keep retrying the identical signal every loop
+        # until a genuinely new candle forms.
+        state.setdefault("logic_c_last_signal_candle", {})[sym] = candle_ts
 
         if stop_dist_pct < MIN_STOP_DIST_PCT_C:
             print(f"    [INFO] ATR-based stop distance {stop_dist_pct:.3f}% is tinier than "
