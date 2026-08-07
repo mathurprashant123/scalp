@@ -350,6 +350,13 @@ LOGIC_C_RISK_PER_TRADE_PCT = 1.5   # unused while FIXED_SIZE > 0, kept for
 LOGIC_C_LEVERAGE = 10
 MIN_STOP_DIST_PCT_C = 0.30
 LOGIC_C_SYMBOLS = ["BTCUSD", "ETHUSD"]
+# ---- NEW 2026-08-07: whipsaw-count filter constants — see the full
+# reasoning in look_for_entry_c where this is used. Chosen as a
+# reasonable first-pass estimate, NOT backtested — 3+ flips within 10
+# candles felt like a fair "this looks choppy, not clean" bar, but this
+# is worth revisiting once real trades show whether it helps.
+WHIPSAW_LOOKBACK_C = 10        # how many recent 15-min candles to check
+WHIPSAW_MAX_CROSSES_C = 3      # 3+ EMA9/20 flips in that window = "choppy", skip
 
 FIXED_SIZE = 1             # ---- CHANGED for real-account initial verification ----
                            # 1 = hamesha exactly 1 lot, risk-based-sizing formula
@@ -3395,6 +3402,29 @@ def look_for_entry_c(state, symbol_data, bias_data, products):
         bullish_cross = prev_fast <= prev_slow and curr_fast > curr_slow
         bearish_cross = prev_fast >= prev_slow and curr_fast < curr_slow
 
+        # ---- NEW 2026-08-07: whipsaw-count filter. User's own visual
+        # inspection of a real Logic C trade's chart (BTCUSD, entry
+        # 64274) showed the surrounding candles were small-bodied with
+        # wicks on both sides — a genuinely choppy-looking stretch, not a
+        # clean, confident move. This is our OWN idea (not from the
+        # video, not from any external source) to catch that pattern
+        # directly: count how many times EMA9/EMA20 have flipped
+        # relative-order in the recent lookback-window. A genuine,
+        # confident trend has few/no flips; a choppy stretch whipsaws
+        # back and forth repeatedly. If too many flips happened recently,
+        # treat THIS crossover as likely-noise and skip it, even though
+        # it technically qualifies. ----
+        lookback_start = max(0, i - WHIPSAW_LOOKBACK_C + 1)
+        fast_window = df[fast_col].iloc[lookback_start:i + 1].values
+        slow_window = df[slow_col].iloc[lookback_start:i + 1].values
+        diff_signs = (fast_window - slow_window) > 0
+        whipsaw_count = sum(1 for k in range(1, len(diff_signs)) if diff_signs[k] != diff_signs[k - 1])
+        if (bullish_cross or bearish_cross) and whipsaw_count >= WHIPSAW_MAX_CROSSES_C:
+            print(f"    -> SKIP: {sym} crossover looks like noise — EMA9/EMA20 flipped "
+                  f"{whipsaw_count} times in the last {WHIPSAW_LOOKBACK_C} candles "
+                  f"(>= {WHIPSAW_MAX_CROSSES_C} threshold, choppy-looking stretch).")
+            continue
+
         # ---- BUG FIX 2026-08-06: a 15-min candle stays the "current" one
         # for up to 15 minutes, but this loop runs roughly every 20-30
         # seconds — so a single crossover could be seen as "True" on
@@ -3408,7 +3438,15 @@ def look_for_entry_c(state, symbol_data, bias_data, products):
         # Logic B already has via its close-cooldown, just candle-based
         # instead of time-based (more appropriate here since the signal
         # itself is candle-bound). ----
-        candle_ts = df["timestamp"].iloc[i] if "timestamp" in df.columns else None
+        # ---- BUG FIX 2026-08-07: candle_ts must be JSON-serializable
+        # since it gets saved into state.json — a raw pandas Timestamp
+        # is NOT, and caused a 'not JSON serializable' error on every
+        # single loop once a Logic C position was open (state-saving was
+        # silently failing each loop as a result). Converting to an ISO
+        # string here fixes it for both the comparison below AND the
+        # state-storage further down — comparing two identical strings
+        # works exactly the same as comparing two identical Timestamps. ----
+        candle_ts = str(df["timestamp"].iloc[i]) if "timestamp" in df.columns else None
         last_signal_candle = state.get("logic_c_last_signal_candle", {}).get(sym)
         if (bullish_cross or bearish_cross) and candle_ts is not None and last_signal_candle == candle_ts:
             print(f"    -> SKIP: {sym} crossover already acted on for this same 15-min "
