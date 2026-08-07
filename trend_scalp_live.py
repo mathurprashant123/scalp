@@ -171,6 +171,11 @@ LOGIC_A_ENTRY_TIMEOUT_SECONDS = 90
 VWAP_SLOPE_LOOKBACK = 20      # 15-min candles = 5 hours
 MAX_VWAP_SLOPE_PCT = 0.15     # if VWAP moved more than this over the lookback,
                                 # treat the session as trending, not range-bound
+# ---- NEW 2026-08-07: Logic A whipsaw-count filter constants — see the
+# full reasoning where this is used in look_for_entry_a. Same first-pass,
+# not-yet-backtested threshold-choice as Logic C's version.
+WHIPSAW_LOOKBACK_A = 10        # how many recent 15-min candles to check
+WHIPSAW_MAX_CROSSES_A = 3      # 3+ price/VWAP crosses in that window = "choppy", skip
 LIMIT_OFFSET_PCT = 0.02
 # ---- NEW 2026-08-05: buffer between a bracket's stop-TRIGGER price and
 # its actual LIMIT price (see place_bracket_order_raw / edit_bracket_order
@@ -3020,6 +3025,28 @@ def look_for_entry_a(state, symbol_data, products):
                           f"this looks like a trending session, not genuine range-bound "
                           f"conditions, even though price is near VWAP right now.")
                     continue
+
+        # ---- NEW 2026-08-07: whipsaw-count filter (Logic A version).
+        # Same idea as Logic C's whipsaw-filter, adapted for Logic A's
+        # mechanism — Logic A doesn't have a fast/slow EMA pair to check,
+        # but it's fundamentally about price-vs-VWAP, so we count how many
+        # times PRICE has crossed VWAP in the recent lookback instead.
+        # Research (web-search, 2026-08-07) confirms this is a genuine,
+        # known VWAP limitation, not just our own guess: "VWAP does not
+        # work well in choppy markets where price keeps moving back and
+        # forth across the line... the best trade is no trade at all."
+        # Fails OPEN if there isn't enough history yet. ----
+        if i >= WHIPSAW_LOOKBACK_A:
+            lookback_start = i - WHIPSAW_LOOKBACK_A + 1
+            price_window = df["close"].iloc[lookback_start:i + 1].values
+            vwap_window = df["vwap"].iloc[lookback_start:i + 1].values
+            above_vwap = price_window > vwap_window
+            whipsaw_count_a = sum(1 for k in range(1, len(above_vwap)) if above_vwap[k] != above_vwap[k - 1])
+            if whipsaw_count_a >= WHIPSAW_MAX_CROSSES_A:
+                print(f"    -> SKIP: price has crossed VWAP {whipsaw_count_a} times in the last "
+                      f"{WHIPSAW_LOOKBACK_A} candles (>= {WHIPSAW_MAX_CROSSES_A} threshold) — "
+                      f"choppy-looking stretch, VWAP-reversion less reliable here.")
+                continue
 
         side = None
         if bullish and cvd_rising_flag:
