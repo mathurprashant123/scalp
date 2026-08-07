@@ -3358,15 +3358,20 @@ def look_for_entry_c(state, symbol_data, bias_data, products):
     Logic C: 1-hour EMA9/20 bias + 15-min EMA9/20 crossover entry.
     Only checked if Logic A AND Logic B both found nothing this loop
     (cascade order: A -> B -> C).
-    """
-    regime = LATEST_STATE.get("market_regime")
-    if regime is not None and regime.get("favors") != "B":
-        print(f"  [REGIME-GATE] Logic C: market condition currently favors "
-              f"'{regime.get('favors')}' ({regime.get('label')}) — Logic C is "
-              f"also a trend-following approach, so it uses the same gate as "
-              f"Logic B — skipping entry scan this loop.")
-        return False
 
+    ---- CHANGED 2026-08-06: removed the market_regime gate (was reusing
+    Logic B's "favors == B" / Strong-Trend-only gate). In practice this
+    combined with Logic C's OWN 1hr+15min double-confirmation to make
+    entries extremely rare — real trades showed the regime rarely reached
+    "Strong Trend" at all, so Logic C almost never got a chance to fire
+    even when its own multi-timeframe signal was genuinely valid. Logic
+    C's own design (requiring BOTH a 1-hour directional bias AND a
+    matching 15-min crossover) is already a meaningful filter on its own,
+    unlike Logic B's simpler single-timeframe EMA5/13 crossover — so it
+    doesn't need the same external regime-gate to avoid trading in
+    genuinely unfavorable conditions. Revisit this decision once enough
+    real trades come in with the gate removed. ----
+    """
     print("  --- Logic C entry scan detail (per coin) ---")
     for sym, df in symbol_data.items():
         if sym not in bias_data:
