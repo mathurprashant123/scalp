@@ -3408,7 +3408,28 @@ def look_for_entry_c(state, symbol_data, bias_data, products):
     doesn't need the same external regime-gate to avoid trading in
     genuinely unfavorable conditions. Revisit this decision once enough
     real trades come in with the gate removed. ----
+
+    ---- CHANGED 2026-08-07: re-added a SOFTER version of the gate — this
+    is a refinement, not a reversal, of the 2026-08-06 change above. User's
+    own real-trade data: 5 trades, 1 loss, all during a "Strong trend" /
+    "Mixed" dashboard-labeled session — a genuinely strong real-world
+    signal that Logic C performs well outside pure range-bound conditions.
+    Unlike the OLD gate (Strong-Trend-only, which made entries too rare),
+    this NEW gate only blocks the single "Range-bound" (favors == "A")
+    label — both "Mixed"/NEUTRAL and "Strong Trend" are allowed. Known,
+    accepted gap: this does NOT catch a brief sideways consolidation
+    happening WITHIN a larger trending session (the dashboard label
+    reflects the broader session, not the current 15-min micro-structure)
+    — that's a different problem, tracked separately for a future
+    price-range-based filter. ----
     """
+    regime = LATEST_STATE.get("market_regime")
+    if regime is not None and regime.get("favors") == "A":
+        print(f"  [REGIME-GATE] Logic C: market condition currently favors "
+              f"'A' (Range-bound) — skipping entry scan this loop (Mixed "
+              f"and Strong-Trend conditions are still allowed).")
+        return False
+
     print("  --- Logic C entry scan detail (per coin) ---")
     for sym, df in symbol_data.items():
         if sym not in bias_data:
