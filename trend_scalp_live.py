@@ -362,6 +362,9 @@ LOGIC_C_SYMBOLS = ["BTCUSD", "ETHUSD"]
 # is worth revisiting once real trades show whether it helps.
 WHIPSAW_LOOKBACK_C = 10        # how many recent 15-min candles to check
 WHIPSAW_MAX_CROSSES_C = 3      # 3+ EMA9/20 flips in that window = "choppy", skip
+# ---- NEW 2026-08-07: extension-distance filter constant — see full
+# reasoning in look_for_entry_c. First-pass, not-yet-backtested.
+MAX_EXTENSION_ATR_MULT_C = 2.0   # price > 2x-ATR away from EMA9 = "too late/extended", skip
 
 FIXED_SIZE = 1             # ---- CHANGED for real-account initial verification ----
                            # 1 = hamesha exactly 1 lot, risk-based-sizing formula
@@ -3429,6 +3432,27 @@ def look_for_entry_c(state, symbol_data, bias_data, products):
         bullish_cross = prev_fast <= prev_slow and curr_fast > curr_slow
         bearish_cross = prev_fast >= prev_slow and curr_fast < curr_slow
 
+        # ---- CHANGED 2026-08-07: switched from "only the EXACT crossing
+        # candle" to "the trend is currently in this state" (Option 1,
+        # user's explicit choice — "trend ke saath chalo, tabhi result
+        # aayega"). Real example that motivated this: BTCUSD rallied
+        # 64,400 -> 64,946 on 2026-08-07, but EMA9 had already crossed
+        # above EMA20 SEVERAL candles before the rally started — the old
+        # cross-only logic would have missed the entire move, since it
+        # only fires on the single candle where the cross itself happens.
+        # bullish_trend/bearish_trend now drive the actual entry-decision
+        # below; bullish_cross/bearish_cross are kept only for logging
+        # context (still shows whether this is a fresh cross or a
+        # continuation). Trade-off, stated plainly: this WILL enter later
+        # in a move sometimes (not just at the exact cross), and — since
+        # entries can now recur on any candle while the trend-state holds,
+        # not just once at the cross — the whipsaw-count filter above
+        # becomes the main defense against choppy/sideways stretches
+        # instead of the natural "only one cross per move" limit that the
+        # old logic had for free. ----
+        bullish_trend = curr_fast > curr_slow
+        bearish_trend = curr_fast < curr_slow
+
         # ---- NEW 2026-08-07: whipsaw-count filter. User's own visual
         # inspection of a real Logic C trade's chart (BTCUSD, entry
         # 64274) showed the surrounding candles were small-bodied with
@@ -3446,7 +3470,7 @@ def look_for_entry_c(state, symbol_data, bias_data, products):
         slow_window = df[slow_col].iloc[lookback_start:i + 1].values
         diff_signs = (fast_window - slow_window) > 0
         whipsaw_count = sum(1 for k in range(1, len(diff_signs)) if diff_signs[k] != diff_signs[k - 1])
-        if (bullish_cross or bearish_cross) and whipsaw_count >= WHIPSAW_MAX_CROSSES_C:
+        if (bullish_trend or bearish_trend) and whipsaw_count >= WHIPSAW_MAX_CROSSES_C:
             print(f"    -> SKIP: {sym} crossover looks like noise — EMA9/EMA20 flipped "
                   f"{whipsaw_count} times in the last {WHIPSAW_LOOKBACK_C} candles "
                   f"(>= {WHIPSAW_MAX_CROSSES_C} threshold, choppy-looking stretch).")
@@ -3475,9 +3499,29 @@ def look_for_entry_c(state, symbol_data, bias_data, products):
         # works exactly the same as comparing two identical Timestamps. ----
         candle_ts = str(df["timestamp"].iloc[i]) if "timestamp" in df.columns else None
         last_signal_candle = state.get("logic_c_last_signal_candle", {}).get(sym)
-        if (bullish_cross or bearish_cross) and candle_ts is not None and last_signal_candle == candle_ts:
-            print(f"    -> SKIP: {sym} crossover already acted on for this same 15-min "
+        if (bullish_trend or bearish_trend) and candle_ts is not None and last_signal_candle == candle_ts:
+            print(f"    -> SKIP: {sym} trend-state already acted on for this same 15-min "
                   f"candle ({candle_ts}) — waiting for a genuinely new candle.")
+            continue
+
+        # ---- NEW 2026-08-07: extension-distance filter. Direct
+        # follow-up to switching from cross-only to continued-trend-state
+        # entries above — user's own concern: "pehli candle par lega yeh
+        # to really khatam fir entry lega upar" (on the very first loop
+        # after a restart, if EMA9/20 have ALREADY been in this trend
+        # state for a while, the bot could enter immediately even if the
+        # move is largely over, not just at a fresh/early point in it).
+        # Trend-state alone can't tell "just started" from "already
+        # extended" — so measure how far CURRENT PRICE has stretched away
+        # from EMA9 itself, in ATR terms. A fresh continuation should
+        # still be reasonably close to EMA9; a move that's run 2+ ATR
+        # beyond it looks late/extended, closer to exhaustion than to a
+        # good entry. First-pass threshold, not backtested. ----
+        extension_atr_mult = abs(price - curr_fast) / atr if atr > 0 else 0
+        if extension_atr_mult > MAX_EXTENSION_ATR_MULT_C:
+            print(f"    -> SKIP: {sym} price is {extension_atr_mult:.2f}x-ATR away from EMA{EMA_FAST_C} "
+                  f"(> {MAX_EXTENSION_ATR_MULT_C}x threshold) — this move looks already-extended/late, "
+                  f"not a fresh entry point.")
             continue
 
         # ---- 1-hour bias check ----
@@ -3493,18 +3537,19 @@ def look_for_entry_c(state, symbol_data, bias_data, products):
         bias_label = "UP" if bias_up else ("DOWN" if bias_down else "NONE")
 
         print(f"  {sym}: 15m EMA{EMA_FAST_C}={curr_fast:.5f} EMA{EMA_SLOW_C}={curr_slow:.5f} "
-              f"bullish_cross={bullish_cross} bearish_cross={bearish_cross} | "
+              f"bullish_trend={bullish_trend} bearish_trend={bearish_trend} "
+              f"(fresh_cross={bullish_cross or bearish_cross}) | "
               f"1h bias={bias_label} (price={b_price:.5f} EMA{EMA_FAST_C}={b_fast:.5f} "
               f"EMA{EMA_SLOW_C}={b_slow:.5f})")
 
         side = None
-        if bullish_cross and bias_up:
+        if bullish_trend and bias_up:
             side = "long"
-        elif bearish_cross and bias_down:
+        elif bearish_trend and bias_down:
             side = "short"
         else:
-            if bullish_cross or bearish_cross:
-                print(f"    -> SKIP: 15-min crossover happened but doesn't match "
+            if bullish_trend or bearish_trend:
+                print(f"    -> SKIP: 15-min trend-state doesn't match "
                       f"the 1-hour bias ({bias_label})")
             continue
 
