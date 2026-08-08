@@ -365,6 +365,11 @@ WHIPSAW_MAX_CROSSES_C = 3      # 3+ EMA9/20 flips in that window = "choppy", ski
 # ---- NEW 2026-08-07: extension-distance filter constant — see full
 # reasoning in look_for_entry_c. First-pass, not-yet-backtested.
 MAX_EXTENSION_ATR_MULT_C = 2.0   # price > 2x-ATR away from EMA9 = "too late/extended", skip
+# ---- NEW 2026-08-08: regime must stay OUT of Range-bound for this many
+# CONSECUTIVE loops (roughly 20-25s apart) before Logic C trusts it —
+# filters out single-loop regime-flickers. First-pass, not-backtested;
+# 4 loops = roughly 1.5-2 minutes of sustained non-range-bound condition.
+MIN_REGIME_PERSISTENCE_LOOPS = 4
 
 FIXED_SIZE = 1             # ---- CHANGED for real-account initial verification ----
                            # 1 = hamesha exactly 1 lot, risk-based-sizing formula
@@ -3422,13 +3427,36 @@ def look_for_entry_c(state, symbol_data, bias_data, products):
     reflects the broader session, not the current 15-min micro-structure)
     — that's a different problem, tracked separately for a future
     price-range-based filter. ----
+
+    ---- NEW 2026-08-08: persistence-check added on top of the gate
+    above. Real trade showed the gate itself working correctly (blocked
+    for 40 straight minutes, then genuinely allowed once regime shifted)
+    — but the regime FLIPPED for only ~22 seconds (one single loop) before
+    a trade fired, then flipped straight back to Range-bound. Technically
+    not a bug (regime genuinely was non-Range-bound at that instant), but
+    a single noisy loop isn't a meaningful signal that conditions have
+    truly changed — market_regime is recalculated fresh every loop from
+    VWAP-distance and can flicker. Now requires the regime to have stayed
+    OUT of "Range-bound" for MIN_REGIME_PERSISTENCE_LOOPS consecutive
+    loops in a row before Logic C is allowed to act on it, filtering out
+    single-loop noise while still allowing genuine, sustained shifts. ----
     """
     regime = LATEST_STATE.get("market_regime")
     if regime is not None and regime.get("favors") == "A":
+        state["logic_c_regime_streak"] = 0
         print(f"  [REGIME-GATE] Logic C: market condition currently favors "
               f"'A' (Range-bound) — skipping entry scan this loop (Mixed "
               f"and Strong-Trend conditions are still allowed).")
         return False
+
+    if regime is not None:
+        streak = state.get("logic_c_regime_streak", 0) + 1
+        state["logic_c_regime_streak"] = streak
+        if streak < MIN_REGIME_PERSISTENCE_LOOPS:
+            print(f"  [REGIME-GATE] Logic C: market condition just left Range-bound "
+                  f"({streak}/{MIN_REGIME_PERSISTENCE_LOOPS} consecutive loops so far) — "
+                  f"waiting for this to be sustained before trusting it, not a single-loop flicker.")
+            return False
 
     print("  --- Logic C entry scan detail (per coin) ---")
     for sym, df in symbol_data.items():
