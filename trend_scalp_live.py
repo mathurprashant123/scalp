@@ -370,6 +370,10 @@ MAX_EXTENSION_ATR_MULT_C = 2.0   # price > 2x-ATR away from EMA9 = "too late/ext
 # filters out single-loop regime-flickers. First-pass, not-backtested;
 # 4 loops = roughly 1.5-2 minutes of sustained non-range-bound condition.
 MIN_REGIME_PERSISTENCE_LOOPS = 4
+# ---- NEW 2026-08-10: dead-zone hours (IST) — real-trade-data-backed,
+# see the full reasoning in run_one_loop_iteration where this is used.
+DEAD_ZONE_START_HOUR = 2.5   # 2:30 AM IST
+DEAD_ZONE_END_HOUR = 5.5     # 5:30 AM IST
 
 FIXED_SIZE = 1             # ---- CHANGED for real-account initial verification ----
                            # 1 = hamesha exactly 1 lot, risk-based-sizing formula
@@ -460,6 +464,24 @@ def estimate_net_pnl_pct(gross_pnl_pct, strategy):
     return gross_pnl_pct - round_trip_fee_pct
 
 
+def _record_event(event_type, detail):
+    """
+    Appends a compact entry to the module-level RECENT_EVENTS list (see
+    its definition for the full reasoning) and prunes anything older than
+    RECENT_EVENTS_HOURS. Uses an explicit strftime format (not bare
+    str(now_ist())) so parsing back is always reliable — Python's default
+    datetime string representation silently DROPS the microseconds
+    portion when it's exactly zero, which would otherwise break
+    strptime on some entries.
+    """
+    global RECENT_EVENTS
+    now = now_ist()
+    RECENT_EVENTS.append({"time": now.strftime("%Y-%m-%d %H:%M:%S.%f"), "type": event_type, "detail": detail})
+    cutoff = now - timedelta(hours=RECENT_EVENTS_HOURS)
+    RECENT_EVENTS = [e for e in RECENT_EVENTS
+                      if datetime.strptime(e["time"], "%Y-%m-%d %H:%M:%S.%f") >= cutoff]
+
+
 def log_trade_event(**fields):
     """
     Writes a trade log row using a FIXED, consistent set of columns every
@@ -544,6 +566,14 @@ def log_trade_event(**fields):
         append_csv(TRADES_LOG_C, row, fallback_key="log_c")
     else:
         append_csv(TRADES_LOG, row, fallback_key="log")
+
+    # ---- NEW 2026-08-10: record this event for the restart-recap. ----
+    action = fields.get("action", "")
+    net_pct_display = row.get("approx_net_pnl_pct_after_fees", "")
+    detail = f"[Logic {strategy}] {action} {symbol} @ {fields.get('exit_price') or entry_price}"
+    if action == "CLOSE" and net_pct_display != "":
+        detail += f" (net: {net_pct_display}%, reason: {fields.get('reason', '')})"
+    _record_event(action, detail)
 
 
 def append_csv(path, row_dict, fallback_key="log"):
@@ -630,6 +660,10 @@ def _safe_write_json(primary_path, fallback_key, data):
 
 
 def save_state(state):
+    # ---- NEW 2026-08-10: piggyback RECENT_EVENTS onto every save, so
+    # all existing save_state(state) call-sites persist it for free
+    # without needing to touch each one individually. ----
+    state["recent_events"] = RECENT_EVENTS
     _safe_write_json(STATE_FILE, "state", state)
 
 
@@ -2254,7 +2288,19 @@ def manage_open_position(state, symbol_data):
                 approx_pnl_pct = (approx_exit_price - entry_price) / entry_price * 100
             else:
                 approx_pnl_pct = (entry_price - approx_exit_price) / entry_price * 100
-            net_pnl_pct = estimate_net_pnl_pct(approx_pnl_pct, "A")
+            # ---- BUG FIX 2026-08-10: this used to hardcode strategy="A"
+            # here, even though this same close-path is shared by BOTH
+            # Logic A and Logic C positions (Logic C reuses Logic A's
+            # generic staircase/management code). Result: every Logic C
+            # trade that closed via the exchange-side-bracket (SL/TP
+            # triggering before the local check caught it — the MOST
+            # common close-path) got logged to LOGIC A's CSV instead of
+            # Logic C's, so Logic C's own CSV only ever saw the OPEN
+            # event and never the matching CLOSE — rows stuck as "OPEN"
+            # forever even though the trade had genuinely closed on the
+            # exchange. Now uses the position's OWN recorded strategy. ----
+            actual_strategy = pos.get("strategy", "A")
+            net_pnl_pct = estimate_net_pnl_pct(approx_pnl_pct, actual_strategy)
 
             # ---- BUG FIX: try to get the REAL exit price + REAL fee from
             # Delta's own /v2/fills before falling back to the candle-price
@@ -2275,7 +2321,7 @@ def manage_open_position(state, symbol_data):
                 reason="exchange_bracket_closed", entry_price=entry_price,
                 exit_price=approx_exit_price, approx_gross_pnl_pct=round(approx_pnl_pct, 4),
                 approx_net_pnl_pct_after_fees=round(net_pnl_pct, 4), fill_method="bracket",
-                strategy="A", real_exit_price=real_exit_price, real_fee_amount=real_fee_amount,
+                strategy=actual_strategy, real_exit_price=real_exit_price, real_fee_amount=real_fee_amount,
             )
             state["position"] = None
             return
@@ -3944,21 +3990,47 @@ def run_one_loop_iteration(state, products):
     #      so the other logic is never even checked that same loop
     # ============================================================
     if state["position"] is None:
-        enabled = LOGIC_MODE["enabled"]
-        took_trade = False
-        if "A" in enabled:
-            took_trade = look_for_entry_a(state, symbol_data_a, products)
-        if not took_trade and "B" in enabled:
-            took_trade = look_for_entry_b(state, symbol_data_b, products)
-        if not took_trade and "C" in enabled:
-            took_trade = look_for_entry_c(state, symbol_data_a, symbol_data_c_bias, products)
-        if not took_trade:
-            print(f"  No tradeable setup this loop (enabled={sorted(enabled)}) — staying flat.")
+        # ---- NEW 2026-08-10: dead-zone block. User's own real-trade data
+        # (10 trades) showed a genuinely striking pattern: the 6:30-10:30 PM
+        # IST "Golden Window" (Europe+US overlap) was net-profitable, while
+        # trades taken between roughly 2:30-5:30 AM IST (thinnest global
+        # liquidity — US closed, Asia not yet active) were net-losing.
+        # Research independently confirms this same window as crypto's
+        # lowest-liquidity stretch. This does NOT force-close an
+        # already-open position if the window starts mid-trade — it only
+        # blocks NEW entries during the window; an existing trade is left
+        # to hit its own stop/target/staircase normally. Applies to all
+        # three logics uniformly (dead liquidity hurts all of them). ----
+        ist_hour = now_ist().hour + now_ist().minute / 60
+        in_dead_zone = DEAD_ZONE_START_HOUR <= ist_hour < DEAD_ZONE_END_HOUR
+        if in_dead_zone:
+            print(f"  [DEAD-ZONE] Current IST-hour ({ist_hour:.2f}) is within the "
+                  f"{DEAD_ZONE_START_HOUR}-{DEAD_ZONE_END_HOUR} thin-liquidity window "
+                  f"— skipping all new-entry scans this loop (existing positions, "
+                  f"if any, are unaffected).")
+        else:
+            enabled = LOGIC_MODE["enabled"]
+            took_trade = False
+            if "A" in enabled:
+                took_trade = look_for_entry_a(state, symbol_data_a, products)
+            if not took_trade and "B" in enabled:
+                took_trade = look_for_entry_b(state, symbol_data_b, products)
+            if not took_trade and "C" in enabled:
+                took_trade = look_for_entry_c(state, symbol_data_a, symbol_data_c_bias, products)
+            if not took_trade:
+                print(f"  No tradeable setup this loop (enabled={sorted(enabled)}) — staying flat.")
 
     save_state(state)
 
 
 LATEST_STATE = {"position": None, "equity_note": None, "market_regime": None}
+# ---- NEW 2026-08-10: rolling history of recent trade-events, persisted
+# across restarts (via state.json) so a fresh deploy/restart can print a
+# "here's what happened before I restarted" recap instead of the operator
+# having to scroll back through old, now-gone log-text. Pruned to the
+# last RECENT_EVENTS_HOURS hours on every write and on load. ----
+RECENT_EVENTS = []
+RECENT_EVENTS_HOURS = 5
 
 
 def main_loop(stop_event=None):
@@ -3966,6 +4038,25 @@ def main_loop(stop_event=None):
         return stop_event is not None and stop_event.is_set()
 
     state = load_state()
+
+    # ---- NEW 2026-08-10: restore + print recent-events recap. Answers
+    # the user's own concern directly — "algo new run hota hai woh purana
+    # bhul jata hai" (the algo forgets the past on every restart). This
+    # doesn't change any trading-logic, purely an operator-visibility fix
+    # so a fresh restart's log immediately shows what happened in the
+    # last few hours, instead of that context being gone. ----
+    global RECENT_EVENTS
+    saved_events = state.get("recent_events", [])
+    cutoff = now_ist() - timedelta(hours=RECENT_EVENTS_HOURS)
+    RECENT_EVENTS = [e for e in saved_events
+                      if datetime.strptime(e["time"], "%Y-%m-%d %H:%M:%S.%f") >= cutoff]
+    if RECENT_EVENTS:
+        print(f"\n{'='*60}\nRECAP — last {RECENT_EVENTS_HOURS} hours before this restart:")
+        for e in RECENT_EVENTS:
+            print(f"  [{e['time'][:19]}] {e['type']}: {e['detail']}")
+        print(f"{'='*60}\n")
+    else:
+        print(f"\n(No recorded events in the last {RECENT_EVENTS_HOURS} hours before this restart.)\n")
 
     # ---- BUG FIX: restore the last-chosen enabled-logics set from the
     # saved state. Previously LOGIC_MODE only lived in memory, so any
