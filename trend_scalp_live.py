@@ -2428,17 +2428,26 @@ def manage_open_position(state, symbol_data):
         manage_bracket_position_b(state, pos, symbol_data)
         return
 
-    # ---- Logic A (and Logic C, which reuses this same generic path) with
-    # an active exchange-side safety bracket: check FIRST whether that
-    # bracket already closed the position on the exchange (SL or TP
-    # triggered there) before relying on our own candle-based stop/target
-    # check below. This closes a real gap that was found in practice: the
-    # safety bracket correctly stopped out a losing trade, but this
-    # script's own local state kept showing the position as still open
-    # (since the candle-based check alone never "saw" the exchange-side
-    # close), leaving the dashboard stale and blocking new entries until a
-    # manual restart forced a reconciliation. ----
-    if pos.get("strategy") in ("A", "C") and pos.get("exchange_safety_stop_active"):
+    # ---- Logic A (and Logic C, which reuses this same generic path):
+    # check FIRST whether the position has ALREADY genuinely closed on
+    # the exchange (SL/TP-bracket triggered there, manual close, a
+    # liquidation, anything) before relying on our own candle-based
+    # stop/target check below. This closes a real gap found in practice:
+    # the safety bracket correctly stopped out a losing trade, but this
+    # script's own local state kept showing the position as still open,
+    # leaving the dashboard stale and blocking new entries until a
+    # manual restart forced a reconciliation.
+    # ---- BUG FIX 2026-08-10: this used to ALSO require
+    # pos.get("exchange_safety_stop_active") == True — meaning ADOPTED
+    # positions (found on exchange after a restart, where attaching our
+    # own bracket failed with "bracket_order_exists") never got this
+    # protection at all, since that flag is explicitly False for them.
+    # Found live: an adopted BTCUSD short was sitting in exactly this
+    # unprotected state. There's no real reason to gate this check on
+    # whether OUR OWN bracket is active — checking "does the exchange
+    # still show this position open at all" is valuable regardless of
+    # why it might have closed. Now runs for every Logic A/C position. ----
+    if pos.get("strategy") in ("A", "C"):
         try:
             live_pos = client.get_position(pos["product_id"])
             size_now = float(live_pos.get("size", 0)) if isinstance(live_pos, dict) else pos["size"]
