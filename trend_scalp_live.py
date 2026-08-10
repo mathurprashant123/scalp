@@ -3329,11 +3329,15 @@ def check_support_resistance(df, i, side, price):
     """
     levels = find_support_resistance_levels(df, i)
     if not levels:
+        print(f"    [S/R] No established support/resistance levels found yet in the "
+              f"lookback window — neutral, not blocking.")
         return True  # no known levels at all yet — neutral, don't block
 
     nearest = min(levels, key=lambda lv: abs(price - lv))
     dist_pct = abs(price - nearest) / price * 100
     if dist_pct > SR_PROXIMITY_PCT:
+        print(f"    [S/R] Nearest level is {nearest:.2f} ({dist_pct:.3f}% away, > "
+              f"{SR_PROXIMITY_PCT}% threshold) — neutral zone, not blocking.")
         return True  # not close to any known level — neutral zone
 
     level_is_below = nearest < price  # level below current price = acting as support
@@ -3346,6 +3350,9 @@ def check_support_resistance(df, i, side, price):
         if not bounced:
             print(f"    -> SKIP: price is near a support level ({nearest:.2f}), but recent "
                   f"candles look like a BREAKDOWN, not a genuine bounce.")
+        else:
+            print(f"    [S/R] Price is near support ({nearest:.2f}) with a genuine bounce "
+                  f"confirmed — supports this LONG.")
         return bounced
     else:  # short
         if level_is_below:
@@ -3356,6 +3363,9 @@ def check_support_resistance(df, i, side, price):
         if not bounced:
             print(f"    -> SKIP: price is near a resistance level ({nearest:.2f}), but recent "
                   f"candles look like a BREAKOUT, not a genuine bounce.")
+        else:
+            print(f"    [S/R] Price is near resistance ({nearest:.2f}) with a genuine bounce "
+                  f"confirmed — supports this SHORT.")
         return bounced
 
 
