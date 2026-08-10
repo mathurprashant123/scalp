@@ -374,6 +374,25 @@ MIN_REGIME_PERSISTENCE_LOOPS = 4
 # see the full reasoning in run_one_loop_iteration where this is used.
 DEAD_ZONE_START_HOUR = 2.5   # 2:30 AM IST
 DEAD_ZONE_END_HOUR = 5.5     # 5:30 AM IST
+# ---- NEW 2026-08-10: Open-Interest confirmation constants, for Logic
+# B/C only — see oi_confirms_direction() for the full reasoning.
+# ---- UPDATED 2026-08-10 (same day, TWICE): first pass was 30-min/0.5%
+# (guess). Widened to 3-hour/1% after research on how professional
+# swing/position-traders use OI — but the user then correctly pointed
+# out this ignores OUR OWN bot's actual holding-periods. Checked against
+# real closed-trade data from today: median holding-time was only ~27
+# minutes, average ~67 (skewed by one long outlier). A 3-hour OI-lookback
+# for a ~30-minute trade is a genuine timeframe-mismatch — like judging
+# a sprint's pace using last week's weather. Settled on 45 minutes as a
+# reasonable middle-ground: close to the median trade-duration, still
+# giving the OI-check a MEANINGFUL window (not so short it's just noise,
+# per the original 30-min concern), without referencing a timeframe far
+# longer than the trades themselves. Still a first-pass estimate, not
+# backtested — but now at least grounded in THIS bot's own real
+# behavior, not generic swing-trader guidance from a different context. ----
+OI_LOOKBACK_MINUTES = 45       # ~matches this bot's own median trade-duration
+MIN_OI_INCREASE_PCT = 0.75     # OI must have grown at least this much to "confirm"
+OI_SAMPLE_INTERVAL_MINUTES = 3   # only store a new OI-snapshot this often (avoids state-bloat)
 
 FIXED_SIZE = 1             # ---- CHANGED for real-account initial verification ----
                            # 1 = hamesha exactly 1 lot, risk-based-sizing formula
@@ -998,7 +1017,97 @@ def place_market_order_direct(product_id, side, size, reduce_only=False):
     return response, "market_direct"
 
 
-def get_current_ticker_price(symbol):
+def get_open_interest(symbol):
+    """
+    Public endpoint — current Open Interest (in USD-value terms, via
+    oi_value_usd) for the given symbol. Used by the OI-confirmation
+    filter in Logic B/C (see oi_confirms_direction()). Delta's REST
+    /v2/tickers only exposes the CURRENT oi snapshot, not a built-in
+    change-over-time metric (that's websocket-only, per their docs) — so
+    this script tracks its own rolling history in state["oi_history"]
+    and computes the change itself. Returns None on any failure (fails
+    OPEN — the confirmation-check treats a fetch-failure as "can't
+    confirm, don't block the trade over it", same philosophy as every
+    other best-effort real-data lookup in this script).
+    """
+    try:
+        r = requests.get(f"{config.REAL_DATA_BASE_URL}/v2/tickers/{symbol}", timeout=10)
+        r.raise_for_status()
+        data = r.json().get("result", {})
+        oi_usd = data.get("oi_value_usd")
+        return float(oi_usd) if oi_usd is not None else None
+    except Exception as e:
+        print(f"    [WARN] Couldn't fetch Open-Interest for {symbol} ({e}) — "
+              f"OI-confirmation will fail-open (not block the trade) this loop.")
+        return None
+
+
+def oi_confirms_direction(state, symbol, side):
+    """
+    Checks whether Open Interest has genuinely been INCREASING over the
+    last OI_LOOKBACK_MINUTES, as a confirmation-signal for Logic B/C
+    trend-following entries. Rationale (from research + user discussion,
+    2026-08-10): rising OI alongside a price-move suggests genuinely NEW
+    positions are being opened (real conviction), whereas a price-move
+    on FLAT/FALLING OI is more likely just existing positions being
+    forced closed (e.g. a short-squeeze) — a move with less genuine
+    staying-power. This is a CONFIRMATION-ONLY filter, same pattern as
+    CVD in Logic A: it doesn't care about direction (long vs short) for
+    OI specifically, since OI rising means MORE conviction on EITHER
+    side of the market — it just wants to see genuine NEW interest, not
+    stale/flat positioning. Deliberately NOT applied to Logic A (a
+    mean-reversion strategy) — for Logic A, rising OI would actually be
+    a WARNING sign (a genuine trend forming, working against mean-
+    reversion), not a confirmation; that's a different, inverted
+    relationship tracked separately, not implemented here.
+    Fails OPEN (returns True, doesn't block) if OI data isn't available
+    yet or the fetch fails — this is a best-effort confirmation-layer,
+    not a hard requirement, consistent with how CVD/whipsaw-filters
+    degrade gracefully elsewhere in this script.
+    """
+    current_oi = get_open_interest(symbol)
+    if current_oi is None:
+        return True  # can't confirm — fail open, don't block the trade over it
+
+    history = state.setdefault("oi_history", {}).setdefault(symbol, [])
+    now = now_ist()
+    # ---- Thinning: with a 3-hour lookback (widened same-day after
+    # research, see OI_LOOKBACK_MINUTES comment) and a ~20-25s loop
+    # interval, storing every single loop's reading would build up
+    # roughly 1000+ entries per symbol within the buffer window — fine
+    # functionally, but needless bloat in state.json. Only append a new
+    # point if at least OI_SAMPLE_INTERVAL_MINUTES have passed since the
+    # last stored one; a few-minute granularity is plenty for a
+    # 3-hour-scale trend-check. ----
+    if not history or (now - datetime.strptime(history[-1]["time"], "%Y-%m-%d %H:%M:%S.%f")
+                        >= timedelta(minutes=OI_SAMPLE_INTERVAL_MINUTES)):
+        history.append({"time": now.strftime("%Y-%m-%d %H:%M:%S.%f"), "oi": current_oi})
+    cutoff = now - timedelta(minutes=OI_LOOKBACK_MINUTES * 2)  # keep a bit extra buffer
+    state["oi_history"][symbol] = [
+        h for h in history
+        if datetime.strptime(h["time"], "%Y-%m-%d %H:%M:%S.%f") >= cutoff
+    ]
+
+    lookback_cutoff = now - timedelta(minutes=OI_LOOKBACK_MINUTES)
+    past_points = [h for h in state["oi_history"][symbol]
+                   if datetime.strptime(h["time"], "%Y-%m-%d %H:%M:%S.%f") <= lookback_cutoff]
+    if not past_points:
+        print(f"    [OI] Not enough OI-history yet for {symbol} "
+              f"({OI_LOOKBACK_MINUTES}-min lookback) — confirmation fails open this time.")
+        return True  # not enough history yet — fail open
+
+    past_oi = past_points[-1]["oi"]  # most recent point that's still >= lookback-old
+    if past_oi <= 0:
+        return True
+    oi_change_pct = (current_oi - past_oi) / past_oi * 100
+    confirmed = oi_change_pct >= MIN_OI_INCREASE_PCT
+    print(f"    [OI] {symbol}: OI changed {oi_change_pct:+.2f}% over the last "
+          f"{OI_LOOKBACK_MINUTES} min ({'CONFIRMS' if confirmed else 'does NOT confirm'} "
+          f"genuine new-position interest, threshold={MIN_OI_INCREASE_PCT}%)")
+    return confirmed
+
+
+
     """Public endpoint — current mark/last price, used when widening a
     rejected bracket order (need fresh price to nudge levels away from)."""
     r = requests.get(f"{config.REAL_DATA_BASE_URL}/v2/tickers/{symbol}", timeout=10)
@@ -2690,6 +2799,15 @@ def look_for_entry_b(state, symbol_data, products):
                           f"the required band for that direction")
                 continue
 
+        # ---- NEW 2026-08-10: Open-Interest confirmation. See
+        # oi_confirms_direction() docstring for the full reasoning —
+        # requires genuinely-rising OI (new positions opening) rather
+        # than just a price-move on flat/stale positioning. ----
+        if not oi_confirms_direction(state, sym, side):
+            print(f"    -> SKIP: {sym} OI doesn't confirm genuine new-position "
+                  f"interest for this {side}-entry.")
+            continue
+
         # real-market "price" decided the direction and ATR above. Now fetch
         # the TESTNET account's own current price to anchor the initial
         # SL/TP/sizing estimate (reduces the gap vs the real fill later).
@@ -3646,6 +3764,13 @@ def look_for_entry_c(state, symbol_data, bias_data, products):
             if bullish_trend or bearish_trend:
                 print(f"    -> SKIP: 15-min trend-state doesn't match "
                       f"the 1-hour bias ({bias_label})")
+            continue
+
+        # ---- NEW 2026-08-10: Open-Interest confirmation. Same reasoning
+        # as Logic B's version — see oi_confirms_direction() docstring. ----
+        if not oi_confirms_direction(state, sym, side):
+            print(f"    -> SKIP: {sym} OI doesn't confirm genuine new-position "
+                  f"interest for this {side}-entry.")
             continue
 
         stop = price - SL_ATR_MULT * atr if side == "long" else price + SL_ATR_MULT * atr
