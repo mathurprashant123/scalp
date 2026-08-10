@@ -467,6 +467,15 @@ DEAD_ZONE_END_HOUR = 5.5     # 5:30 AM IST
 OI_LOOKBACK_MINUTES = 45       # ~matches this bot's own median trade-duration
 MIN_OI_INCREASE_PCT = 0.75     # OI must have grown at least this much to "confirm"
 OI_SAMPLE_INTERVAL_MINUTES = 3   # only store a new OI-snapshot this often (avoids state-bloat)
+# ---- NEW 2026-08-10: Support/Resistance constants, Logic A ONLY — see
+# find_support_resistance_levels()/check_support_resistance() for full
+# reasoning. First-pass, not-yet-backtested.
+SR_LOOKBACK_CANDLES = 100        # how far back (15-min candles) to scan for levels
+SR_CLUSTER_TOLERANCE_PCT = 0.3   # swing-points within this % of each other = same level
+SR_MIN_TOUCHES = 2               # a level needs at least this many touches to count
+SR_PROXIMITY_PCT = 0.2           # how close price must be to a level to trigger the check
+SR_BOUNCE_LOOKBACK_CANDLES = 2   # how many recent candles to check for genuine-bounce
+SR_TOUCH_TOLERANCE_PCT = 0.05    # small buffer for what counts as "touched" the level
 
 FIXED_SIZE = 1             # ---- CHANGED for real-account initial verification ----
                            # 1 = hamesha exactly 1 lot, risk-based-sizing formula
@@ -3225,6 +3234,122 @@ def check_minimum_balance_floor(state):
     return True
 
 
+def find_support_resistance_levels(df, i, lookback=None, cluster_tolerance_pct=None, min_touches=None):
+    """
+    Finds significant support/resistance levels using swing-point
+    clustering, for Logic A only (mean-reversion strategy — see
+    check_support_resistance() docstring for why this doesn't apply the
+    same way to Logic B/C). Genuinely REQUESTED after a real, live
+    example: Logic A took a SHORT at a SUPPORT level (exactly the wrong
+    setup — support should favor LONGs, not SHORTs), motivating this
+    filter. Looks back `lookback` candles, finds local swing highs/lows
+    (a point higher/lower than both neighbours), clusters swing-points
+    within `cluster_tolerance_pct` of each other into a single level, and
+    only keeps levels touched at least `min_touches` times (a single
+    reversal isn't a genuine, repeatedly-respected level). First-pass
+    design, not backtested.
+    """
+    lookback = lookback or SR_LOOKBACK_CANDLES
+    cluster_tolerance_pct = cluster_tolerance_pct or SR_CLUSTER_TOLERANCE_PCT
+    min_touches = min_touches or SR_MIN_TOUCHES
+
+    start = max(0, i - lookback + 1)
+    window = df.iloc[start:i + 1]
+    if len(window) < 3:
+        return []
+
+    highs = window["high"].values
+    lows = window["low"].values
+    swing_points = []
+    for j in range(1, len(window) - 1):
+        if highs[j] > highs[j - 1] and highs[j] > highs[j + 1]:
+            swing_points.append(highs[j])
+        if lows[j] < lows[j - 1] and lows[j] < lows[j + 1]:
+            swing_points.append(lows[j])
+
+    if not swing_points:
+        return []
+
+    swing_points.sort()
+    clusters = [[swing_points[0]]]
+    for p in swing_points[1:]:
+        if (p - clusters[-1][-1]) / clusters[-1][-1] * 100 <= cluster_tolerance_pct:
+            clusters[-1].append(p)
+        else:
+            clusters.append([p])
+
+    return [sum(c) / len(c) for c in clusters if len(c) >= min_touches]
+
+
+def check_genuine_bounce(df, i, level, level_type, lookback=None):
+    """
+    Confirms whether recent price-action shows a GENUINE bounce off a
+    level, versus a breakdown/breakout through it. Directly answers the
+    gap identified in conversation: "sirf price-level-ke-paas-hai kaafi
+    nahi — genuinely-bounce-hui-ya-toot-gayi bhi dekhna-hoga."
+    For support: recent low(s) must have touched at/below the level, but
+    the latest close must still be back ABOVE it (rejected, not broken).
+    For resistance: mirror-opposite (touched-at-above, closed back below).
+    """
+    lookback = lookback or SR_BOUNCE_LOOKBACK_CANDLES
+    start = max(0, i - lookback + 1)
+    recent = df.iloc[start:i + 1]
+    latest_close = df["close"].iloc[i]
+
+    if level_type == "support":
+        touched = (recent["low"] <= level * (1 + SR_TOUCH_TOLERANCE_PCT / 100)).any()
+        return bool(touched and latest_close > level)
+    else:  # resistance
+        touched = (recent["high"] >= level * (1 - SR_TOUCH_TOLERANCE_PCT / 100)).any()
+        return bool(touched and latest_close < level)
+
+
+def check_support_resistance(df, i, side, price):
+    """
+    Logic A's support/resistance gate — called right after `side` is
+    decided in look_for_entry_a, before proceeding to order-placement.
+    LONG needs to be near SUPPORT with a genuine bounce confirmed (or in
+    a neutral zone with no nearby level, which doesn't block). Being near
+    RESISTANCE blocks a LONG outright, regardless of bounce-status —
+    resistance is structurally the wrong place to bet on an upward
+    mean-reversion. SHORT is the exact mirror-opposite. Deliberately
+    Logic-A-ONLY: Logic B/C are trend-following (already handled
+    separately via OI-confirmation, added earlier the same day) — support/
+    resistance's "bet on a bounce" framing is specific to mean-reversion.
+    Returns True (proceed) or False (skip this loop for this symbol).
+    """
+    levels = find_support_resistance_levels(df, i)
+    if not levels:
+        return True  # no known levels at all yet — neutral, don't block
+
+    nearest = min(levels, key=lambda lv: abs(price - lv))
+    dist_pct = abs(price - nearest) / price * 100
+    if dist_pct > SR_PROXIMITY_PCT:
+        return True  # not close to any known level — neutral zone
+
+    level_is_below = nearest < price  # level below current price = acting as support
+    if side == "long":
+        if not level_is_below:
+            print(f"    -> SKIP: price is near a RESISTANCE level ({nearest:.2f}) — "
+                  f"wrong side of structure for a LONG mean-reversion bet.")
+            return False
+        bounced = check_genuine_bounce(df, i, nearest, "support")
+        if not bounced:
+            print(f"    -> SKIP: price is near a support level ({nearest:.2f}), but recent "
+                  f"candles look like a BREAKDOWN, not a genuine bounce.")
+        return bounced
+    else:  # short
+        if level_is_below:
+            print(f"    -> SKIP: price is near a SUPPORT level ({nearest:.2f}) — "
+                  f"wrong side of structure for a SHORT mean-reversion bet.")
+            return False
+        bounced = check_genuine_bounce(df, i, nearest, "resistance")
+        if not bounced:
+            print(f"    -> SKIP: price is near a resistance level ({nearest:.2f}), but recent "
+                  f"candles look like a BREAKOUT, not a genuine bounce.")
+        return bounced
+
+
 def look_for_entry_a(state, symbol_data, products):
     """Logic A: 200 EMA + VWAP + CVD confluence (existing strategy)."""
     print("  --- Entry scan detail (per coin) ---")
@@ -3310,6 +3435,14 @@ def look_for_entry_a(state, symbol_data, products):
 
         if stop_dist_pct <= 0:
             print(f"    -> SKIP: invalid stop distance")
+            continue
+
+        # ---- NEW 2026-08-10: Support/Resistance gate. Directly
+        # motivated by a real, live example — Logic A took a SHORT at a
+        # SUPPORT level (structurally wrong: support should favor
+        # LONGs). See check_support_resistance() docstring for full
+        # reasoning. Logic-A-ONLY (mean-reversion-specific). ----
+        if not check_support_resistance(df, i, side, price):
             continue
 
         # ---- Minimum stop-distance floor (WIDEN, don't skip) ----
