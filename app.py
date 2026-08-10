@@ -267,16 +267,23 @@ TRADES_PAGE_TEMPLATE = """
 def reset_circuit_breaker():
     """Manually clears today's daily-loss circuit-breaker tracking (useful
     if it tripped incorrectly, or you want to give it a fresh start).
-    Re-baselines start_of_day_balance to whatever the balance is right now."""
-    state = algo.load_state()
+    Re-baselines start_of_day_balance to whatever the balance is right now.
+
+    ---- FIXED 2026-08-10: was writing directly to state.json, which the
+    running trading-loop's stale in-memory state would silently
+    overwrite (same root-cause bug found and fixed in force_clear_
+    position — see that endpoint's docstring for the full explanation).
+    Now queues the update instead, so it reliably applies on the bot's
+    very next loop even while it keeps running. ----"""
+    fields = {"daily_breaker_tripped": False}
     try:
-        current_balance = algo.get_wallet_total_balance()
-        state["start_of_day_balance"] = current_balance
+        fields["start_of_day_balance"] = algo.get_wallet_total_balance()
     except Exception:
-        pass  # if balance fetch fails, still clear the tripped flag below
-    state["daily_breaker_tripped"] = False
-    algo.save_state(state)
-    return jsonify({"ok": True, "message": "Circuit breaker reset. New entries allowed again."})
+        pass  # if balance fetch fails, still clear the tripped flag
+    ok = algo.queue_state_update({"action": "set_fields", "fields": fields})
+    msg = ("Circuit breaker reset queued — takes effect on the bot's very next loop."
+           if ok else "Couldn't queue the reset (failed to write the update-file) — try again.")
+    return jsonify({"ok": ok, "message": msg})
 
 
 @app.route("/reset_min_balance_breaker", methods=["POST"])
@@ -287,11 +294,15 @@ def reset_min_balance_breaker():
     This does NOT re-baseline the all-time starting balance — that number
     stays fixed on purpose, so resetting this only un-blocks new entries,
     it doesn't move the floor itself. Use this deliberately, only after
-    understanding why it tripped."""
-    state = algo.load_state()
-    state["min_balance_breaker_tripped"] = False
-    algo.save_state(state)
-    return jsonify({"ok": True, "message": "Minimum-balance floor breaker reset. New entries allowed again."})
+    understanding why it tripped.
+
+    ---- FIXED 2026-08-10: see reset_circuit_breaker's docstring — same
+    queue-based fix for the same underlying race-condition bug. ----"""
+    ok = algo.queue_state_update({"action": "set_fields",
+                                   "fields": {"min_balance_breaker_tripped": False}})
+    msg = ("Minimum-balance floor breaker reset queued — takes effect on the bot's very next loop."
+           if ok else "Couldn't queue the reset — try again.")
+    return jsonify({"ok": ok, "message": msg})
 
 
 @app.route("/reset_abnormal_fill_breaker", methods=["POST"])
@@ -300,12 +311,16 @@ def reset_abnormal_fill_breaker():
     close order fills at a price wildly far from the expected/reference
     price (e.g. a thin/broken order book), which real accounting can't
     catch in advance. Reset only after checking the exchange's own order
-    history for what actually happened."""
-    state = algo.load_state()
-    state["abnormal_fill_breaker_tripped"] = False
-    state["abnormal_fill_detail"] = None
-    algo.save_state(state)
-    return jsonify({"ok": True, "message": "Abnormal-fill breaker reset. New entries allowed again."})
+    history for what actually happened.
+
+    ---- FIXED 2026-08-10: see reset_circuit_breaker's docstring — same
+    queue-based fix for the same underlying race-condition bug. ----"""
+    ok = algo.queue_state_update({"action": "set_fields", "fields": {
+        "abnormal_fill_breaker_tripped": False, "abnormal_fill_detail": None,
+    }})
+    msg = ("Abnormal-fill breaker reset queued — takes effect on the bot's very next loop."
+           if ok else "Couldn't queue the reset — try again.")
+    return jsonify({"ok": ok, "message": msg})
 
 
 @app.route("/recalibrate_balance_floor", methods=["POST"])
@@ -326,6 +341,8 @@ def recalibrate_balance_floor():
     nets stay meaningful. Requires a live balance fetch, so it can fail
     if the exchange API is unreachable at that moment — safe to just
     retry in that case, nothing is changed until it succeeds.
+    ---- FIXED 2026-08-10: see reset_circuit_breaker's docstring — same
+    queue-based fix for the same underlying race-condition bug. ----
     """
     try:
         current_balance = algo.get_wallet_total_balance()
@@ -333,26 +350,28 @@ def recalibrate_balance_floor():
         return jsonify({"ok": False, "message": f"Couldn't fetch current balance to "
                         f"recalibrate against ({e}) — try again in a moment."}), 503
 
-    state = algo.load_state()
+    state = algo.load_state()  # read-only here, just for the old-value display in the message
     old_all_time = state.get("all_time_starting_balance")
-    old_start_of_day = state.get("start_of_day_balance")
 
-    state["all_time_starting_balance"] = current_balance
-    state["start_of_day_balance"] = current_balance
-    state["min_balance_breaker_tripped"] = False
-    state["daily_breaker_tripped"] = False
-    algo.save_state(state)
+    fields = {
+        "all_time_starting_balance": current_balance,
+        "start_of_day_balance": current_balance,
+        "min_balance_breaker_tripped": False,
+        "daily_breaker_tripped": False,
+    }
+    ok = algo.queue_state_update({"action": "set_fields", "fields": fields})
 
     new_floor = current_balance * (algo.MIN_BALANCE_FLOOR_PCT / 100)
+    if not ok:
+        return jsonify({"ok": False, "message": "Couldn't queue the recalibration — try again."})
     return jsonify({
         "ok": True,
         "message": (
-            f"Recalibrated: baseline was ${old_all_time:.2f} (floor was "
-            f"${(old_all_time or 0) * algo.MIN_BALANCE_FLOOR_PCT / 100:.2f}) -> "
-            f"now ${current_balance:.2f} (new floor: ${new_floor:.2f}). "
-            f"Daily-loss baseline also reset to today's actual balance."
+            f"Recalibration queued (baseline was ${old_all_time:.2f}) -> "
+            f"will apply ${current_balance:.2f} (new floor: ${new_floor:.2f}) "
+            f"on the bot's very next loop. Daily-loss baseline also reset to today's actual balance."
         ) if old_all_time is not None else
-        f"Baseline set for the first time: ${current_balance:.2f} (floor: ${new_floor:.2f})."
+        f"Baseline queued for the first time: ${current_balance:.2f} (floor: ${new_floor:.2f})."
     })
 
 
@@ -374,15 +393,40 @@ def force_clear_position():
     for new entries. If the real position on the exchange is still open,
     the next restart's reconciliation will find it again and re-adopt it
     — so this is meant as a temporary unblock, not a permanent fix for
-    whatever is stuck on the exchange side."""
+    whatever is stuck on the exchange side.
+
+    ---- FIXED 2026-08-10: this used to ONLY write state["position"] =
+    None into state.json. That looked correct, but the main trading
+    LOOP is a separate running process holding its own in-memory copy of
+    `state`, only reading the file fresh at startup — its next
+    save_state(state) call would overwrite the file with its own STALE
+    in-memory position, silently undoing this button's effect. In
+    practice, the button only actually worked if you Stopped and
+    Started the bot afterward, which wasn't obvious and looked like the
+    button was simply broken.
+    On closer review the SAME bug existed in 4 more buttons (the breaker
+    -resets and recalibrate), so this was generalized into one shared
+    queue_state_update() mechanism (see trend_scalp_live.py) that all of
+    them now use — the loop applies + clears the whole queue at the
+    start of every iteration, making all these buttons take effect
+    immediately, even mid-run. ----"""
+    ok = algo.queue_state_update({"action": "clear_position"})
+    # Best-effort immediate state.json write too (harmless, and covers the
+    # rare case where the bot isn't running at all right now, so there's no
+    # loop to pick up the queue — a later restart would need it in state.json).
     state = algo.load_state()
     had_position = state.get("position") is not None
     state["position"] = None
     algo.save_state(state)
-    msg = ("Local position tracking cleared — the bot will resume scanning for new "
-           "trades. Remember: this did NOT close anything on the exchange itself; "
-           "if a real position is still open there, handle it separately." if had_position
-           else "No position was being tracked locally — nothing to clear.")
+    if had_position:
+        msg = ("Local position tracking cleared — takes effect on the bot's very "
+               "next loop, even while it keeps running (no Stop/Start needed anymore). "
+               "Remember: this did NOT close anything on the exchange itself; if a "
+               "real position is still open there, handle it separately.") if ok else (
+               "Cleared in state.json, but couldn't queue the live-update — if the bot "
+               "is currently running, you may need to Stop then Start it.")
+    else:
+        msg = "No position was being tracked locally — nothing to clear."
     return jsonify({"ok": True, "message": msg})
 
 

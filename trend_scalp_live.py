@@ -241,6 +241,80 @@ STAIRCASE_TRIGGERS = [0.35, 0.50, 0.75, 0.90]   # progress levels that trigger a
 STAIRCASE_LOCKS =    [0.00, 0.20, 0.50, 0.75]   # where the stop locks to, for each trigger above
 
 STATE_FILE = "trend_live_state.json"
+# ---- NEW 2026-08-10: generalized pending-state-update queue. Original
+# fix was a single-purpose signal-file just for Force-Clear — but on
+# closer review (user asked for a careful re-check), the EXACT SAME
+# race-condition bug exists in 4 MORE dashboard buttons: reset_circuit_
+# breaker, reset_min_balance_breaker, reset_abnormal_fill_breaker, and
+# recalibrate_balance_floor. All of them write directly to state.json
+# from the separate Flask process, which the running trading-loop's own
+# stale in-memory state silently overwrites on its next save — meaning
+# NONE of these "emergency reset" buttons reliably worked while the bot
+# was actively running, only after a Stop/Start. Generalized into one
+# queue-file that any endpoint can append a small update-dict to; the
+# loop applies + clears the whole queue at the start of every
+# iteration. See apply_pending_updates() and queue_state_update(). ----
+PENDING_UPDATES_FILE = "pending_updates.json"
+
+
+def queue_state_update(update_dict):
+    """
+    Called from the Flask dashboard process (app.py) — appends a small
+    dict of state-keys-to-update to PENDING_UPDATES_FILE. Does NOT touch
+    state.json directly (see the module-level comment above for why that
+    doesn't reliably work while the main loop is running). The main loop
+    picks this up and applies it at the start of its very next iteration
+    via apply_pending_updates().
+    """
+    try:
+        existing = []
+        if os.path.exists(PENDING_UPDATES_FILE):
+            with open(PENDING_UPDATES_FILE, "r") as f:
+                existing = json.load(f)
+        existing.append(update_dict)
+        with open(PENDING_UPDATES_FILE, "w") as f:
+            json.dump(existing, f)
+        return True
+    except Exception:
+        return False
+
+
+def apply_pending_updates(state):
+    """
+    Called at the very start of every run_one_loop_iteration(). Reads
+    any queued updates (from dashboard-button-presses), applies each
+    key/value directly into the loop's own in-memory `state` dict, then
+    clears the queue-file. This is what makes dashboard buttons like
+    Force-Clear and the breaker-resets take effect IMMEDIATELY on the
+    bot's very next loop, even while it keeps running — instead of
+    silently getting overwritten by the loop's own next save_state()
+    call using its stale in-memory copy.
+    """
+    if not os.path.exists(PENDING_UPDATES_FILE):
+        return
+    try:
+        with open(PENDING_UPDATES_FILE, "r") as f:
+            updates = json.load(f)
+    except Exception as e:
+        print(f"  [WARN] Couldn't read pending-updates file ({e}) — skipping this loop, will retry.")
+        return
+    for update in updates:
+        action = update.get("action", "")
+        if action == "clear_position":
+            had = state.get("position") is not None
+            state["position"] = None
+            print(f"  [PENDING-UPDATE] clear_position applied (had_position={had})")
+        elif action == "set_fields":
+            fields = update.get("fields", {})
+            state.update(fields)
+            print(f"  [PENDING-UPDATE] set_fields applied: {list(fields.keys())}")
+        else:
+            print(f"  [WARN] Unknown pending-update action '{action}' — ignoring.")
+    try:
+        os.remove(PENDING_UPDATES_FILE)
+    except Exception as e:
+        print(f"  [WARN] Applied pending updates but couldn't delete the queue-file ({e}) "
+              f"— will try again next loop if it's still there.")
 TRADES_LOG = "trend_trades_log.csv"     # Logic A trades
 TRADES_LOG_B = "trend_trades_log_B.csv"  # Logic B trades — kept separate
 TRADES_LOG_C = "trend_trades_log_C.csv"  # Logic C trades — kept separate
@@ -4000,6 +4074,13 @@ def compute_market_regime(symbol_data_a):
 
 
 def run_one_loop_iteration(state, products):
+    # ---- NEW 2026-08-10: apply any pending dashboard-button updates
+    # (Force-Clear, breaker-resets, etc.) at the very start of every
+    # loop — see apply_pending_updates() docstring for the full
+    # reasoning (PERMANENT fix for a real bug: these buttons silently
+    # didn't work while the bot was running, only after Stop/Start). ----
+    apply_pending_updates(state)
+
     symbol_data_a = {}  # Logic A: 15-min candles
     symbol_data_b = {}  # Logic B: 1-min candles
 
