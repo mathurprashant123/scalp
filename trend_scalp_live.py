@@ -3423,6 +3423,43 @@ def check_support_resistance(df, i, side, price):
         return bounced
 
 
+def print_oi_status(state, symbol):
+    """
+    ---- NEW 2026-08-11: purely INFORMATIONAL — prints the current OI
+    change-over-lookback for `symbol`, EVERY loop, regardless of whether
+    Logic A/B/C's own gates ever reach oi_confirms_direction(). User
+    asked why OI wasn't visible ("OI ko open kyu nahi rakha jo dikhta
+    rehta") — the confirm/reject check only fires deep inside Logic B/C's
+    gate-sequence (after extension-filter, bias-check, etc.), so on days
+    where those earlier gates keep skipping, OI's own status was
+    invisible even though it was being sampled fine in the background.
+    This makes it visible like price/EMA/VWAP/CVD already are, without
+    changing any actual trading-decision — same read-only data
+    oi_confirms_direction() would use, just surfaced unconditionally. ----
+    """
+    current_oi = get_open_interest(symbol)
+    if current_oi is None:
+        print(f"    [OI-status] {symbol}: couldn't fetch right now")
+        return
+    now = now_ist()
+    history = state.get("oi_history", {}).get(symbol, [])
+    lookback_cutoff = now - timedelta(minutes=OI_LOOKBACK_MINUTES)
+    past_points = [h for h in history
+                   if datetime.strptime(h["time"], "%Y-%m-%d %H:%M:%S.%f") <= lookback_cutoff]
+    if not past_points:
+        print(f"    [OI-status] {symbol}: current OI={current_oi:.0f}, still building "
+              f"{OI_LOOKBACK_MINUTES}-min history (not enough yet)")
+        return
+    past_oi = past_points[-1]["oi"]
+    if past_oi <= 0:
+        return
+    oi_change_pct = (current_oi - past_oi) / past_oi * 100
+    would_confirm = oi_change_pct >= MIN_OI_INCREASE_PCT
+    print(f"    [OI-status] {symbol}: {oi_change_pct:+.2f}% over last {OI_LOOKBACK_MINUTES}min "
+          f"(would {'CONFIRM' if would_confirm else 'NOT confirm'} a B/C entry right now, "
+          f"threshold={MIN_OI_INCREASE_PCT}%)")
+
+
 def look_for_entry_a(state, symbol_data, products):
     """Logic A: 200 EMA + VWAP + CVD confluence (existing strategy)."""
     print("  --- Entry scan detail (per coin) ---")
@@ -3448,6 +3485,7 @@ def look_for_entry_a(state, symbol_data, products):
         print(f"  {sym}: price={price:.5f} EMA200={ema:.5f} ({trend_label}) "
               f"VWAP={vwap:.5f} (dist={dist_from_vwap_pct:.3f}%, need<={VWAP_PROXIMITY_PCT}%) "
               f"CVD_now={cvd_now:.1f} rising={cvd_rising_flag} falling={cvd_falling_flag}")
+        print_oi_status(state, sym)
 
         if not near_vwap:
             print(f"    -> SKIP: price not close enough to VWAP")
