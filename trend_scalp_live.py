@@ -139,13 +139,25 @@ LOOP_INTERVAL_SECONDS = 20
 
 MAKER_FEE_PCT = 0.04
 TAKER_FEE_PCT = 0.06
-ROUND_TRIP_FEE_PCT = MAKER_FEE_PCT * 2
+# ---- NEW 2026-08-11: GST. User pointed out (with real wallet-ledger
+# data) that Delta charges ~15.25% GST ON TOP OF trading fees — this
+# script's fee-aware target/net-P&L math was previously only accounting
+# for the raw trading-fee, silently understating the TRUE cost of every
+# trade by ~15%. Verified precisely against 4 real ledger entries
+# (GST/Fee ratio consistently 15.25-15.26%). Applying this multiplier to
+# the base fee-rates below means every fee-aware calculation downstream
+# (MIN_TARGET_PCT, estimate_net_pnl_pct, etc.) now reflects genuine,
+# all-in cost — not just the pre-GST trading-fee. ----
+GST_RATE = 0.1525
+MAKER_FEE_PCT_WITH_GST = MAKER_FEE_PCT * (1 + GST_RATE)
+TAKER_FEE_PCT_WITH_GST = TAKER_FEE_PCT * (1 + GST_RATE)
+ROUND_TRIP_FEE_PCT = MAKER_FEE_PCT_WITH_GST * 2
 SAFETY_MARGIN_MULT = 2.0
 MIN_TARGET_PCT = ROUND_TRIP_FEE_PCT * SAFETY_MARGIN_MULT  # Logic A (limit-first, maker-fee based)
 
 # Logic B ALWAYS uses market orders (never gets the cheaper maker fee), so
 # its fee-aware filter must be based on TAKER fees, not the maker-based one above.
-MIN_TARGET_PCT_B = (TAKER_FEE_PCT * 2) * SAFETY_MARGIN_MULT
+MIN_TARGET_PCT_B = (TAKER_FEE_PCT_WITH_GST * 2) * SAFETY_MARGIN_MULT
 
 LIMIT_ORDER_TIMEOUT_SECONDS = 45
 # ---- NEW 2026-08-05: Logic A's entries specifically wait longer for a
@@ -556,13 +568,13 @@ def estimate_net_pnl_pct(gross_pnl_pct, strategy):
         to a market fill on one or both legs, real fees were higher than
         this estimate — this is a best-case approximation, not exact.
       - Logic B: ALWAYS uses market/bracket orders (taker fee) on both
-        entry and exit -> taker round-trip (TAKER_FEE_PCT * 2). This one
+        entry and exit -> taker round-trip, GST-inclusive (TAKER_FEE_PCT_WITH_GST * 2). This one
         should be fairly accurate since Logic B's execution path is fixed.
     """
     if strategy == "B":
-        round_trip_fee_pct = TAKER_FEE_PCT * 2
+        round_trip_fee_pct = TAKER_FEE_PCT_WITH_GST * 2  # ---- FIXED 2026-08-11: now GST-inclusive
     else:
-        round_trip_fee_pct = ROUND_TRIP_FEE_PCT
+        round_trip_fee_pct = ROUND_TRIP_FEE_PCT  # already GST-inclusive (see its definition)
     return gross_pnl_pct - round_trip_fee_pct
 
 
