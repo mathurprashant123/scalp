@@ -4056,6 +4056,20 @@ def look_for_entry_c(state, symbol_data, bias_data, products):
             continue
 
         # ---- 1-hour bias check ----
+        # ---- LOOSENED 2026-08-11: was a STRICT 3-way ordering
+        # (price > EMA9 > EMA20, or the mirror for down) — found in
+        # practice to miss genuinely strong, fresh trends: EMA9 is
+        # itself a lagging average, so during a fast recent move price
+        # can be well above BOTH EMA9 and EMA20, while EMA9 hasn't yet
+        # crossed above EMA20 (still catching up from older, less-
+        # bullish data). That legitimately-strong-trend case showed
+        # bias="NONE" and got skipped, even though the dashboard's own
+        # market-regime indicator was flagging "Strong trend" at the
+        # same moment. Loosened to just price-vs-EMA9 (drop the EMA20
+        # leg of the ordering) — still requires price to be genuinely on
+        # the correct side of the 1-hour trend-following average, just
+        # doesn't also demand EMA9 and EMA20 be in a fully resolved
+        # crossover yet. First-pass change, not backtested. ----
         bdf = bias_data[sym]
         bi = len(bdf) - 1
         b_fast, b_slow = bdf[fast_col].iloc[bi], bdf[slow_col].iloc[bi]
@@ -4063,8 +4077,8 @@ def look_for_entry_c(state, symbol_data, bias_data, products):
         if pd.isna(b_fast) or pd.isna(b_slow):
             print(f"  {sym}: 1-hour bias indicators not ready yet")
             continue
-        bias_up = b_price > b_fast > b_slow
-        bias_down = b_price < b_fast < b_slow
+        bias_up = b_price > b_fast
+        bias_down = b_price < b_fast
         bias_label = "UP" if bias_up else ("DOWN" if bias_down else "NONE")
 
         print(f"  {sym}: 15m EMA{EMA_FAST_C}={curr_fast:.5f} EMA{EMA_SLOW_C}={curr_slow:.5f} "
