@@ -1124,17 +1124,32 @@ def get_open_interest(symbol):
     OPEN — the confirmation-check treats a fetch-failure as "can't
     confirm, don't block the trade over it", same philosophy as every
     other best-effort real-data lookup in this script).
+
+    ---- CHANGED 2026-08-11: now returns (oi, price) instead of just oi
+    — the SAME ticker-response already includes a "close" field, so this
+    is a genuinely free addition (no extra API call). This enables
+    DIRECTION-AWARE OI (see oi_confirms_direction() docstring): a real
+    trade showed OI-confirmed-but-still-lost, because plain "OI is
+    rising" doesn't say WHICH side that new interest is on — rising OI
+    during a genuine price-DROP usually means new SHORTS building, not
+    new longs, even for a LONG-entry's "confirmation". Combining OI-
+    direction with PRICE-direction (a standard professional-trading
+    read: price-up+OI-up = genuine new longs; price-down+OI-up = genuine
+    new shorts) closes that gap. ----
     """
     try:
         r = requests.get(f"{config.REAL_DATA_BASE_URL}/v2/tickers/{symbol}", timeout=10)
         r.raise_for_status()
         data = r.json().get("result", {})
         oi_usd = data.get("oi_value_usd")
-        return float(oi_usd) if oi_usd is not None else None
+        price = data.get("close")
+        oi_val = float(oi_usd) if oi_usd is not None else None
+        price_val = float(price) if price is not None else None
+        return oi_val, price_val
     except Exception as e:
         print(f"    [WARN] Couldn't fetch Open-Interest for {symbol} ({e}) — "
               f"OI-confirmation will fail-open (not block the trade) this loop.")
-        return None
+        return None, None
 
 
 def sample_oi_history(state, symbol):
@@ -1162,7 +1177,7 @@ def sample_oi_history(state, symbol):
     populated. Silent no-op if the OI-fetch fails (best-effort, same
     fail-open philosophy as the rest of this feature). ----
     """
-    current_oi = get_open_interest(symbol)
+    current_oi, current_price = get_open_interest(symbol)
     if current_oi is None:
         return  # best-effort — just skip this loop's sample silently
 
@@ -1170,7 +1185,8 @@ def sample_oi_history(state, symbol):
     now = now_ist()
     if not history or (now - datetime.strptime(history[-1]["time"], "%Y-%m-%d %H:%M:%S.%f")
                         >= timedelta(minutes=OI_SAMPLE_INTERVAL_MINUTES)):
-        history.append({"time": now.strftime("%Y-%m-%d %H:%M:%S.%f"), "oi": current_oi})
+        history.append({"time": now.strftime("%Y-%m-%d %H:%M:%S.%f"), "oi": current_oi,
+                         "price": current_price})
     cutoff = now - timedelta(minutes=OI_LOOKBACK_MINUTES * 2)  # keep a bit extra buffer
     state["oi_history"][symbol] = [
         h for h in history
@@ -1180,34 +1196,44 @@ def sample_oi_history(state, symbol):
 
 def oi_confirms_direction(state, symbol, side):
     """
-    Checks whether Open Interest has genuinely been INCREASING over the
-    last OI_LOOKBACK_MINUTES, as a confirmation-signal for Logic B/C
-    trend-following entries. Rationale (from research + user discussion,
-    2026-08-10): rising OI alongside a price-move suggests genuinely NEW
-    positions are being opened (real conviction), whereas a price-move
-    on FLAT/FALLING OI is more likely just existing positions being
-    forced closed (e.g. a short-squeeze) — a move with less genuine
-    staying-power. This is a CONFIRMATION-ONLY filter, same pattern as
-    CVD in Logic A: it doesn't care about direction (long vs short) for
-    OI specifically, since OI rising means MORE conviction on EITHER
-    side of the market — it just wants to see genuine NEW interest, not
-    stale/flat positioning. Deliberately NOT applied to Logic A (a
-    mean-reversion strategy) — for Logic A, rising OI would actually be
-    a WARNING sign (a genuine trend forming, working against mean-
-    reversion), not a confirmation; that's a different, inverted
-    relationship tracked separately, not implemented here.
-    Fails OPEN (returns True, doesn't block) if OI data isn't available
-    yet or the fetch fails — this is a best-effort confirmation-layer,
-    not a hard requirement, consistent with how CVD/whipsaw-filters
-    degrade gracefully elsewhere in this script.
+    Checks whether Open Interest is genuinely building on the CORRECT
+    side for this specific trade — not just "OI is rising" in general.
 
-    ---- CHANGED 2026-08-11: no longer samples OI itself — that's now
-    sample_oi_history()'s job, called every loop independently (see its
-    docstring). This function now ONLY reads whatever history has
-    already accumulated and makes the confirm/reject decision. ----
+    ---- CHANGED 2026-08-11 (DIRECTION-AWARE, real-trade-motivated): the
+    original version only checked "is TOTAL OI rising", treating that as
+    confirmation for EITHER side. A real trade showed the gap: OI rose
+    +1.81% (genuinely "confirmed" a LONG), the trade was taken, and it
+    still lost — because rising OI alone doesn't say WHICH side that new
+    interest is on. Aggregate OI is symmetric (every contract has a long
+    and a short), so "OI up" just as easily means genuine NEW SHORTS
+    building as genuine new longs.
+    Fixed using the standard professional-trading OI+Price read:
+        Price UP   + OI UP   = genuine NEW LONGS   (confirms a LONG)
+        Price DOWN + OI UP   = genuine NEW SHORTS  (confirms a SHORT)
+        Price UP   + OI DOWN = short-covering, not genuine long-building
+        Price DOWN + OI DOWN = long-liquidation, not genuine short-building
+    Now requires BOTH: OI rising by MIN_OI_INCREASE_PCT AND price having
+    moved in the SAME direction as the intended trade over the same
+    lookback window. This is what "direction-aware OI" means — same
+    data-source as before (get_open_interest now also returns price from
+    the same ticker-call, no extra API cost), just a stricter, more
+    honestly-interpreted read of it.
+    Deliberately NOT applied to Logic A (see original reasoning below).
+    Fails OPEN (returns True) if data isn't available yet — best-effort,
+    same philosophy as the rest of this feature.
+
+    [Original 2026-08-10 reasoning, still applies to the overall
+    Logic-A-exclusion]: rising OI alongside a price-move suggests
+    genuinely NEW positions are being opened (real conviction), whereas
+    a price-move on FLAT/FALLING OI is more likely just existing
+    positions being forced closed — less genuine staying-power.
+    Deliberately NOT applied to Logic A (mean-reversion) — for Logic A,
+    rising OI would be a WARNING sign (a genuine trend forming, working
+    against mean-reversion), not a confirmation; a different, inverted
+    relationship, not implemented here.
     """
-    current_oi = get_open_interest(symbol)
-    if current_oi is None:
+    current_oi, current_price = get_open_interest(symbol)
+    if current_oi is None or current_price is None:
         return True  # can't confirm — fail open, don't block the trade over it
 
     now = now_ist()
@@ -1220,14 +1246,35 @@ def oi_confirms_direction(state, symbol, side):
               f"({OI_LOOKBACK_MINUTES}-min lookback) — confirmation fails open this time.")
         return True  # not enough history yet — fail open
 
-    past_oi = past_points[-1]["oi"]  # most recent point that's still >= lookback-old
-    if past_oi <= 0:
-        return True
+    past_point = past_points[-1]  # most recent point that's still >= lookback-old
+    past_oi = past_point["oi"]
+    past_price = past_point.get("price")
+    if past_oi is None or past_oi <= 0 or past_price is None or past_price <= 0:
+        return True  # old-format history-point without price — fail open
+
     oi_change_pct = (current_oi - past_oi) / past_oi * 100
-    confirmed = oi_change_pct >= MIN_OI_INCREASE_PCT
-    print(f"    [OI] {symbol}: OI changed {oi_change_pct:+.2f}% over the last "
-          f"{OI_LOOKBACK_MINUTES} min ({'CONFIRMS' if confirmed else 'does NOT confirm'} "
-          f"genuine new-position interest, threshold={MIN_OI_INCREASE_PCT}%)")
+    price_change_pct = (current_price - past_price) / past_price * 100
+    oi_rising = oi_change_pct >= MIN_OI_INCREASE_PCT
+
+    if side == "long":
+        price_matches = price_change_pct > 0
+        direction_word = "rising"
+    else:  # short
+        price_matches = price_change_pct < 0
+        direction_word = "falling"
+
+    confirmed = oi_rising and price_matches
+    if oi_rising and not price_matches:
+        reason = (f"OI is rising (+{oi_change_pct:.2f}%) but price is NOT {direction_word} "
+                   f"({price_change_pct:+.2f}%) — looks like new interest is building on the "
+                   f"OTHER side, not genuinely supporting this {side}.")
+    elif not oi_rising:
+        reason = f"OI changed {oi_change_pct:+.2f}% (< {MIN_OI_INCREASE_PCT}% threshold)"
+    else:
+        reason = f"OI +{oi_change_pct:.2f}% AND price {price_change_pct:+.2f}% both genuinely support this {side}"
+
+    print(f"    [OI] {symbol}: {reason} "
+          f"({'CONFIRMS' if confirmed else 'does NOT confirm'} genuine {side}-side interest)")
     return confirmed
 
 
@@ -3425,19 +3472,13 @@ def check_support_resistance(df, i, side, price):
 
 def print_oi_status(state, symbol):
     """
-    ---- NEW 2026-08-11: purely INFORMATIONAL — prints the current OI
-    change-over-lookback for `symbol`, EVERY loop, regardless of whether
-    Logic A/B/C's own gates ever reach oi_confirms_direction(). User
-    asked why OI wasn't visible ("OI ko open kyu nahi rakha jo dikhta
-    rehta") — the confirm/reject check only fires deep inside Logic B/C's
-    gate-sequence (after extension-filter, bias-check, etc.), so on days
-    where those earlier gates keep skipping, OI's own status was
-    invisible even though it was being sampled fine in the background.
-    This makes it visible like price/EMA/VWAP/CVD already are, without
-    changing any actual trading-decision — same read-only data
-    oi_confirms_direction() would use, just surfaced unconditionally. ----
+    ---- CHANGED 2026-08-11: now also shows PRICE-direction alongside OI
+    (direction-aware framework — see oi_confirms_direction() docstring),
+    since "OI is confirming" now depends on side too. Shows both raw
+    OI-change% and price-change%, so it's genuinely informative
+    regardless of which side a future signal might take. ----
     """
-    current_oi = get_open_interest(symbol)
+    current_oi, current_price = get_open_interest(symbol)
     if current_oi is None:
         print(f"    [OI-status] {symbol}: couldn't fetch right now")
         return
@@ -3451,13 +3492,21 @@ def print_oi_status(state, symbol):
               f"{OI_LOOKBACK_MINUTES}-min history (not enough yet)")
         return
     past_oi = past_points[-1]["oi"]
-    if past_oi <= 0:
+    past_price = past_points[-1].get("price")
+    if past_oi is None or past_oi <= 0:
         return
     oi_change_pct = (current_oi - past_oi) / past_oi * 100
-    would_confirm = oi_change_pct >= MIN_OI_INCREASE_PCT
-    print(f"    [OI-status] {symbol}: {oi_change_pct:+.2f}% over last {OI_LOOKBACK_MINUTES}min "
-          f"(would {'CONFIRM' if would_confirm else 'NOT confirm'} a B/C entry right now, "
-          f"threshold={MIN_OI_INCREASE_PCT}%)")
+    oi_rising = oi_change_pct >= MIN_OI_INCREASE_PCT
+    if past_price and past_price > 0 and current_price:
+        price_change_pct = (current_price - past_price) / past_price * 100
+        would_confirm_long = oi_rising and price_change_pct > 0
+        would_confirm_short = oi_rising and price_change_pct < 0
+        print(f"    [OI-status] {symbol}: OI {oi_change_pct:+.2f}%, price {price_change_pct:+.2f}% "
+              f"over last {OI_LOOKBACK_MINUTES}min (would {'CONFIRM' if would_confirm_long else 'NOT confirm'} "
+              f"a LONG, would {'CONFIRM' if would_confirm_short else 'NOT confirm'} a SHORT)")
+    else:
+        print(f"    [OI-status] {symbol}: {oi_change_pct:+.2f}% over last {OI_LOOKBACK_MINUTES}min "
+              f"(no price-history yet for direction-aware read)")
 
 
 def look_for_entry_a(state, symbol_data, products):
