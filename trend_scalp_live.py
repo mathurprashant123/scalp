@@ -1125,6 +1125,47 @@ def get_open_interest(symbol):
         return None
 
 
+def sample_oi_history(state, symbol):
+    """
+    Fetches the CURRENT Open Interest for `symbol` and appends it to
+    state["oi_history"][symbol] if enough time has passed since the last
+    sample (see OI_SAMPLE_INTERVAL_MINUTES). Pure data-collection, no
+    decision-making here.
+
+    ---- NEW 2026-08-11: extracted out of oi_confirms_direction() and
+    now called EVERY LOOP (for both symbols, regardless of whether any
+    entry-signal is being evaluated) — see the call-site in
+    run_one_loop_iteration for the full reasoning. Previously, sampling
+    only happened at the exact moment oi_confirms_direction() was
+    called, which is itself gated behind Logic B/C's OTHER conditions
+    already passing (EMA-cross, bias, RSI, etc.) — a genuinely rare
+    event. This created a structural chicken-and-egg gap: the
+    OI_LOOKBACK_MINUTES-long history needed for a meaningful confirmation
+    could only ever accumulate DURING actual entry-attempts, which are
+    infrequent — so by the time OI was actually needed, it usually
+    didn't have enough history yet and silently fell back to "fail
+    open" (unconfirmed, but not blocking). This fix makes history build
+    up continuously in the background, independent of entries, so by the
+    time a genuine signal comes along the lookback-window is already
+    populated. Silent no-op if the OI-fetch fails (best-effort, same
+    fail-open philosophy as the rest of this feature). ----
+    """
+    current_oi = get_open_interest(symbol)
+    if current_oi is None:
+        return  # best-effort — just skip this loop's sample silently
+
+    history = state.setdefault("oi_history", {}).setdefault(symbol, [])
+    now = now_ist()
+    if not history or (now - datetime.strptime(history[-1]["time"], "%Y-%m-%d %H:%M:%S.%f")
+                        >= timedelta(minutes=OI_SAMPLE_INTERVAL_MINUTES)):
+        history.append({"time": now.strftime("%Y-%m-%d %H:%M:%S.%f"), "oi": current_oi})
+    cutoff = now - timedelta(minutes=OI_LOOKBACK_MINUTES * 2)  # keep a bit extra buffer
+    state["oi_history"][symbol] = [
+        h for h in history
+        if datetime.strptime(h["time"], "%Y-%m-%d %H:%M:%S.%f") >= cutoff
+    ]
+
+
 def oi_confirms_direction(state, symbol, side):
     """
     Checks whether Open Interest has genuinely been INCREASING over the
@@ -1147,32 +1188,20 @@ def oi_confirms_direction(state, symbol, side):
     yet or the fetch fails — this is a best-effort confirmation-layer,
     not a hard requirement, consistent with how CVD/whipsaw-filters
     degrade gracefully elsewhere in this script.
+
+    ---- CHANGED 2026-08-11: no longer samples OI itself — that's now
+    sample_oi_history()'s job, called every loop independently (see its
+    docstring). This function now ONLY reads whatever history has
+    already accumulated and makes the confirm/reject decision. ----
     """
     current_oi = get_open_interest(symbol)
     if current_oi is None:
         return True  # can't confirm — fail open, don't block the trade over it
 
-    history = state.setdefault("oi_history", {}).setdefault(symbol, [])
     now = now_ist()
-    # ---- Thinning: with a 3-hour lookback (widened same-day after
-    # research, see OI_LOOKBACK_MINUTES comment) and a ~20-25s loop
-    # interval, storing every single loop's reading would build up
-    # roughly 1000+ entries per symbol within the buffer window — fine
-    # functionally, but needless bloat in state.json. Only append a new
-    # point if at least OI_SAMPLE_INTERVAL_MINUTES have passed since the
-    # last stored one; a few-minute granularity is plenty for a
-    # 3-hour-scale trend-check. ----
-    if not history or (now - datetime.strptime(history[-1]["time"], "%Y-%m-%d %H:%M:%S.%f")
-                        >= timedelta(minutes=OI_SAMPLE_INTERVAL_MINUTES)):
-        history.append({"time": now.strftime("%Y-%m-%d %H:%M:%S.%f"), "oi": current_oi})
-    cutoff = now - timedelta(minutes=OI_LOOKBACK_MINUTES * 2)  # keep a bit extra buffer
-    state["oi_history"][symbol] = [
-        h for h in history
-        if datetime.strptime(h["time"], "%Y-%m-%d %H:%M:%S.%f") >= cutoff
-    ]
-
+    history = state.get("oi_history", {}).get(symbol, [])
     lookback_cutoff = now - timedelta(minutes=OI_LOOKBACK_MINUTES)
-    past_points = [h for h in state["oi_history"][symbol]
+    past_points = [h for h in history
                    if datetime.strptime(h["time"], "%Y-%m-%d %H:%M:%S.%f") <= lookback_cutoff]
     if not past_points:
         print(f"    [OI] Not enough OI-history yet for {symbol} "
@@ -3317,14 +3346,27 @@ def check_support_resistance(df, i, side, price):
     """
     Logic A's support/resistance gate — called right after `side` is
     decided in look_for_entry_a, before proceeding to order-placement.
+
+    ---- REVERTED 2026-08-10 (same day): briefly made this mandatory
+    (neutral-zone would skip) after a request following a real trade
+    that took a SHORT at a support level. On review, that specific
+    scenario was ALREADY blocked by the "wrong side of structure" check
+    below regardless of the mandatory/optional distinction — there was
+    no concrete evidence the neutral-zone-proceeding case itself had
+    caused a problem. User decided the extra restriction (fewer trades
+    overall) wasn't wanted without a demonstrated need. Back to: a
+    neutral zone (no nearby level) doesn't block — S/R only actively
+    blocks when price is on the WRONG side of a known level, or confirms
+    when on the RIGHT side with a genuine bounce. ----
+
     LONG needs to be near SUPPORT with a genuine bounce confirmed (or in
     a neutral zone with no nearby level, which doesn't block). Being near
     RESISTANCE blocks a LONG outright, regardless of bounce-status —
     resistance is structurally the wrong place to bet on an upward
     mean-reversion. SHORT is the exact mirror-opposite. Deliberately
     Logic-A-ONLY: Logic B/C are trend-following (already handled
-    separately via OI-confirmation, added earlier the same day) — support/
-    resistance's "bet on a bounce" framing is specific to mean-reversion.
+    separately via OI-confirmation) — support/resistance's "bet on a
+    bounce" framing is specific to mean-reversion.
     Returns True (proceed) or False (skip this loop for this symbol).
     """
     levels = find_support_resistance_levels(df, i)
@@ -4232,6 +4274,20 @@ def run_one_loop_iteration(state, products):
     # reasoning (PERMANENT fix for a real bug: these buttons silently
     # didn't work while the bot was running, only after Stop/Start). ----
     apply_pending_updates(state)
+
+    # ---- NEW 2026-08-11: sample OI-history for BOTH symbols on EVERY
+    # loop, unconditionally — regardless of whether Logic B/C are even
+    # enabled, or whether any entry-signal is being evaluated this loop.
+    # See sample_oi_history() docstring for the full reasoning: this
+    # fixes a structural gap where OI-history previously only
+    # accumulated during actual entry-attempts (rare), meaning the
+    # OI_LOOKBACK_MINUTES window rarely had enough data by the time it
+    # was actually needed, and silently fell back to "can't confirm"
+    # every time. Now the history builds up continuously in the
+    # background, so it's genuinely ready whenever a real signal comes
+    # along. Cheap, read-only, public-endpoint call — safe to always run. ----
+    for _oi_symbol in LOGIC_C_SYMBOLS:
+        sample_oi_history(state, _oi_symbol)
 
     symbol_data_a = {}  # Logic A: 15-min candles
     symbol_data_b = {}  # Logic B: 1-min candles
