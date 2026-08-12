@@ -365,6 +365,17 @@ STRATEGY_MODE_B = "trend"
 EMA_FAST = 5
 EMA_SLOW = 13
 RSI_PERIOD = 14
+# ---- NEW 2026-08-12: informational-only RSI thresholds for Logic A
+# (mean-reversion). RSI is a MOMENTUM indicator — VWAP-proximity alone
+# only tells us WHERE price is (near fair-value), not whether the move
+# INTO that position has genuinely exhausted itself. RSI < 30 / > 70 are
+# the standard, widely-used oversold/overbought thresholds. Deliberately
+# NOT a hard gate yet — this only prints alongside the existing checks
+# (same pattern as OI-status earlier) so real data can be observed for a
+# few days before deciding whether to make it an actual filter. First-
+# pass thresholds, not backtested. ----
+RSI_OVERSOLD = 30
+RSI_OVERBOUGHT = 70
 ATR_PERIOD = 14
 RSI_LONG_MAX = 80
 RSI_LONG_MIN = 50
@@ -3599,6 +3610,21 @@ def look_for_entry_a(state, symbol_data, products):
               f"CVD_now={cvd_now:.1f} rising={cvd_rising_flag} falling={cvd_falling_flag}")
         print_oi_status(state, sym)
 
+        # ---- NEW 2026-08-12: informational-only RSI (momentum) status.
+        # VWAP tells us WHERE price is; RSI tells us HOW FAST it got there
+        # — genuinely different questions. Not a gate yet (see
+        # RSI_OVERSOLD/RSI_OVERBOUGHT docstring above), just surfaced
+        # here the same way OI-status is, so real data can inform whether
+        # to make it an actual filter later. ----
+        rsi_val = row.get("rsi") if hasattr(row, "get") else (row["rsi"] if "rsi" in row.index else None)
+        if rsi_val is not None and pd.notna(rsi_val):
+            rsi_zone = ("OVERSOLD" if rsi_val < RSI_OVERSOLD
+                        else "OVERBOUGHT" if rsi_val > RSI_OVERBOUGHT else "normal")
+            print(f"    [RSI-status] {sym}: RSI={rsi_val:.1f} ({rsi_zone} — "
+                  f"would {'support a LONG' if rsi_zone == 'OVERSOLD' else 'support a SHORT' if rsi_zone == 'OVERBOUGHT' else 'not favor either side'})")
+        else:
+            print(f"    [RSI-status] {sym}: not ready yet (still warming up)")
+
         if not near_vwap:
             print(f"    -> SKIP: price not close enough to VWAP")
             continue
@@ -4509,6 +4535,8 @@ def run_one_loop_iteration(state, products):
                 df_a = compute_ema(df_a, period=EMA_PERIOD)
                 df_a = compute_vwap(df_a)
                 df_a = compute_cvd(df_a)
+                if len(df_a) >= RSI_PERIOD + 5:
+                    df_a = compute_rsi(df_a, period=RSI_PERIOD)
                 if len(df_a) >= EMA_SLOW_C + ATR_PERIOD + 5:
                     df_a = compute_ema(df_a, period=EMA_FAST_C)
                     df_a = compute_ema(df_a, period=EMA_SLOW_C)
