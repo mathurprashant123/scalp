@@ -3401,6 +3401,69 @@ def check_genuine_bounce(df, i, level, level_type, lookback=None):
         return bool(touched and latest_close < level)
 
 
+def oi_warns_against_reversion(state, symbol, side):
+    """
+    Logic-A-ONLY (mean-reversion) warning-check: does OI suggest genuine
+    NEW conviction is building on the OPPOSITE side of this bounce-bet,
+    which would make the level more likely to break than hold?
+
+    ---- NEW 2026-08-12: this is the INVERTED counterpart to
+    oi_confirms_direction() (Logic B/C's trend-following confirmation).
+    Logic A's own docstring (see check_support_resistance()) always
+    flagged that rising OI SHOULD be a warning sign for mean-reversion —
+    a genuine trend forming works against a bounce — but this was never
+    implemented since plain (non-direction-aware) OI couldn't
+    distinguish "new longs building" from "new shorts building". Now
+    that OI-history also tracks price (see sample_oi_history()), this
+    can finally be checked properly: only warn when OI is GENUINELY
+    rising on the side that would BREAK this trade's level (e.g. for a
+    LONG at support, warn if OI is rising while price is still falling —
+    that's fresh short-conviction, the opposite of what a support-bounce
+    needs). This is deliberately a WARNING-ONLY filter, not a
+    confirmation requirement — plenty of genuine bounces will have flat
+    or not-enough OI-history, and those should still proceed exactly as
+    before. Only the specific case of ACTIVE, OPPOSING conviction
+    blocks the trade. Fails OPEN (returns False = no warning) if data
+    isn't available, same philosophy as the rest of this feature.
+    """
+    current_oi, current_price = get_open_interest(symbol)
+    if current_oi is None or current_price is None:
+        return False  # can't check — fail open, don't block over it
+
+    now = now_ist()
+    history = state.get("oi_history", {}).get(symbol, [])
+    lookback_cutoff = now - timedelta(minutes=OI_LOOKBACK_MINUTES)
+    past_points = [h for h in history
+                   if datetime.strptime(h["time"], "%Y-%m-%d %H:%M:%S.%f") <= lookback_cutoff]
+    if not past_points:
+        return False  # not enough history — fail open, no warning
+
+    past_point = past_points[-1]
+    past_oi = past_point["oi"]
+    past_price = past_point.get("price")
+    if past_oi is None or past_oi <= 0 or past_price is None or past_price <= 0:
+        return False
+
+    oi_change_pct = (current_oi - past_oi) / past_oi * 100
+    price_change_pct = (current_price - past_price) / past_price * 100
+    oi_rising = oi_change_pct >= MIN_OI_INCREASE_PCT
+
+    # For a LONG (betting price bounces UP off support): the danger is
+    # fresh conviction on the DOWN side — OI rising while price is
+    # still falling. Mirror for a SHORT at resistance.
+    if side == "long":
+        opposing = price_change_pct < 0
+    else:
+        opposing = price_change_pct > 0
+
+    warning = oi_rising and opposing
+    if warning:
+        print(f"    [OI-warning] {symbol}: OI is rising (+{oi_change_pct:.2f}%) while price is "
+              f"still moving AGAINST this {side} ({price_change_pct:+.2f}%) — looks like fresh "
+              f"conviction building on the opposing side, this level may not hold.")
+    return warning
+
+
 def check_support_resistance(df, i, side, price):
     """
     Logic A's support/resistance gate — called right after `side` is
@@ -3603,6 +3666,17 @@ def look_for_entry_a(state, symbol_data, products):
         # LONGs). See check_support_resistance() docstring for full
         # reasoning. Logic-A-ONLY (mean-reversion-specific). ----
         if not check_support_resistance(df, i, side, price):
+            continue
+
+        # ---- NEW 2026-08-12: Direction-aware OI warning-check.
+        # S/R just confirmed a genuine bounce-setup — this asks one more
+        # question: is fresh conviction ACTIVELY building on the OPPOSITE
+        # side right now? If so, the level looks more likely to break
+        # than hold, despite S/R's read. See oi_warns_against_reversion()
+        # docstring for full reasoning — this is a warning-only filter,
+        # not a confirmation requirement: flat/insufficient OI-history
+        # does NOT block, only active opposing conviction does. ----
+        if oi_warns_against_reversion(state, sym, side):
             continue
 
         # ---- Minimum stop-distance floor (WIDEN, don't skip) ----
