@@ -978,17 +978,37 @@ def start_oi_warmup_route():
     for OI_WARMUP_MINUTES real minutes while a dense, fresh history
     builds up. See start_oi_warmup() / OI_WARMUP_MINUTES docstrings in
     trend_scalp_live.py for why this is a genuine shorter real-time wait,
-    not an instant backfill (the exchange only exposes CURRENT OI)."""
-    ok = algo.queue_state_update({"action": "start_oi_warmup"})
-    # Best-effort immediate state.json write too, covering the case where
-    # the bot isn't running right now (no loop to pick up the queue).
+    not an instant backfill (the exchange only exposes CURRENT OI).
+
+    ---- FIXED 2026-08-13: this used to ALWAYS queue a pending-update
+    AND write state.json directly, regardless of whether the bot was
+    running. If pressed while the bot was STOPPED, the direct write
+    started the real warm-up timer immediately — but the queued update
+    stayed sitting in the pending-updates file (unprocessed, since no
+    loop was running to pick it up). The very next time the bot was
+    started, its first loop would apply that stale queued update and
+    call start_oi_warmup() AGAIN, silently resetting the already-ticking
+    timer back to 0 — exactly what was observed: warm-up looked like it
+    restarted right after pressing Start. Fix: only queue the live
+    -update when the bot is actually running (checked via algo state);
+    when it's stopped, the direct state.json write alone is correct and
+    sufficient — there's no running loop to apply a queued action, so
+    queuing one is not just unnecessary but actively harmful the next
+    time the bot starts. ----"""
+    thread = state_info.get("thread")
+    bot_running = thread is not None and thread.is_alive()
     state = algo.load_state()
     algo.start_oi_warmup(state)
     algo.save_state(state)
-    msg = (f"OI Warm-Up started — new entries paused for {algo.OI_WARMUP_MINUTES} minutes "
-           "while fresh OI-history builds up.") if ok else (
-           f"Started in state.json, but couldn't queue the live-update — if the bot is "
-           "currently running, you may need to Stop then Start it for this to take effect.")
+    if bot_running:
+        algo.queue_state_update({"action": "start_oi_warmup"})
+        msg = (f"OI Warm-Up started — new entries paused for {algo.OI_WARMUP_MINUTES} "
+               "minutes while fresh OI-history builds up.")
+    else:
+        msg = (f"OI Warm-Up started — new entries paused for {algo.OI_WARMUP_MINUTES} "
+               "minutes while fresh OI-history builds up. Bot is currently stopped — "
+               "press Start whenever you're ready, the warm-up timer is already ticking "
+               "in the background and won't reset when you do.")
     return jsonify({"ok": True, "message": msg})
 
 
