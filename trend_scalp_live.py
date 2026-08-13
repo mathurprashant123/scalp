@@ -320,6 +320,10 @@ def apply_pending_updates(state):
             fields = update.get("fields", {})
             state.update(fields)
             print(f"  [PENDING-UPDATE] set_fields applied: {list(fields.keys())}")
+        elif action == "start_oi_warmup":
+            start_oi_warmup(state)
+            print(f"  [PENDING-UPDATE] OI Warm-Up started — entries paused for "
+                  f"{OI_WARMUP_MINUTES} real minutes while OI-history builds fresh.")
         else:
             print(f"  [WARN] Unknown pending-update action '{action}' — ignoring.")
     try:
@@ -490,6 +494,40 @@ DEAD_ZONE_END_HOUR = 5.5     # 5:30 AM IST
 OI_LOOKBACK_MINUTES = 45       # ~matches this bot's own median trade-duration
 MIN_OI_INCREASE_PCT = 0.75     # OI must have grown at least this much to "confirm"
 OI_SAMPLE_INTERVAL_MINUTES = 3   # only store a new OI-snapshot this often (avoids state-bloat)
+# ---- NEW 2026-08-13: OI Warm-Up Mode. User's idea, adjusted for a real
+# technical constraint: the exchange's OI endpoint only exposes the
+# CURRENT snapshot (see get_open_interest docstring) — there is no way
+# to fetch "OI as of 45 minutes ago" faster by polling harder right now,
+# since that value only exists if it was genuinely recorded at that
+# moment. What CAN genuinely be sped up: sampling MORE OFTEN in real
+# time (every loop, ~20s, instead of throttled to once per
+# OI_SAMPLE_INTERVAL_MINUTES) so a SHORTER real wait builds a usably
+# dense history, and using that shorter real window as the lookback
+# instead of insisting on the full 45 minutes. This trades some
+# precision for a much shorter, still-genuine wait — motivated by two
+# real losing trades that both fired immediately after a restart, before
+# OI-confirmation had any history to check (see 2026-08-13 review). ----
+OI_WARMUP_MINUTES = 10          # real wall-clock minutes to wait before trading resumes
+OI_WARMUP_SAMPLE_INTERVAL_SECONDS = 20  # sample (near-)every loop during warm-up, not throttled
+# ---- NEW 2026-08-13: In-Trade OI Reversal Exit. User's idea: OI is
+# only ever checked at ENTRY (oi_confirms_direction), never again while
+# the trade is open — so if genuine new interest builds AGAINST the
+# position after entry, the bot has no way to notice until price
+# eventually hits the hard stop. This adds a lightweight in-trade check:
+# same "price+OI direction" read as the entry-side confirmation (see
+# oi_confirms_direction docstring), but checking for CONFIRMATION OF THE
+# OPPOSITE SIDE from a SHORTER, more responsive lookback than the
+# 45-minute entry-lookback (an in-trade warning needs to be timely, not
+# a slow-moving average). Deliberately conservative: a short grace
+# period after entry (avoid reacting to entry-moment noise), and exits
+# via the same _close_position() path as a stop/target hit — so it's
+# fully logged, fee-aware, and fallback-safe like every other exit. This
+# does NOT replace the hard stop-loss — it's a chance to exit EARLIER,
+# before price has to travel all the way to the stop. First-pass
+# thresholds, not backtested; can be disabled by setting to False. ----
+OI_INTRADE_REVERSAL_ENABLED = True
+OI_INTRADE_REVERSAL_LOOKBACK_MINUTES = 15   # shorter/more responsive than the 45-min entry-lookback
+OI_INTRADE_GRACE_MINUTES = 5                # don't check in the first few minutes after entry
 # ---- NEW 2026-08-10: Support/Resistance constants, Logic A ONLY — see
 # find_support_resistance_levels()/check_support_resistance() for full
 # reasoning. First-pass, not-yet-backtested.
@@ -1163,6 +1201,32 @@ def get_open_interest(symbol):
         return None, None
 
 
+def start_oi_warmup(state):
+    """
+    ---- NEW 2026-08-13: user-triggered OI Warm-Up. Clears existing OI
+    history and starts a fresh real-time-only build-up. See
+    OI_WARMUP_MINUTES docstring above for why this is a genuine shorter
+    wait, not an instant backfill. Entries stay blocked (see the gate in
+    run_one_loop_iteration) until either OI_WARMUP_MINUTES has genuinely
+    elapsed, or the person cancels/starts the bot anyway. ----
+    """
+    now = now_ist()
+    state["oi_history"] = {sym: [] for sym in LOGIC_C_SYMBOLS}
+    state["oi_warmup_start"] = now.strftime("%Y-%m-%d %H:%M:%S.%f")
+
+
+def get_oi_warmup_status(state):
+    start_str = state.get("oi_warmup_start")
+    if not start_str:
+        return {"active": False}
+    start = datetime.strptime(start_str, "%Y-%m-%d %H:%M:%S.%f")
+    elapsed_min = (now_ist() - start).total_seconds() / 60.0
+    ready = elapsed_min >= OI_WARMUP_MINUTES
+    return {"active": True, "ready": ready,
+            "elapsed_minutes": round(elapsed_min, 1),
+            "target_minutes": OI_WARMUP_MINUTES}
+
+
 def sample_oi_history(state, symbol):
     """
     Fetches the CURRENT Open Interest for `symbol` and appends it to
@@ -1187,6 +1251,11 @@ def sample_oi_history(state, symbol):
     time a genuine signal comes along the lookback-window is already
     populated. Silent no-op if the OI-fetch fails (best-effort, same
     fail-open philosophy as the rest of this feature). ----
+
+    ---- NEW 2026-08-13: during an active OI Warm-Up (see
+    start_oi_warmup), the normal OI_SAMPLE_INTERVAL_MINUTES throttle is
+    replaced with OI_WARMUP_SAMPLE_INTERVAL_SECONDS so history builds up
+    densely within the shorter real-time warm-up window. ----
     """
     current_oi, current_price = get_open_interest(symbol)
     if current_oi is None:
@@ -1194,8 +1263,11 @@ def sample_oi_history(state, symbol):
 
     history = state.setdefault("oi_history", {}).setdefault(symbol, [])
     now = now_ist()
+    warmup_active = get_oi_warmup_status(state).get("active", False)
+    min_gap = (timedelta(seconds=OI_WARMUP_SAMPLE_INTERVAL_SECONDS) if warmup_active
+               else timedelta(minutes=OI_SAMPLE_INTERVAL_MINUTES))
     if not history or (now - datetime.strptime(history[-1]["time"], "%Y-%m-%d %H:%M:%S.%f")
-                        >= timedelta(minutes=OI_SAMPLE_INTERVAL_MINUTES)):
+                        >= min_gap):
         history.append({"time": now.strftime("%Y-%m-%d %H:%M:%S.%f"), "oi": current_oi,
                          "price": current_price})
     cutoff = now - timedelta(minutes=OI_LOOKBACK_MINUTES * 2)  # keep a bit extra buffer
@@ -1287,6 +1359,66 @@ def oi_confirms_direction(state, symbol, side):
     print(f"    [OI] {symbol}: {reason} "
           f"({'CONFIRMS' if confirmed else 'does NOT confirm'} genuine {side}-side interest)")
     return confirmed
+
+
+def check_oi_reversal_exit(state, pos):
+    """
+    ---- NEW 2026-08-13: In-Trade OI Reversal check. See
+    OI_INTRADE_REVERSAL_ENABLED docstring above for the full reasoning —
+    this uses the SAME price+OI direction read as oi_confirms_direction,
+    but checks whether genuine new interest has built on the OPPOSITE
+    side from the position's entry side, using a shorter
+    (OI_INTRADE_REVERSAL_LOOKBACK_MINUTES) lookback for a timelier
+    signal. Returns (should_exit: bool, reason: str). Fails safe (False,
+    "") on any missing data — never forces an exit over incomplete
+    information.
+    """
+    if not OI_INTRADE_REVERSAL_ENABLED:
+        return False, ""
+
+    symbol = pos["symbol"]
+    side = pos["side"]  # "long" or "short"
+    entry_time = datetime.strptime(pos["entry_time"], "%Y-%m-%d %H:%M:%S.%f")
+    now = now_ist()
+    if (now - entry_time) < timedelta(minutes=OI_INTRADE_GRACE_MINUTES):
+        return False, ""  # still in grace period — too soon to judge
+
+    current_oi, current_price = get_open_interest(symbol)
+    if current_oi is None or current_price is None:
+        return False, ""
+
+    history = state.get("oi_history", {}).get(symbol, [])
+    lookback_cutoff = now - timedelta(minutes=OI_INTRADE_REVERSAL_LOOKBACK_MINUTES)
+    past_points = [h for h in history
+                   if datetime.strptime(h["time"], "%Y-%m-%d %H:%M:%S.%f") <= lookback_cutoff]
+    if not past_points:
+        return False, ""  # not enough history yet — fail safe, don't exit
+
+    past_point = past_points[-1]
+    past_oi = past_point["oi"]
+    past_price = past_point.get("price")
+    if not past_oi or past_oi <= 0 or not past_price or past_price <= 0:
+        return False, ""
+
+    oi_change_pct = (current_oi - past_oi) / past_oi * 100
+    price_change_pct = (current_price - past_price) / past_price * 100
+    oi_rising = oi_change_pct >= MIN_OI_INCREASE_PCT
+
+    # A LONG position sees a genuine reversal warning when OI rises WHILE
+    # price is falling (new shorts building against it) — the mirror of
+    # a SHORT position seeing OI rise while price rises (new longs
+    # building against it).
+    if side == "long":
+        opposing_side_confirmed = oi_rising and price_change_pct < 0
+    else:
+        opposing_side_confirmed = oi_rising and price_change_pct > 0
+
+    if opposing_side_confirmed:
+        reason = (f"OI {oi_change_pct:+.2f}% AND price {price_change_pct:+.2f}% over the last "
+                  f"{OI_INTRADE_REVERSAL_LOOKBACK_MINUTES}min genuinely suggest new "
+                  f"{'shorts' if side == 'long' else 'longs'} building against this {side} position")
+        return True, reason
+    return False, ""
 
 
 
@@ -2627,6 +2759,15 @@ def manage_open_position(state, symbol_data):
             return
         else:
             pos["_zero_size_confirmations"] = 0
+
+    # ---- NEW 2026-08-13: In-Trade OI Reversal check — a chance to exit
+    # EARLIER, before price has to travel all the way to the hard stop.
+    # See check_oi_reversal_exit() docstring for the full reasoning. ----
+    should_exit_oi, oi_exit_reason = check_oi_reversal_exit(state, pos)
+    if should_exit_oi:
+        print(f"  [OI-REVERSAL] {sym}: {oi_exit_reason} — closing early as a defensive exit.")
+        _close_position(state, pos, price, "oi_reversal", pos["size"])
+        return
 
     # ---- Hard stop-loss / full target check first ----
     hit_stop = hit_target = False
@@ -4589,6 +4730,28 @@ def run_one_loop_iteration(state, products):
     # along. Cheap, read-only, public-endpoint call — safe to always run. ----
     for _oi_symbol in LOGIC_C_SYMBOLS:
         sample_oi_history(state, _oi_symbol)
+
+    # ---- NEW 2026-08-13: OI Warm-Up gate. If the person triggered
+    # warm-up (dashboard button), block ALL new entries — across every
+    # logic, not just the OI-dependent ones — until OI_WARMUP_MINUTES has
+    # genuinely elapsed in real time. This is deliberately simple (a hard
+    # stop on new entries, not a partial/per-logic exemption) since the
+    # goal is a clean, predictable "wait, then go" — not another
+    # conditional branch to reason about mid-trade. Does NOT touch
+    # position-management for an already-open position (safety
+    # stops/targets keep working normally even during warm-up). ----
+    warmup_status = get_oi_warmup_status(state)
+    LATEST_STATE["oi_warmup"] = warmup_status
+    if warmup_status.get("active") and not warmup_status.get("ready"):
+        print(f"  [OI-WARMUP] Building OI history: {warmup_status['elapsed_minutes']:.1f} / "
+              f"{warmup_status['target_minutes']} minutes — new entries paused until ready.")
+        if not state.get("position"):
+            print("  No tradeable setup this loop (OI warm-up in progress) — staying flat.")
+            return
+    elif warmup_status.get("active") and warmup_status.get("ready"):
+        print("  [OI-WARMUP] Complete — OI history ready, resuming normal entry-scanning.")
+        state["oi_warmup_start"] = None
+        LATEST_STATE["oi_warmup"] = {"active": False}
 
     symbol_data_a = {}  # Logic A: 15-min candles
     symbol_data_b = {}  # Logic B: 1-min candles
