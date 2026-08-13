@@ -547,6 +547,9 @@ PAGE_TEMPLATE = """
                          border: 2px solid #d94f4f; box-shadow: 0 0 10px rgba(217,79,79,0.5); }
         #regimeBanner .sub { font-size:12px; font-weight:normal; color:#f0c6c6; margin-top:4px; }
         #regimeBanner.hidden { display:none; }
+        #oiWarmupBanner { color:white; text-align:center; padding:10px 20px;
+                           border-radius:8px; margin:10px 0; font-size:14px; font-weight:bold; }
+        #oiWarmupBanner.hidden { display:none; }
         #trendMeter { display:flex; gap:10px; margin-bottom:18px; }
         #trendMeter.hidden { display:none; }
         .trend-card { flex:1; text-align:center; padding:10px; border-radius:8px; font-size:13px; }
@@ -615,7 +618,12 @@ PAGE_TEMPLATE = """
                 padding:8px 18px; border-radius:6px; cursor:pointer; font-size:13px; margin-left:8px;">
             &#9940; Force-Clear Stuck Position (emergency)
         </button>
+        <button onclick="startOiWarmup()" style="background:#1a3a5a; color:white; border:2px solid #4a9ade;
+                padding:8px 18px; border-radius:6px; cursor:pointer; font-size:13px; margin-left:8px;">
+            &#9203; Start OI Warm-Up (before starting bot)
+        </button>
     </div>
+    <div id="oiWarmupBanner" class="hidden"></div>
     <script>
         function resetBreaker() {
             if (!confirm('Ye aaj ka daily-loss circuit breaker reset kar dega. Sure?')) return;
@@ -647,6 +655,34 @@ PAGE_TEMPLATE = """
                 alert(data.message || 'Done');
             });
         }
+        function startOiWarmup() {
+            if (!confirm('Ye OI-history fresh se build karega (' + '10' + ' minute tak naye entries ruke rahenge). Bot start karne se PEHLE isse use karo, restart ke turant baad nahi. Sure?')) return;
+            fetch('/start_oi_warmup', {method:'POST'}).then(r => r.json()).then(data => {
+                alert(data.message || 'Done');
+                refreshOiWarmup();
+            });
+        }
+        function refreshOiWarmup() {
+            fetch('/oi_warmup_status').then(r => r.json()).then(data => {
+                const el = document.getElementById('oiWarmupBanner');
+                if (!data || !data.active) {
+                    el.className = 'hidden';
+                    return;
+                }
+                el.className = '';
+                if (data.ready) {
+                    el.style.background = '#0a4a2a';
+                    el.style.border = '2px solid #4CAF50';
+                    el.innerHTML = '&#9989; OI Warm-Up complete &mdash; history ready, bot resuming normal scanning.';
+                } else {
+                    el.style.background = '#1a3a5a';
+                    el.style.border = '2px solid #4a9ade';
+                    el.innerHTML = `&#9203; OI Warm-Up in progress: ${data.elapsed_minutes} / ${data.target_minutes} minutes &mdash; new entries paused.`;
+                }
+            });
+        }
+        setInterval(refreshOiWarmup, 5000);
+        refreshOiWarmup();
     </script>
     <div id="status" class="stopped">STOPPED</div>
     <div class="buttons">
@@ -934,6 +970,34 @@ def trend_meter():
     if meter is None:
         return jsonify({})
     return jsonify(meter)
+
+
+@app.route("/start_oi_warmup", methods=["POST"])
+def start_oi_warmup_route():
+    """Kicks off OI Warm-Up: clears OI history and pauses all new entries
+    for OI_WARMUP_MINUTES real minutes while a dense, fresh history
+    builds up. See start_oi_warmup() / OI_WARMUP_MINUTES docstrings in
+    trend_scalp_live.py for why this is a genuine shorter real-time wait,
+    not an instant backfill (the exchange only exposes CURRENT OI)."""
+    ok = algo.queue_state_update({"action": "start_oi_warmup"})
+    # Best-effort immediate state.json write too, covering the case where
+    # the bot isn't running right now (no loop to pick up the queue).
+    state = algo.load_state()
+    algo.start_oi_warmup(state)
+    algo.save_state(state)
+    msg = (f"OI Warm-Up started — new entries paused for {algo.OI_WARMUP_MINUTES} minutes "
+           "while fresh OI-history builds up.") if ok else (
+           f"Started in state.json, but couldn't queue the live-update — if the bot is "
+           "currently running, you may need to Stop then Start it for this to take effect.")
+    return jsonify({"ok": True, "message": msg})
+
+
+@app.route("/oi_warmup_status")
+def oi_warmup_status_route():
+    status = algo.LATEST_STATE.get("oi_warmup")
+    if status is None:
+        status = algo.get_oi_warmup_status(algo.load_state())
+    return jsonify(status)
 
 
 @app.route("/live_pnl")
