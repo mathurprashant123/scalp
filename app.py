@@ -547,10 +547,21 @@ PAGE_TEMPLATE = """
                          border: 2px solid #d94f4f; box-shadow: 0 0 10px rgba(217,79,79,0.5); }
         #regimeBanner .sub { font-size:12px; font-weight:normal; color:#f0c6c6; margin-top:4px; }
         #regimeBanner.hidden { display:none; }
+        #trendMeter { display:flex; gap:10px; margin-bottom:18px; }
+        #trendMeter.hidden { display:none; }
+        .trend-card { flex:1; text-align:center; padding:10px; border-radius:8px; font-size:13px; }
+        .trend-card .sym { font-weight:bold; font-size:14px; margin-bottom:4px; }
+        .trend-card .state { font-weight:bold; }
+        .trend-uptrend-active { background:#1f4a2a; border:2px solid #4CAF50; }
+        .trend-uptrend-forming { background:#1f3a2a; border:2px dashed #6ab577; }
+        .trend-downtrend-active { background:#4a1f1f; border:2px solid #E85D5D; }
+        .trend-downtrend-forming { background:#3a2222; border:2px dashed #c47a7a; }
+        .trend-neutral { background:#333; border:2px solid #888; }
     </style>
 </head>
 <body>
     <div id="regimeBanner" class="hidden"></div>
+    <div id="trendMeter" class="hidden"></div>
     <div id="pnlWidget" class="flat">
         <h3>Live Trade P&amp;L</h3>
         <div class="pnl-row" style="border-bottom:1px solid #333; padding-bottom:6px; margin-bottom:6px;">
@@ -772,6 +783,32 @@ PAGE_TEMPLATE = """
                     `(Logic A needs \u2264${data.threshold_pct}%) &mdash; ${perSymbol}</div>`;
             });
         }
+        function refreshTrendMeter() {
+            fetch('/trend_meter').then(r => r.json()).then(data => {
+                const el = document.getElementById('trendMeter');
+                const syms = Object.keys(data || {});
+                if (syms.length === 0) {
+                    el.className = 'hidden';
+                    return;
+                }
+                el.className = '';
+                const stateClass = {
+                    'UPTREND-ACTIVE': 'trend-uptrend-active',
+                    'UPTREND-FORMING': 'trend-uptrend-forming',
+                    'DOWNTREND-ACTIVE': 'trend-downtrend-active',
+                    'DOWNTREND-FORMING': 'trend-downtrend-forming',
+                    'NEUTRAL': 'trend-neutral',
+                };
+                el.innerHTML = syms.map(sym => {
+                    const d = data[sym];
+                    const cls = stateClass[d.state] || 'trend-neutral';
+                    return `<div class="trend-card ${cls}"><div class="sym">${sym}</div>` +
+                           `<div class="state">${d.state}</div></div>`;
+                }).join('');
+            });
+        }
+        setInterval(refreshTrendMeter, 5000);
+        refreshTrendMeter();
         setInterval(refreshRegime, 5000);
         refreshRegime();
         setInterval(refreshStatus, 2000);
@@ -889,6 +926,14 @@ def market_regime():
     if regime is None:
         return jsonify({"favors": None})
     return jsonify(regime)
+
+
+@app.route("/trend_meter")
+def trend_meter():
+    meter = algo.LATEST_STATE.get("trend_meter")
+    if meter is None:
+        return jsonify({})
+    return jsonify(meter)
 
 
 @app.route("/live_pnl")

@@ -4427,6 +4427,94 @@ def look_for_entry_c(state, symbol_data, bias_data, products):
 # Main loop — wrapped so it NEVER stops on its own
 # ============================================================
 
+def compute_trend_meter(state, symbol_data_a):
+    """
+    ---- NEW 2026-08-12: Market Trend-Prediction Meter ----
+    User's idea: now that Direction-Aware OI exists (see
+    oi_confirms_direction() / oi_warns_against_reversion()), combine it
+    with the 15-min EMA9/EMA20 trend-lean and RSI-momentum to classify
+    each symbol into one of 5 human-readable states, surfaced on the
+    dashboard: NEUTRAL, UPTREND-FORMING, UPTREND-ACTIVE,
+    DOWNTREND-FORMING, DOWNTREND-ACTIVE.
+
+    This is a READ-ONLY, informational display — same philosophy as
+    market-regime and OI/RSI-status: it does NOT feed back into any
+    trading-decision, it just surfaces signals the bot already computes
+    every loop, so the person watching can see the same picture the
+    algo sees, in plain language.
+
+    Classification logic (first-pass, not backtested):
+    1. DIRECTION: 15-min EMA9 vs EMA20 (from Logic-C's own indicators,
+       already computed every loop) — EMA9 > EMA20 = bullish lean,
+       EMA9 < EMA20 = bearish lean, near-equal = NEUTRAL.
+    2. STRENGTH: within a direction, "ACTIVE" (established, trading
+       with it makes sense) vs "FORMING" (early, wait for confirmation)
+       is decided by Direction-Aware OI — see oi_confirms_direction():
+       if OI is genuinely rising AND price has moved WITH this
+       direction over the same lookback, that's real conviction
+       (ACTIVE). If OI isn't confirming yet (still building, or flat),
+       it's an early/unconfirmed lean (FORMING).
+    Uses Logic A's 15-min candle data for EMA200 context isn't needed
+    here (this uses the Logic C fast/slow EMAs, but computed from
+    Logic A's dataframe since it's the shared 15-min source — see
+    look_for_entry_a's symbol_data_a).
+    """
+    now = now_ist()
+    meter = {}
+    for sym in LOGIC_C_SYMBOLS:
+        df = symbol_data_a.get(sym)
+        if df is None or len(df) == 0:
+            continue
+        row = df.iloc[-1]
+        ema9 = row.get(f"ema_{EMA_FAST_C}") if hasattr(row, "get") else None
+        ema20 = row.get(f"ema_{EMA_SLOW_C}") if hasattr(row, "get") else None
+        if ema9 is None or ema20 is None or pd.isna(ema9) or pd.isna(ema20):
+            continue
+
+        ema_diff_pct = (ema9 - ema20) / ema20 * 100
+        NEUTRAL_BAND_PCT = 0.02  # EMA9/EMA20 within this = genuinely too-close-to-call
+
+        if abs(ema_diff_pct) < NEUTRAL_BAND_PCT:
+            meter[sym] = {"state": "NEUTRAL", "label": "Neutral — no clear direction",
+                          "ema_diff_pct": round(ema_diff_pct, 4)}
+            continue
+
+        direction = "UP" if ema_diff_pct > 0 else "DOWN"
+
+        # ---- Direction-Aware OI check (informational, read-only version
+        # of oi_confirms_direction's core logic) ----
+        history = state.get("oi_history", {}).get(sym, [])
+        lookback_cutoff = now - timedelta(minutes=OI_LOOKBACK_MINUTES)
+        past_points = [h for h in history
+                       if datetime.strptime(h["time"], "%Y-%m-%d %H:%M:%S.%f") <= lookback_cutoff]
+        oi_confirms = False
+        if past_points:
+            past_oi = past_points[-1]["oi"]
+            past_price = past_points[-1].get("price")
+            current_oi, current_price = get_open_interest(sym)
+            if (current_oi is not None and current_price is not None
+                    and past_oi and past_oi > 0 and past_price and past_price > 0):
+                oi_change_pct = (current_oi - past_oi) / past_oi * 100
+                price_change_pct = (current_price - past_price) / past_price * 100
+                oi_rising = oi_change_pct >= MIN_OI_INCREASE_PCT
+                price_matches = (price_change_pct > 0) if direction == "UP" else (price_change_pct < 0)
+                oi_confirms = oi_rising and price_matches
+
+        if direction == "UP":
+            state_name = "UPTREND-ACTIVE" if oi_confirms else "UPTREND-FORMING"
+            label = ("Uptrend — active, OI confirms genuine buying" if oi_confirms
+                      else "Uptrend forming — early lean, OI not confirming yet")
+        else:
+            state_name = "DOWNTREND-ACTIVE" if oi_confirms else "DOWNTREND-FORMING"
+            label = ("Downtrend — active, OI confirms genuine selling" if oi_confirms
+                      else "Downtrend forming — early lean, OI not confirming yet")
+
+        meter[sym] = {"state": state_name, "label": label,
+                      "ema_diff_pct": round(ema_diff_pct, 4), "oi_confirms": oi_confirms}
+
+    LATEST_STATE["trend_meter"] = meter if meter else None
+
+
 def compute_market_regime(symbol_data_a):
     """
     ---- NEW FEATURE: market-regime indicator ----
@@ -4544,6 +4632,7 @@ def run_one_loop_iteration(state, products):
                 symbol_data_a[sym] = df_a
 
     compute_market_regime(symbol_data_a)
+    compute_trend_meter(state, symbol_data_a)
 
     # ---- Logic C bias data (1-hour) — only fetched when actually needed ----
     symbol_data_c_bias = {}
