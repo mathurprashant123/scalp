@@ -1020,6 +1020,27 @@ def oi_warmup_status_route():
     return jsonify(status)
 
 
+@app.route("/options_status")
+def options_status_route():
+    """---- NEW 2026-08-14: status for the Options-Bot running in the
+    SAME process/service as this futures-bot dashboard (see the
+    threading.Thread(target=options_bot.bot_loop...) call at the bottom
+    of this file). Genuinely independent state from the futures bot —
+    reads options_bot's own state file directly. ----"""
+    try:
+        import options_bot
+        state = options_bot.load_state()
+        return jsonify({
+            "dry_run": options_bot.DRY_RUN,
+            "in_golden_window": options_bot.in_golden_window(),
+            "position": state.get("position"),
+            "cooldown_until": state.get("cooldown_until"),
+            "recent_trades": state.get("trade_history", [])[-10:],
+        })
+    except Exception as e:
+        return jsonify({"error": f"Options-bot status genuinely unavailable: {e}"})
+
+
 @app.route("/live_pnl")
 def live_pnl():
     pos = algo.LATEST_STATE.get("position")
@@ -1100,4 +1121,26 @@ def _self_ping_loop():
 if __name__ == "__main__":
     print("Starting web dashboard at http://localhost:5000 ...")
     threading.Thread(target=_self_ping_loop, daemon=True).start()
+
+    # ---- NEW 2026-08-14: Options-Bot, genuinely running in the SAME
+    # Render service/process as this futures-bot dashboard (user's
+    # explicit choice — one Render service, not two). Completely
+    # independent state (options_bot_state.json vs state.json) and
+    # completely independent loop — see options_bot.py's own docstring
+    # for the full strategy. Starts in DRY_RUN mode by default (see
+    # OPTIONS_BOT_LIVE env var in options_bot.py) — genuinely no real
+    # orders until that's explicitly flipped. Import is wrapped in
+    # try/except so a problem in the (separately-tested) options-bot
+    # module can NEVER take down the existing, proven futures-bot
+    # dashboard — the two are independent enough in code that they
+    # shouldn't interfere, but this is an extra safety margin. ----
+    try:
+        import options_bot
+        threading.Thread(target=options_bot.bot_loop, daemon=True).start()
+        print(f"Options-bot thread genuinely started (DRY_RUN={options_bot.DRY_RUN}). "
+              f"Status at /options_status.")
+    except Exception as e:
+        print(f"[WARN] Options-bot genuinely failed to start ({e}) — "
+              f"futures-bot dashboard continues normally regardless.")
+
     app.run(host="0.0.0.0", port=5000, debug=False)
