@@ -560,11 +560,21 @@ PAGE_TEMPLATE = """
         .trend-downtrend-active { background:#4a1f1f; border:2px solid #E85D5D; }
         .trend-downtrend-forming { background:#3a2222; border:2px dashed #c47a7a; }
         .trend-neutral { background:#333; border:2px solid #888; }
+        #optionsBotCard { background:#1a1a2e; border:2px solid #4a4a8a; border-radius:8px;
+                           padding:14px 18px; margin-bottom:18px; font-size:14px; }
+        #optionsBotCard.hidden { display:none; }
+        #optionsBotCard h3 { margin:0 0 10px 0; font-size:16px; }
+        #optionsBotCard .obRow { display:flex; justify-content:space-between; padding:3px 0; }
+        #optionsBotCard .dryrun-badge { background:#4a4a1a; color:#e8d84a; padding:2px 10px;
+                                          border-radius:10px; font-size:12px; font-weight:bold; }
+        #optionsBotCard .live-badge { background:#4a1a1a; color:#ff6b6b; padding:2px 10px;
+                                        border-radius:10px; font-size:12px; font-weight:bold; }
     </style>
 </head>
 <body>
     <div id="regimeBanner" class="hidden"></div>
     <div id="trendMeter" class="hidden"></div>
+    <div id="optionsBotCard" class="hidden"></div>
     <div id="pnlWidget" class="flat">
         <h3>Live Trade P&amp;L</h3>
         <div class="pnl-row" style="border-bottom:1px solid #333; padding-bottom:6px; margin-bottom:6px;">
@@ -845,6 +855,46 @@ PAGE_TEMPLATE = """
         }
         setInterval(refreshTrendMeter, 5000);
         refreshTrendMeter();
+
+        function refreshOptionsBot() {
+            fetch('/options_status').then(r => r.json()).then(data => {
+                const el = document.getElementById('optionsBotCard');
+                if (!data || data.error) {
+                    el.className = 'hidden';
+                    return;
+                }
+                el.className = '';
+                const badge = data.dry_run
+                    ? '<span class="dryrun-badge">DRY-RUN (safe, no real orders)</span>'
+                    : '<span class="live-badge">LIVE (real orders)</span>';
+                const windowStatus = data.in_golden_window
+                    ? '✅ Golden-Window active (5:30-10:30 PM)'
+                    : '⏳ Outside Golden-Window — idle';
+                let posHtml = '<div class="obRow"><span>Position</span><span>No open position</span></div>';
+                if (data.position) {
+                    const p = data.position;
+                    posHtml = `<div class="obRow"><span>Position</span><span>${p.underlying} ${p.side.toUpperCase()} — ${p.symbol}</span></div>` +
+                              `<div class="obRow"><span>Entry Price</span><span>${p.entry_price}</span></div>` +
+                              `<div class="obRow"><span>TP Target</span><span>${p.tp_target_premium}</span></div>` +
+                              `<div class="obRow"><span>SL Target</span><span>${p.sl_target_premium}</span></div>`;
+                }
+                let cooldownHtml = '';
+                if (data.cooldown_until) {
+                    cooldownHtml = `<div class="obRow"><span>Cooldown until</span><span>${data.cooldown_until}</span></div>`;
+                }
+                let tradesHtml = '';
+                if (data.recent_trades && data.recent_trades.length > 0) {
+                    const last = data.recent_trades[data.recent_trades.length - 1];
+                    tradesHtml = `<div class="obRow"><span>Last trade</span><span>${last.underlying} ${last.exit_reason} PnL=${(last.pnl||0).toFixed(3)}</span></div>`;
+                }
+                el.innerHTML = `<h3>🎯 Options Trend-Bot ${badge}</h3>` +
+                                `<div class="obRow"><span>Window</span><span>${windowStatus}</span></div>` +
+                                posHtml + cooldownHtml + tradesHtml;
+            });
+        }
+        setInterval(refreshOptionsBot, 5000);
+        refreshOptionsBot();
+
         setInterval(refreshRegime, 5000);
         refreshRegime();
         setInterval(refreshStatus, 2000);
