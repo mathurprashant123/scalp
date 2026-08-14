@@ -501,15 +501,31 @@ def manage_open_position(state):
     print(f"  [EXIT] genuinely closed — PnL={pnl:.4f} — cooldown for {COOLDOWN_MINUTES}min")
 
 
-def bot_loop():
+def bot_loop(stop_event=None):
+    """
+    ---- CHANGED 2026-08-14: now accepts an optional stop_event, so this
+    can genuinely be started/stopped via the dashboard's own "Options"
+    button (see app.py's /start_options, /stop_options), same pattern
+    as the futures bot's own Start/Stop. No longer auto-starts on
+    process-boot (see the bottom of this file) — user's explicit
+    request: 3 independent buttons (Signal / Future / Options), not
+    Options tied to the process lifecycle. ----
+    """
+    def should_stop():
+        return stop_event is not None and stop_event.is_set()
+
     state = load_state()
     print(f"Options-bot starting. DRY_RUN={DRY_RUN}")
-    while True:
+    while not should_stop():
         try:
             run_one_cycle(state)
         except Exception as e:
             print(f"  [ERROR] loop exception: {e}")
-        time.sleep(LOOP_INTERVAL_SECONDS)
+        for _ in range(LOOP_INTERVAL_SECONDS):
+            if should_stop():
+                break
+            time.sleep(1)
+    print("Options-bot genuinely stopped.")
 
 
 # ============================================================
@@ -537,6 +553,11 @@ def health():
 
 
 if __name__ == "__main__":
+    # ---- Genuinely for standalone testing/running this file directly
+    # ONLY (e.g. python3 options_bot.py on its own machine). When
+    # deployed as part of the combined app.py service (the actual
+    # Render setup), THIS block never runs — app.py's own dashboard
+    # buttons (/start_options etc.) control the loop instead. ----
     t = threading.Thread(target=bot_loop, daemon=True)
     t.start()
     port = int(os.environ.get("PORT", 5001))

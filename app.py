@@ -89,6 +89,12 @@ log_buffer = []  # keeps full history for the page (capped)
 MAX_LOG_LINES = 500
 
 state_info = {"running": False, "stop_event": None, "thread": None}
+# ---- NEW 2026-08-14: separate state-tracking for the Signal-Only loop
+# and the Options-Bot loop, so all THREE can be independently
+# started/stopped (user's explicit request) instead of Options-Bot
+# only ever running tied to the full futures-trading loop. ----
+signal_info = {"running": False, "stop_event": None, "thread": None}
+options_info = {"running": False, "stop_event": None, "thread": None}
 
 
 def find_trades_csv_path(strategy="A"):
@@ -569,6 +575,14 @@ PAGE_TEMPLATE = """
                                           border-radius:10px; font-size:12px; font-weight:bold; }
         #optionsBotCard .live-badge { background:#4a1a1a; color:#ff6b6b; padding:2px 10px;
                                         border-radius:10px; font-size:12px; font-weight:bold; }
+        .bot-panel { display:flex; gap:14px; margin:16px 0; }
+        .bot-block { flex:1; text-align:center; padding:12px; background:#1a1a2e;
+                     border-radius:8px; border:1px solid #333; }
+        .bot-block button { margin:4px; padding:8px 14px; border-radius:6px; cursor:pointer;
+                             border:none; font-size:13px; }
+        .bot-block button:first-of-type { background:#1f4a2a; color:#4CAF50; }
+        .bot-block button:last-of-type { background:#4a1f1f; color:#E85D5D; }
+        .bot-block button:disabled { opacity:0.4; cursor:not-allowed; }
     </style>
 </head>
 <body>
@@ -694,10 +708,30 @@ PAGE_TEMPLATE = """
         setInterval(refreshOiWarmup, 5000);
         refreshOiWarmup();
     </script>
-    <div id="status" class="stopped">STOPPED</div>
-    <div class="buttons">
-        <button id="startBtn" onclick="startAlgo()">&#9654; START</button>
-        <button id="stopBtn" onclick="stopAlgo()" disabled>&#9632; STOP</button>
+    <!-- ---- NEW 2026-08-14: 3 genuinely-independent buttons (user's
+    explicit request) — Signal (regime+trend-meter only, no trading),
+    Future (the original full futures-trading loop, unchanged), and
+    Options (options-bot, now genuinely start/stop-able on its own,
+    no longer tied to process-boot). Each has its own status/thread —
+    starting/stopping one never affects the other two. ---- -->
+    <div class="bot-panel">
+        <div class="bot-block">
+            <div id="signalStatus" class="stopped">SIGNAL: STOPPED</div>
+            <button id="signalStartBtn" onclick="startSignal()">&#9654; Start Signal</button>
+            <button id="signalStopBtn" onclick="stopSignal()" disabled>&#9632; Stop Signal</button>
+        </div>
+        <div class="bot-block">
+            <div id="status" class="stopped">FUTURE: STOPPED</div>
+            <div class="buttons">
+                <button id="startBtn" onclick="startAlgo()">&#9654; START</button>
+                <button id="stopBtn" onclick="stopAlgo()" disabled>&#9632; STOP</button>
+            </div>
+        </div>
+        <div class="bot-block">
+            <div id="optionsRunStatus" class="stopped">OPTIONS: STOPPED</div>
+            <button id="optionsStartBtn" onclick="startOptionsBot()">&#9654; Start Options</button>
+            <button id="optionsStopBtn" onclick="stopOptionsBot()" disabled>&#9632; Stop Options</button>
+        </div>
     </div>
     <div id="log">Waiting to start...</div>
 
@@ -713,21 +747,57 @@ PAGE_TEMPLATE = """
         function stopAlgo() {
             fetch('/stop', {method:'POST'}).then(refreshStatus);
         }
+        function startSignal() {
+            fetch('/start_signal', {method:'POST'}).then(r => r.json()).then(data => {
+                if (data.already_running && data.message) alert(data.message);
+                refreshStatus();
+            });
+        }
+        function stopSignal() {
+            fetch('/stop_signal', {method:'POST'}).then(refreshStatus);
+        }
+        function startOptionsBot() {
+            fetch('/start_options', {method:'POST'}).then(r => r.json()).then(data => {
+                if (!data.ok && data.message) alert(data.message);
+                refreshStatus();
+            });
+        }
+        function stopOptionsBot() {
+            fetch('/stop_options', {method:'POST'}).then(refreshStatus);
+        }
         function refreshStatus() {
-            fetch('/status').then(r => r.json()).then(data => {
+            fetch('/all_status').then(r => r.json()).then(data => {
                 const statusDiv = document.getElementById('status');
                 const startBtn = document.getElementById('startBtn');
                 const stopBtn = document.getElementById('stopBtn');
-                if (data.running) {
-                    statusDiv.textContent = 'RUNNING';
+                if (data.future_running) {
+                    statusDiv.textContent = 'FUTURE: RUNNING';
                     statusDiv.className = 'running';
-                    startBtn.disabled = true;
-                    stopBtn.disabled = false;
+                    startBtn.disabled = true; stopBtn.disabled = false;
                 } else {
-                    statusDiv.textContent = 'STOPPED';
+                    statusDiv.textContent = 'FUTURE: STOPPED';
                     statusDiv.className = 'stopped';
-                    startBtn.disabled = false;
-                    stopBtn.disabled = true;
+                    startBtn.disabled = false; stopBtn.disabled = true;
+                }
+                const sigDiv = document.getElementById('signalStatus');
+                const sigStart = document.getElementById('signalStartBtn');
+                const sigStop = document.getElementById('signalStopBtn');
+                if (data.signal_running) {
+                    sigDiv.textContent = 'SIGNAL: RUNNING'; sigDiv.className = 'running';
+                    sigStart.disabled = true; sigStop.disabled = false;
+                } else {
+                    sigDiv.textContent = 'SIGNAL: STOPPED'; sigDiv.className = 'stopped';
+                    sigStart.disabled = false; sigStop.disabled = true;
+                }
+                const optDiv = document.getElementById('optionsRunStatus');
+                const optStart = document.getElementById('optionsStartBtn');
+                const optStop = document.getElementById('optionsStopBtn');
+                if (data.options_running) {
+                    optDiv.textContent = 'OPTIONS: RUNNING'; optDiv.className = 'running';
+                    optStart.disabled = true; optStop.disabled = false;
+                } else {
+                    optDiv.textContent = 'OPTIONS: STOPPED'; optDiv.className = 'stopped';
+                    optStart.disabled = false; optStop.disabled = true;
                 }
             });
         }
@@ -973,6 +1043,97 @@ def status():
     return jsonify({"running": truly_running})
 
 
+# ---- NEW 2026-08-14: Signal-Only Start/Stop — genuinely the SAME
+# pattern as /start and /stop above (liveness-check via the actual
+# thread object, not a stale flag), just pointed at
+# algo.signal_only_loop instead of algo.main_loop. ----
+@app.route("/start_signal", methods=["POST"])
+def start_signal():
+    with start_lock:
+        old_thread = signal_info.get("thread")
+        if old_thread is not None and old_thread.is_alive():
+            return jsonify({"ok": False, "already_running": True,
+                             "message": "Signal-loop is already running."})
+        signal_info["stop_event"] = threading.Event()
+
+        def run():
+            try:
+                algo.signal_only_loop(stop_event=signal_info["stop_event"])
+            except Exception as e:
+                log_queue.put(f"[SIGNAL FATAL ERROR] {e}")
+            finally:
+                signal_info["running"] = False
+
+        signal_info["thread"] = threading.Thread(target=run, daemon=True)
+        signal_info["running"] = True
+        signal_info["thread"].start()
+        return jsonify({"ok": True})
+
+
+@app.route("/stop_signal", methods=["POST"])
+def stop_signal():
+    if signal_info["stop_event"] is not None:
+        signal_info["stop_event"].set()
+    signal_info["running"] = False
+    return jsonify({"ok": True})
+
+
+# ---- NEW 2026-08-14: Options-Bot Start/Stop — same pattern again.
+# Options-Bot's own bot_loop() doesn't currently accept a stop_event,
+# so this uses a simple threading.Event the loop checks each cycle
+# (options_bot.py's bot_loop is updated to accept this — see that
+# file's own changelog). Genuinely independent of both Signal and
+# Future — starting/stopping this never touches either of those. ----
+@app.route("/start_options", methods=["POST"])
+def start_options():
+    with start_lock:
+        old_thread = options_info.get("thread")
+        if old_thread is not None and old_thread.is_alive():
+            return jsonify({"ok": False, "already_running": True,
+                             "message": "Options-bot is already running."})
+        try:
+            import options_bot
+        except Exception as e:
+            return jsonify({"ok": False, "message": f"Couldn't import options_bot: {e}"})
+
+        options_info["stop_event"] = threading.Event()
+
+        def run():
+            try:
+                options_bot.bot_loop(stop_event=options_info["stop_event"])
+            except Exception as e:
+                log_queue.put(f"[OPTIONS FATAL ERROR] {e}")
+            finally:
+                options_info["running"] = False
+
+        options_info["thread"] = threading.Thread(target=run, daemon=True)
+        options_info["running"] = True
+        options_info["thread"].start()
+        return jsonify({"ok": True})
+
+
+@app.route("/stop_options", methods=["POST"])
+def stop_options():
+    if options_info["stop_event"] is not None:
+        options_info["stop_event"].set()
+    options_info["running"] = False
+    return jsonify({"ok": True})
+
+
+@app.route("/all_status")
+def all_status():
+    """Genuinely-combined status of all THREE independent loops, for
+    the dashboard's 3-button panel."""
+    def is_alive(info):
+        t = info.get("thread")
+        return t is not None and t.is_alive()
+    return jsonify({
+        "future_running": is_alive(state_info),
+        "signal_running": is_alive(signal_info),
+        "options_running": is_alive(options_info),
+    })
+
+
 @app.route("/logs")
 def logs():
     drain_log_queue()
@@ -1172,25 +1333,10 @@ if __name__ == "__main__":
     print("Starting web dashboard at http://localhost:5000 ...")
     threading.Thread(target=_self_ping_loop, daemon=True).start()
 
-    # ---- NEW 2026-08-14: Options-Bot, genuinely running in the SAME
-    # Render service/process as this futures-bot dashboard (user's
-    # explicit choice — one Render service, not two). Completely
-    # independent state (options_bot_state.json vs state.json) and
-    # completely independent loop — see options_bot.py's own docstring
-    # for the full strategy. Starts in DRY_RUN mode by default (see
-    # OPTIONS_BOT_LIVE env var in options_bot.py) — genuinely no real
-    # orders until that's explicitly flipped. Import is wrapped in
-    # try/except so a problem in the (separately-tested) options-bot
-    # module can NEVER take down the existing, proven futures-bot
-    # dashboard — the two are independent enough in code that they
-    # shouldn't interfere, but this is an extra safety margin. ----
-    try:
-        import options_bot
-        threading.Thread(target=options_bot.bot_loop, daemon=True).start()
-        print(f"Options-bot thread genuinely started (DRY_RUN={options_bot.DRY_RUN}). "
-              f"Status at /options_status.")
-    except Exception as e:
-        print(f"[WARN] Options-bot genuinely failed to start ({e}) — "
-              f"futures-bot dashboard continues normally regardless.")
+    # ---- CHANGED 2026-08-14: Options-Bot no longer auto-starts here —
+    # user's explicit request: 3 genuinely independent dashboard
+    # buttons (Signal / Future / Options), each manually started/
+    # stopped, none tied to the others or to process-boot. See
+    # /start_signal, /start_options routes above. ----
 
     app.run(host="0.0.0.0", port=5000, debug=False)

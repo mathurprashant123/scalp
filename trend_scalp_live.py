@@ -56,6 +56,7 @@ def now_ist():
 
 import requests
 import pandas as pd
+import numpy as np
 from delta_rest_client import DeltaRestClient
 
 import config
@@ -528,6 +529,49 @@ OI_WARMUP_SAMPLE_INTERVAL_SECONDS = 20  # sample (near-)every loop during warm-u
 OI_INTRADE_REVERSAL_ENABLED = True
 OI_INTRADE_REVERSAL_LOOKBACK_MINUTES = 15   # shorter/more responsive than the 45-min entry-lookback
 OI_INTRADE_GRACE_MINUTES = 5                # don't check in the first few minutes after entry
+# ---- NEW 2026-08-14: Consecutive-Loss Cooldown. User's own analysis of
+# a real losing cluster (2026-08-13 21:40-00:18, BTCUSD SHORT, 5-trades-
+# in-a-row, all losses, ~92% of that period's total loss) found the bot
+# kept re-entering the SAME symbol+direction repeatedly despite repeated
+# failures, because the entry signals (EMA-cross, 1h-bias) can keep
+# re-triggering in a whipsaw even though the underlying idea has already
+# failed 2-3 times in a row. This is a simple, high-confidence circuit-
+# breaker: after COOLDOWN_TRIGGER_LOSSES consecutive losses on the SAME
+# symbol+side, pause new entries in that exact symbol+side combination
+# for COOLDOWN_HOURS real hours. A single win resets the streak. Does
+# NOT block the opposite side or the other symbol — e.g. BTCUSD-SHORT
+# cooling down doesn't stop BTCUSD-LONG or ETHUSD-SHORT.
+# COOLDOWN_HOURS chosen from the user's own back-of-envelope simulation
+# against the real losing cluster: 1-2 hours only blocked 1-2 of the 5
+# trades, while 3 hours would have blocked 3 of 5 (saving ~73% of that
+# cluster's loss) — see 2026-08-14 conversation for the exact numbers.
+# First-pass, not exhaustively backtested. ----
+COOLDOWN_ENABLED = True
+COOLDOWN_TRIGGER_LOSSES = 2     # this many consecutive losses (same symbol+side) triggers it
+COOLDOWN_HOURS = 3              # real hours to pause that exact symbol+side combination
+# ---- NEW 2026-08-14: ADX (Average Directional Index) Trend-Strength
+# Filter — Logic C ONLY. User's own insight, confirmed by comparing two
+# real 40-hour price charts (BTCUSD + ETHUSD, 2026-08-13/14) against the
+# existing regime-gate: the existing gate (compute_market_regime) uses
+# VWAP-DISTANCE as its trending/range-bound signal — but distance-from-
+# VWAP measures MAGNITUDE of deviation, not DIRECTIONAL CONSISTENCY. A
+# genuinely choppy/whipsaw market can still swing price far from VWAP in
+# BOTH directions repeatedly, which the existing gate reads as "trending"
+# even though there's no real sustained direction — exactly what both
+# charts showed during the losing BTCUSD-SHORT cluster (2026-08-13
+# 21:40-00:18, 5 trades, all losses). ADX is the standard, well-
+# established indicator for this exact distinction: it measures how
+# CONSISTENTLY price has been moving in one direction (via +DI/-DI),
+# regardless of how far. ADX >= ADX_TREND_THRESHOLD is the conventional
+# "genuinely trending" reading; below it is conventionally "range-bound/
+# choppy" even if price has swung far from its average. This is an
+# ADDITIONAL gate alongside the existing VWAP-distance regime-gate (not
+# a replacement) — Logic C must clear BOTH to trade. First-pass
+# threshold (25 is the standard textbook value), not backtested against
+# this bot's own data yet. ----
+ADX_ENABLED = True
+ADX_PERIOD = 14
+ADX_TREND_THRESHOLD = 25   # standard convention: ADX >= 25 = trending, < 20 = range-bound/choppy
 # ---- NEW 2026-08-10: Support/Resistance constants, Logic A ONLY — see
 # find_support_resistance_levels()/check_support_resistance() for full
 # reasoning. First-pass, not-yet-backtested.
@@ -1421,13 +1465,107 @@ def check_oi_reversal_exit(state, pos):
     return False, ""
 
 
+def record_trade_result(state, symbol, side, strategy, net_pnl_pct):
+    """
+    ---- NEW 2026-08-14: appends a lightweight record of every CLOSED
+    trade's outcome to state["trade_history"], keyed by symbol+side, so
+    check_cooldown_active() can look back at recent consecutive results.
+    Deliberately minimal (just enough for the cooldown check) — the full
+    trade detail already lives in the CSV trade-log via log_trade_event.
+    Trimmed to the most recent 100 entries to avoid unbounded growth in
+    state.json. ----
+    """
+    history = state.setdefault("trade_history", [])
+    history.append({
+        "symbol": symbol, "side": side, "strategy": strategy,
+        "net_pnl_pct": net_pnl_pct, "close_time": now_ist().strftime("%Y-%m-%d %H:%M:%S.%f"),
+    })
+    state["trade_history"] = history[-100:]
 
+
+def check_cooldown_active(state, symbol, side):
+    """
+    ---- NEW 2026-08-14: see COOLDOWN_ENABLED docstring above for the
+    full reasoning. Returns (is_active: bool, reason: str). Looks at the
+    most recent COOLDOWN_TRIGGER_LOSSES trades for this EXACT
+    symbol+side combination (most recent first); if ALL of them were
+    losses AND the most recent one closed within COOLDOWN_HOURS, new
+    entries in this same symbol+side are paused. A single win in that
+    window resets things naturally (the win breaks the "all losses"
+    check next time). ----
+    """
+    if not COOLDOWN_ENABLED:
+        return False, ""
+    history = state.get("trade_history", [])
+    matching = [h for h in history if h["symbol"] == symbol and h["side"] == side]
+    if len(matching) < COOLDOWN_TRIGGER_LOSSES:
+        return False, ""
+    matching.sort(key=lambda h: h["close_time"], reverse=True)
+    recent = matching[:COOLDOWN_TRIGGER_LOSSES]
+    if not all(h["net_pnl_pct"] < 0 for h in recent):
+        return False, ""
+    most_recent_loss_time = datetime.strptime(recent[0]["close_time"], "%Y-%m-%d %H:%M:%S.%f")
+    elapsed = now_ist() - most_recent_loss_time
+    if elapsed < timedelta(hours=COOLDOWN_HOURS):
+        remaining_min = (timedelta(hours=COOLDOWN_HOURS) - elapsed).total_seconds() / 60
+        reason = (f"{COOLDOWN_TRIGGER_LOSSES} consecutive losses on {symbol} {side} "
+                  f"(last closed {elapsed.total_seconds()/60:.0f}min ago) — cooling down, "
+                  f"{remaining_min:.0f}min remaining")
+        return True, reason
+    return False, ""
+
+
+def get_current_ticker_price(symbol):
     """Public endpoint — current mark/last price, used when widening a
     rejected bracket order (need fresh price to nudge levels away from)."""
     r = requests.get(f"{config.REAL_DATA_BASE_URL}/v2/tickers/{symbol}", timeout=10)
     r.raise_for_status()
     data = r.json().get("result", {})
     return float(data.get("close") or data.get("mark_price") or data.get("spot_price"))
+
+
+def compute_adx(df, period=ADX_PERIOD):
+    """
+    ---- NEW 2026-08-14: standard Wilder's ADX (Average Directional
+    Index) — self-contained here (not in trend_scalp_indicators.py) so
+    this doesn't depend on an external file being updated too. Adds an
+    "adx" column to the returned dataframe. See ADX_ENABLED docstring
+    above for why this measures DIRECTIONAL CONSISTENCY (is price
+    genuinely trending in one direction) rather than magnitude-of-move
+    (which VWAP-distance measures) — the two are genuinely different
+    things, and a choppy market can score high on one and low on the
+    other. Standard formula: +DM/-DM from consecutive high/low, smoothed
+    True Range, +DI/-DI as smoothed +DM/-DM relative to smoothed TR, DX
+    as the normalized difference between +DI/-DI, ADX as a smoothed
+    average of DX. Uses Wilder's original smoothing (equivalent to an
+    EWM with alpha=1/period), the textbook-standard approach. ----
+    """
+    df = df.copy()
+    high, low, close = df["high"], df["low"], df["close"]
+
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    prev_close = close.shift()
+    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
+                    axis=1).max(axis=1)
+
+    atr_smooth = tr.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    plus_dm_smooth = pd.Series(plus_dm, index=df.index).ewm(
+        alpha=1 / period, adjust=False, min_periods=period).mean()
+    minus_dm_smooth = pd.Series(minus_dm, index=df.index).ewm(
+        alpha=1 / period, adjust=False, min_periods=period).mean()
+
+    plus_di = 100 * (plus_dm_smooth / atr_smooth.replace(0, np.nan))
+    minus_di = 100 * (minus_dm_smooth / atr_smooth.replace(0, np.nan))
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+
+    df["adx"] = dx.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    df["plus_di"] = plus_di
+    df["minus_di"] = minus_di
+    return df
 
 
 def get_exec_price(symbol, real_market_price):
@@ -2756,6 +2894,12 @@ def manage_open_position(state, symbol_data):
                 strategy=actual_strategy, real_exit_price=real_exit_price, real_fee_amount=real_fee_amount,
             )
             state["position"] = None
+            # ---- NEW 2026-08-14: this exchange_bracket_closed path is
+            # genuinely the MOST COMMON close-path (SL/TP triggering on
+            # the exchange before the local check catches it) — the
+            # consecutive-loss cooldown tracker needs this outcome too,
+            # not just the (rarer) locally-initiated close path. ----
+            record_trade_result(state, sym, side, actual_strategy, net_pnl_pct)
             return
         else:
             pos["_zero_size_confirmations"] = 0
@@ -2955,6 +3099,8 @@ def _close_position(state, pos, price, reason, size):
             if strategy == "B":
                 state["last_trade_close_time_b"] = time.time()
             state["position"] = None
+            # ---- NEW 2026-08-14: cooldown-tracker needs this outcome too. ----
+            record_trade_result(state, sym, side, strategy, net_pnl_pct)
             return
         else:
             raise  # unknown error — let the outer loop's error handler log it
@@ -3015,6 +3161,9 @@ def _close_position(state, pos, price, reason, size):
     print(f"  CLOSED {sym} due to {reason} (filled via {method}), "
           f"approx gross P&L: {gross_pnl_pct:+.3f}% "
           f"(approx net after fees: {net_pnl_pct:+.3f}%)")
+    # ---- NEW 2026-08-14: feed this outcome into the consecutive-loss
+    # cooldown tracker (see COOLDOWN_ENABLED docstring). ----
+    record_trade_result(state, sym, side, pos.get("strategy", "A"), net_pnl_pct)
     if strategy == "B":
         state["last_trade_close_time_b"] = time.time()
     if strategy == "A" and pos.get("exchange_safety_stop_active"):
@@ -3751,12 +3900,12 @@ def look_for_entry_a(state, symbol_data, products):
               f"CVD_now={cvd_now:.1f} rising={cvd_rising_flag} falling={cvd_falling_flag}")
         print_oi_status(state, sym)
 
-        # ---- NEW 2026-08-12: informational-only RSI (momentum) status.
-        # VWAP tells us WHERE price is; RSI tells us HOW FAST it got there
-        # — genuinely different questions. Not a gate yet (see
-        # RSI_OVERSOLD/RSI_OVERBOUGHT docstring above), just surfaced
-        # here the same way OI-status is, so real data can inform whether
-        # to make it an actual filter later. ----
+        # ---- NEW 2026-08-12, UPGRADED TO ACTUAL FILTER 2026-08-14:
+        # RSI (momentum) status. VWAP tells us WHERE price is; RSI tells
+        # us HOW FAST it got there — genuinely different questions. The
+        # actual filter check happens further below (after side is
+        # determined) — this print is just the informational display,
+        # kept for visibility even on loops where side never gets set. ----
         rsi_val = row.get("rsi") if hasattr(row, "get") else (row["rsi"] if "rsi" in row.index else None)
         if rsi_val is not None and pd.notna(rsi_val):
             rsi_zone = ("OVERSOLD" if rsi_val < RSI_OVERSOLD
@@ -3827,12 +3976,39 @@ def look_for_entry_a(state, symbol_data, products):
             print(f"    -> SKIP: invalid stop distance")
             continue
 
+        # ---- CHANGED 2026-08-14: RSI upgraded from informational-only
+        # to an ACTUAL filter (see RSI_OVERSOLD/RSI_OVERBOUGHT docstring
+        # above — this was flagged 2026-08-12 as "print now, filter
+        # later once we have real data to judge it by"). Requires
+        # genuine momentum-exhaustion in the SAME direction as the
+        # mean-reversion trade: LONG needs RSI<RSI_OVERSOLD (price has
+        # genuinely fallen too far, momentum spent), SHORT needs
+        # RSI>RSI_OVERBOUGHT. Fails open (doesn't block) if RSI data
+        # isn't ready yet, same fail-open philosophy as OI. ----
+        rsi_val = row.get("rsi") if hasattr(row, "get") else (row["rsi"] if "rsi" in row.index else None)
+        if rsi_val is not None and pd.notna(rsi_val):
+            if side == "long" and rsi_val >= RSI_OVERSOLD:
+                print(f"    -> SKIP: RSI={rsi_val:.1f} isn't oversold (<{RSI_OVERSOLD}) — "
+                      f"momentum doesn't look genuinely exhausted enough for a LONG bounce yet.")
+                continue
+            if side == "short" and rsi_val <= RSI_OVERBOUGHT:
+                print(f"    -> SKIP: RSI={rsi_val:.1f} isn't overbought (>{RSI_OVERBOUGHT}) — "
+                      f"momentum doesn't look genuinely exhausted enough for a SHORT bounce yet.")
+                continue
+
         # ---- NEW 2026-08-10: Support/Resistance gate. Directly
         # motivated by a real, live example — Logic A took a SHORT at a
         # SUPPORT level (structurally wrong: support should favor
         # LONGs). See check_support_resistance() docstring for full
         # reasoning. Logic-A-ONLY (mean-reversion-specific). ----
         if not check_support_resistance(df, i, side, price):
+            continue
+
+        # ---- NEW 2026-08-14: Consecutive-Loss Cooldown check. See
+        # COOLDOWN_ENABLED docstring for the full reasoning. ----
+        cooldown_active, cooldown_reason = check_cooldown_active(state, sym, side)
+        if cooldown_active:
+            print(f"    -> SKIP: {cooldown_reason}")
             continue
 
         # ---- NEW 2026-08-12: Direction-aware OI warning-check.
@@ -4297,6 +4473,21 @@ def look_for_entry_c(state, symbol_data, bias_data, products):
                   f"(>= {WHIPSAW_MAX_CROSSES_C} threshold, choppy-looking stretch).")
             continue
 
+        # ---- NEW 2026-08-14: ADX trend-strength gate. See ADX_ENABLED
+        # docstring above — this is an ADDITIONAL check on top of the
+        # existing VWAP-distance regime-gate and the whipsaw-count filter
+        # above, catching genuinely non-trending conditions that those
+        # two can miss (both measure something OTHER than directional
+        # consistency). ----
+        if ADX_ENABLED and "adx" in df.columns:
+            adx_val = df["adx"].iloc[i]
+            if pd.notna(adx_val) and adx_val < ADX_TREND_THRESHOLD:
+                print(f"    -> SKIP: {sym} ADX={adx_val:.1f} is below the "
+                      f"{ADX_TREND_THRESHOLD} trending-threshold — price direction doesn't "
+                      f"look genuinely consistent enough right now, even though EMA9/EMA20 "
+                      f"crossed.")
+                continue
+
         # ---- BUG FIX 2026-08-06: a 15-min candle stays the "current" one
         # for up to 15 minutes, but this loop runs roughly every 20-30
         # seconds — so a single crossover could be seen as "True" on
@@ -4386,6 +4577,14 @@ def look_for_entry_c(state, symbol_data, bias_data, products):
             if bullish_trend or bearish_trend:
                 print(f"    -> SKIP: 15-min trend-state doesn't match "
                       f"the 1-hour bias ({bias_label})")
+            continue
+
+        # ---- NEW 2026-08-14: Consecutive-Loss Cooldown check. See
+        # COOLDOWN_ENABLED docstring — real losing cluster (5 straight
+        # BTCUSD SHORT losses, 2026-08-13) motivated this. ----
+        cooldown_active, cooldown_reason = check_cooldown_active(state, sym, side)
+        if cooldown_active:
+            print(f"    -> SKIP: {cooldown_reason}")
             continue
 
         # ---- NEW 2026-08-10: Open-Interest confirmation. Same reasoning
@@ -4656,6 +4855,77 @@ def compute_trend_meter(state, symbol_data_a):
     LATEST_STATE["trend_meter"] = meter if meter else None
 
 
+def run_one_signal_only_iteration(state):
+    """
+    ---- NEW 2026-08-14: "Signal-Only" loop. User's own idea: decouple
+    the market_regime/trend_meter computation from the FULL futures-
+    trading loop (run_one_loop_iteration), so a person can run JUST the
+    signal-computation (for the Options-Bot to consume) WITHOUT also
+    running real futures trades — genuinely 3 independent buttons now:
+    1. Signal  — this function, computes market_regime + trend_meter
+       only, NO order-placement, NO position-management, ever.
+    2. Future  — the existing full run_one_loop_iteration (real trading).
+    3. Options — options_bot.py's own loop (reads LATEST_STATE from
+       whichever of Signal/Future is currently running).
+
+    Genuinely the EXACT SAME candle-fetch + indicator-computation code
+    as run_one_loop_iteration's Logic-A data-block (copied, not a
+    different implementation) — so Signal-only and the full Future-loop
+    always compute IDENTICAL regime/trend_meter numbers when both run
+    the same instant. Does NOT call sample_oi_history, apply_pending_
+    updates, or any entry/position logic — genuinely read-only. ----
+    """
+    symbol_data_a = {}
+    for sym in SYMBOLS_TO_WATCH:
+        try:
+            df_a = fetch_candles(sym, hours=LOGIC_A_LOOKBACK_HOURS, resolution=LOGIC_A_RESOLUTION)
+        except Exception as e:
+            print(f"  [SIGNAL] [ERROR] {sym}: candle-fetch failed ({e}) — skipping")
+            df_a = None
+        if df_a is not None and len(df_a) >= EMA_PERIOD + 5:
+            df_a = compute_ema(df_a, period=EMA_PERIOD)
+            df_a = compute_vwap(df_a)
+            df_a = compute_cvd(df_a)
+            if len(df_a) >= RSI_PERIOD + 5:
+                df_a = compute_rsi(df_a, period=RSI_PERIOD)
+            if len(df_a) >= EMA_SLOW_C + ATR_PERIOD + 5:
+                df_a = compute_ema(df_a, period=EMA_FAST_C)
+                df_a = compute_ema(df_a, period=EMA_SLOW_C)
+                df_a = compute_atr(df_a, period=ATR_PERIOD)
+            if len(df_a) >= ADX_PERIOD * 2 + 5:
+                df_a = compute_adx(df_a, period=ADX_PERIOD)
+            symbol_data_a[sym] = df_a
+
+    for _oi_symbol in LOGIC_C_SYMBOLS:
+        sample_oi_history(state, _oi_symbol)  # trend_meter's OI-confirm needs this history
+
+    compute_market_regime(symbol_data_a)
+    compute_trend_meter(state, symbol_data_a)
+    print(f"  [SIGNAL] regime={LATEST_STATE.get('market_regime', {}).get('label') if LATEST_STATE.get('market_regime') else None} "
+          f"trend_meter={ {s: v.get('state') for s, v in (LATEST_STATE.get('trend_meter') or {}).items()} }")
+
+
+def signal_only_loop(stop_event=None):
+    """Runs run_one_signal_only_iteration on a loop, same cadence as
+    the full futures loop, until stop_event is set. Genuinely its own
+    state file (signal_only_state.json) — only used for OI-history
+    persistence, never touches the real trading state.json."""
+    def should_stop():
+        return stop_event is not None and stop_event.is_set()
+
+    state = {"oi_history": {}}
+    print("Signal-Only loop starting — computing market_regime + trend_meter, NO trading.")
+    while not should_stop():
+        try:
+            run_one_signal_only_iteration(state)
+        except Exception as e:
+            print(f"  [SIGNAL] [ERROR] {e}")
+        for _ in range(LOOP_INTERVAL_SECONDS):
+            if should_stop():
+                break
+            time.sleep(1)
+
+
 def compute_market_regime(symbol_data_a):
     """
     ---- NEW FEATURE: market-regime indicator ----
@@ -4792,6 +5062,8 @@ def run_one_loop_iteration(state, products):
                     df_a = compute_ema(df_a, period=EMA_FAST_C)
                     df_a = compute_ema(df_a, period=EMA_SLOW_C)
                     df_a = compute_atr(df_a, period=ATR_PERIOD)
+                if len(df_a) >= ADX_PERIOD * 2 + 5:
+                    df_a = compute_adx(df_a, period=ADX_PERIOD)
                 symbol_data_a[sym] = df_a
 
     compute_market_regime(symbol_data_a)
