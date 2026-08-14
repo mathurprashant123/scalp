@@ -223,47 +223,62 @@ def find_strike_n_away(chain, atm_strike_price, option_type, n, direction):
 
 
 # ============================================================
-# Signal detection: Market-Regime "B" + Trend-Meter + ADX
+# Signal detection: Genuinely REUSES the futures bot's OWN live
+# Market-Regime + Trend-Meter (via LATEST_STATE) — user's explicit
+# instruction, 2026-08-14: "future wale environment/trending mode
+# lagao, alag se kuch nahi" — no separate re-implementation. Since
+# options_bot.py runs in the SAME process as the futures-bot dashboard
+# (see app.py's threading.Thread(target=options_bot.bot_loop...)),
+# trend_scalp_live's own loop is ALREADY computing these every ~20
+# seconds and writing them into trend_scalp_live.LATEST_STATE — this
+# just reads that directly, genuinely the exact same numbers the
+# futures-bot dashboard itself shows. ADX stays as options-bot's own
+# additional check (not present in the futures bot at all originally,
+# added here as agreed 2026-08-14 for the options-specific "genuinely
+# fast enough move" requirement) — but the underlying direction+regime
+# read is now genuinely identical to the futures bot's.
 # ============================================================
 def detect_signal(underlying_symbol, futures_symbol):
     """Returns ("long"/"short"/None, debug_info_dict)."""
+    try:
+        import trend_scalp_live as algo
+    except ImportError:
+        return None, {"reason": "trend_scalp_live genuinely not importable — "
+                                 "options-bot must run in the same process as app.py"}
+
+    regime = algo.LATEST_STATE.get("market_regime")
+    if regime is None or regime.get("favors") != "B":
+        label = regime.get("label") if regime else "not-computed-yet"
+        return None, {"reason": f"Futures-bot's own regime is genuinely NOT 'B' "
+                                 f"(currently: {label})"}
+
+    meter = algo.LATEST_STATE.get("trend_meter")
+    if meter is None or underlying_symbol + "USD" not in meter:
+        return None, {"reason": f"Futures-bot's own Trend-Meter has no reading yet for "
+                                 f"{underlying_symbol}"}
+    symbol_meter = meter[underlying_symbol + "USD"]
+    state_label = symbol_meter.get("state")
+
+    # ---- ADX: options-bot's own additional speed/consistency check,
+    # computed here since the futures bot doesn't use ADX at all. ----
     df = fetch_candles(futures_symbol, hours=6, resolution="15m")
     if df is None or len(df) < ADX_PERIOD * 2 + 5:
-        return None, {"reason": "not enough candle data yet"}
-
-    df = compute_vwap(df)
-    df = compute_ema(df, 9)
-    df = compute_ema(df, 20)
+        return None, {"reason": "not enough candle data yet for ADX"}
     df = compute_adx(df, ADX_PERIOD)
-
-    last = df.iloc[-1]
-    price, vwap = last["close"], last["vwap"]
-    if pd.isna(vwap) or price == 0:
-        return None, {"reason": "VWAP not ready yet"}
-    vwap_dist_pct = abs(price - vwap) / price * 100
-
-    # Market-Regime "B" check (Strong-Trend) — same logic as the
-    # futures bot's compute_market_regime, self-contained here.
-    regime_is_b = vwap_dist_pct >= VWAP_PROXIMITY_PCT * REGIME_B_MULTIPLIER
-    if not regime_is_b:
-        return None, {"reason": f"Regime not 'B' (VWAP-dist={vwap_dist_pct:.3f}%, "
-                                 f"need>={VWAP_PROXIMITY_PCT * REGIME_B_MULTIPLIER:.3f}%)"}
-
-    adx_val = last["adx"]
+    adx_val = df["adx"].iloc[-1]
     if pd.isna(adx_val) or adx_val < ADX_TREND_THRESHOLD:
-        return None, {"reason": f"ADX={adx_val:.1f} below threshold {ADX_TREND_THRESHOLD}"}
+        return None, {"reason": f"Futures-bot regime is 'B' and Trend-Meter says "
+                                 f"{state_label}, but ADX={adx_val:.1f} is below "
+                                 f"threshold {ADX_TREND_THRESHOLD}"}
 
-    ema9, ema20 = last["ema_9"], last["ema_20"]
-    if pd.isna(ema9) or pd.isna(ema20):
-        return None, {"reason": "EMA not ready yet"}
-
-    if ema9 > ema20:
-        return "long", {"reason": "UPTREND: regime=B, ADX confirmed, EMA9>EMA20",
-                         "vwap_dist_pct": round(vwap_dist_pct, 3), "adx": round(adx_val, 1)}
-    elif ema9 < ema20:
-        return "short", {"reason": "DOWNTREND: regime=B, ADX confirmed, EMA9<EMA20",
-                          "vwap_dist_pct": round(vwap_dist_pct, 3), "adx": round(adx_val, 1)}
-    return None, {"reason": "EMA9==EMA20, no clear direction"}
+    if state_label in ("UPTREND-ACTIVE", "UPTREND-FORMING"):
+        return "long", {"reason": f"Futures-bot regime=B, Trend-Meter={state_label}, "
+                                   f"ADX={adx_val:.1f} confirmed", "adx": round(adx_val, 1)}
+    elif state_label in ("DOWNTREND-ACTIVE", "DOWNTREND-FORMING"):
+        return "short", {"reason": f"Futures-bot regime=B, Trend-Meter={state_label}, "
+                                    f"ADX={adx_val:.1f} confirmed", "adx": round(adx_val, 1)}
+    return None, {"reason": f"Trend-Meter state '{state_label}' genuinely not "
+                             f"UP/DOWN (probably NEUTRAL)"}
 
 
 # ============================================================
