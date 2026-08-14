@@ -4,3 +4,4 @@ pandas
 numpy
 gunicorn
 delta-rest-client
+python-dotenv
