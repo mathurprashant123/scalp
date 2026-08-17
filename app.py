@@ -491,6 +491,87 @@ def trades_page():
         csv_path=path or "not found yet", strategy=strategy)
 
 
+OPTIONS_TRADES_PAGE_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Options-Bot Trades Log</title>
+    <meta charset="utf-8">
+    <style>
+        body { background:#1e1e1e; color:#ddd; font-family: 'Segoe UI', sans-serif; margin:0; padding:20px; }
+        h1, h2 { text-align:center; }
+        a.back { color:#4A90D9; text-decoration:none; display:block; text-align:center; margin-bottom:15px; }
+        table { border-collapse: collapse; width:100%; margin-bottom: 25px; background:#0d0d0d; }
+        th, td { border:1px solid #333; padding:8px 10px; font-size:13px; text-align:center; }
+        th { background:#1a3c6e; color:white; }
+        tr.win { background:#0d2e0d; }
+        tr.loss { background:#2e0d0d; }
+        .summary-box { background:#0d0d0d; border-radius:8px; padding:15px 25px; margin: 0 auto 25px auto;
+                       max-width: 500px; text-align:center; font-size:16px; }
+        .pos { color:#4CAF50; font-weight:bold; }
+        .neg { color:#E85D5D; font-weight:bold; }
+        .dryrun-badge { background:#4a4a1a; color:#e8d84a; padding:4px 14px; border-radius:10px;
+                        font-size:13px; font-weight:bold; }
+        .live-badge { background:#4a1a1a; color:#ff6b6b; padding:4px 14px; border-radius:10px;
+                      font-size:13px; font-weight:bold; }
+    </style>
+</head>
+<body>
+    <a class="back" href="/">&larr; Back to Dashboard</a>
+    <h1>Options-Bot Trades Log</h1>
+    <div style="text-align:center; margin-bottom:15px;">
+        <span class="{{ 'dryrun-badge' if dry_run else 'live-badge' }}">
+            {{ 'DRY-RUN (no real orders)' if dry_run else 'LIVE (real orders)' }}
+        </span>
+    </div>
+
+    <div class="summary-box">
+        <div>Total Trades: <b>{{ total_trades }}</b></div>
+        <div>Wins: <span class="pos">{{ wins }}</span> &nbsp;|&nbsp; Losses: <span class="neg">{{ losses }}</span>
+             {% if total_trades > 0 %}&nbsp;|&nbsp; Win-Rate: <b>{{ '%.0f'|format(wins/total_trades*100) }}%</b>{% endif %}</div>
+        <div>Cumulative Gross P&amp;L: <span class="{{ 'pos' if cum_gross >= 0 else 'neg' }}">{{ '%.4f'|format(cum_gross) }}</span></div>
+        <div>Cumulative Fees+GST: <span class="neg">{{ '%.4f'|format(cum_fees) }}</span></div>
+        <div>Cumulative Net P&amp;L: <span class="{{ 'pos' if cum_net >= 0 else 'neg' }}">{{ '%.4f'|format(cum_net) }}</span></div>
+    </div>
+
+    <h2>Day-by-Day Summary</h2>
+    <table>
+        <tr><th>Date</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Day Net-P&amp;L</th></tr>
+        {% for day, s in day_summary.items() %}
+        <tr>
+            <td>{{ day }}</td><td>{{ s.count }}</td><td>{{ s.wins }}</td><td>{{ s.losses }}</td>
+            <td class="{{ 'pos' if s.pnl >= 0 else 'neg' }}">{{ '%.4f'|format(s.pnl) }}</td>
+        </tr>
+        {% endfor %}
+    </table>
+
+    <h2>Trade-by-Trade Detail</h2>
+    <table>
+        <tr>
+            <th>Entry Time</th><th>Underlying</th><th>Side</th><th>Symbol</th>
+            <th>Entry-Premium</th><th>Exit-Premium</th><th>Exit Time</th><th>Reason</th>
+            <th>Gross P&amp;L</th><th>Fees+GST</th><th>Net P&amp;L</th>
+        </tr>
+        {% for t in trades %}
+        <tr class="{{ 'win' if t.pnl > 0 else 'loss' }}">
+            <td>{{ t.entry_time }}</td><td>{{ t.underlying }}</td><td>{{ t.side }}</td>
+            <td>{{ t.symbol }}</td><td>{{ '%.4f'|format(t.entry_price) }}</td>
+            <td>{{ '%.4f'|format(t.exit_price) }}</td><td>{{ t.exit_time }}</td>
+            <td>{{ t.exit_reason }}</td>
+            <td class="{{ 'pos' if t.gross_pnl >= 0 else 'neg' }}">{{ '%.4f'|format(t.gross_pnl) }}</td>
+            <td class="neg">{{ '%.4f'|format(t.fees_with_gst) }}</td>
+            <td class="{{ 'pos' if t.pnl >= 0 else 'neg' }}">{{ '%.4f'|format(t.pnl) }}</td>
+        </tr>
+        {% endfor %}
+        {% if trades|length == 0 %}
+        <tr><td colspan="11">Genuinely koई trade abhi tak nahi hui.</td></tr>
+        {% endif %}
+    </table>
+</body>
+</html>
+"""
+
+
 class WebLogRedirector:
     """Captures print() output from the algo into our log buffer."""
     def write(self, message):
@@ -955,11 +1036,15 @@ PAGE_TEMPLATE = """
                 let tradesHtml = '';
                 if (data.recent_trades && data.recent_trades.length > 0) {
                     const last = data.recent_trades[data.recent_trades.length - 1];
-                    tradesHtml = `<div class="obRow"><span>Last trade</span><span>${last.underlying} ${last.exit_reason} PnL=${(last.pnl||0).toFixed(3)}</span></div>`;
+                    tradesHtml = `<div class="obRow"><span>Last trade</span><span>${last.underlying} ${last.exit_reason} Net-PnL=${(last.pnl||0).toFixed(4)}</span></div>` +
+                                 `<div class="obRow"><span>&nbsp;&nbsp;(Gross / Fees+GST)</span><span>${(last.gross_pnl||0).toFixed(4)} / ${(last.fees_with_gst||0).toFixed(4)}</span></div>`;
                 }
                 el.innerHTML = `<h3>🎯 Options Trend-Bot ${badge}</h3>` +
                                 `<div class="obRow"><span>Window</span><span>${windowStatus}</span></div>` +
-                                posHtml + cooldownHtml + tradesHtml;
+                                posHtml + cooldownHtml + tradesHtml +
+                                `<div style="text-align:center; margin-top:8px;">` +
+                                `<a href="/options_trades" style="color:#4A90D9; font-size:12px;">` +
+                                `📊 Poора Options Trades Log Dekhein &rarr;</a></div>`;
             });
         }
         setInterval(refreshOptionsBot, 5000);
@@ -1250,6 +1335,48 @@ def options_status_route():
         })
     except Exception as e:
         return jsonify({"error": f"Options-bot status genuinely unavailable: {e}"})
+
+
+@app.route("/options_trades")
+def options_trades_page():
+    """---- NEW 2026-08-14: genuinely a full trades-log page for the
+    Options-Bot, matching the exact style of the futures bot's own
+    /trades page — direct answer to "abhi kaise pata chalega sahi chal
+    raha hai ya nahi": this shows EVERY dry-run (or live) trade, a
+    win/loss summary, and cumulative net-PnL (fees+GST already
+    deducted, see estimate_options_fee in options_bot.py), not just
+    the single "last trade" the dashboard card shows. ----"""
+    try:
+        import options_bot
+        state = options_bot.load_state()
+        trades = list(reversed(state.get("trade_history", [])))
+        wins = sum(1 for t in trades if t.get("pnl", 0) > 0)
+        losses = len(trades) - wins
+        cum_gross = sum(t.get("gross_pnl", 0) for t in trades)
+        cum_fees = sum(t.get("fees_with_gst", 0) for t in trades)
+        cum_net = sum(t.get("pnl", 0) for t in trades)
+
+        day_summary = {}
+        for t in trades:
+            day = (t.get("exit_time") or "")[:10]
+            if not day:
+                continue
+            if day not in day_summary:
+                day_summary[day] = {"count": 0, "wins": 0, "losses": 0, "pnl": 0.0}
+            day_summary[day]["count"] += 1
+            pnl_val = t.get("pnl", 0)
+            day_summary[day]["pnl"] += pnl_val
+            if pnl_val > 0:
+                day_summary[day]["wins"] += 1
+            else:
+                day_summary[day]["losses"] += 1
+
+        return render_template_string(
+            OPTIONS_TRADES_PAGE_TEMPLATE, trades=trades, total_trades=len(trades),
+            wins=wins, losses=losses, cum_gross=cum_gross, cum_fees=cum_fees, cum_net=cum_net,
+            day_summary=day_summary, dry_run=options_bot.DRY_RUN)
+    except Exception as e:
+        return f"Options-bot trades genuinely unavailable: {e}", 500
 
 
 @app.route("/live_pnl")

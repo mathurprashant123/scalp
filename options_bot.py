@@ -75,6 +75,23 @@ LIMIT_CHASE_INTERVAL_SECONDS = 10
 LOOP_INTERVAL_SECONDS = 20
 BUDGET_PCT_OF_WALLET = 0.125       # midpoint of agreed 10-15%
 UNDERLYINGS = [("BTC", "BTCUSD"), ("ETH", "ETHUSD")]
+# ---- NEW 2026-08-14: Options fees + GST — user's direct question
+# "profit milta hai toh fees+GST nikal jayegi kya?" exposed a genuine
+# gap: PnL was being computed as pure gross (exit-entry), with no fee
+# accounting at all — unlike the futures bot, which has always been
+# fee-aware. Verified via Delta Exchange's own official support docs
+# (delta.exchange/support, delta.exchange/fees, cross-checked against
+# multiple independent sources, 2026-08-14): Options maker AND taker
+# fee are both 0.03% of NOTIONAL value (not premium), GST is 18% on
+# top of the fee, and the fee is CAPPED at 3.5% of the premium
+# (protects deep-OTM/cheap-premium trades from disproportionate fees).
+# Notional value = underlying spot price × contract_value × size —
+# same contract_value convention as the futures bot (0.001 BTC per
+# lot, 0.01 ETH per lot). ----
+OPTIONS_FEE_PCT_OF_NOTIONAL = 0.0003   # 0.03%, maker AND taker (options fees don't differ)
+OPTIONS_GST_RATE = 0.18                 # 18% GST on the fee amount
+OPTIONS_FEE_CAP_PCT_OF_PREMIUM = 0.035  # fee capped at 3.5% of premium
+CONTRACT_VALUE = {"BTC": 0.001, "ETH": 0.01}
 
 LATEST_STATE = {"position": None, "last_action": None}
 
@@ -334,6 +351,21 @@ def get_order_state(order_id):
     return r.json()
 
 
+def estimate_options_fee(underlying, spot_price, premium, size=1):
+    """
+    ---- NEW 2026-08-14: see OPTIONS_FEE_PCT_OF_NOTIONAL docstring
+    above for the full reasoning/sourcing. Returns the fee (INCLUDING
+    GST) for ONE leg (entry OR exit) — call it once for entry, once
+    for exit, and subtract both from gross PnL to get net. ----
+    """
+    contract_value = CONTRACT_VALUE.get(underlying, 0.001)
+    notional_value = spot_price * contract_value * size
+    fee_pct_based = notional_value * OPTIONS_FEE_PCT_OF_NOTIONAL
+    fee_cap = premium * size * OPTIONS_FEE_CAP_PCT_OF_PREMIUM
+    fee_before_gst = min(fee_pct_based, fee_cap)
+    return fee_before_gst * (1 + OPTIONS_GST_RATE)
+
+
 def limit_order_chase(product_id, side, size, get_current_price_fn, reduce_only=False,
                        max_seconds=120, label=""):
     """
@@ -445,6 +477,7 @@ def run_one_cycle(state):
             "underlying": underlying, "symbol": atm["symbol"], "product_id": product_id,
             "side": side, "entry_price": result["fill_price"],
             "entry_time": now.strftime("%Y-%m-%d %H:%M:%S.%f"),
+            "entry_spot_price": spot,  # ---- NEW 2026-08-14: needed for fee calculation ----
             "tp_target_premium": float(tp_ref.get("mark_price")),
             "sl_target_premium": float(sl_ref.get("mark_price")),
             "option_type": option_type,
@@ -487,10 +520,23 @@ def manage_open_position(state):
     result = limit_order_chase(pos["product_id"], "sell", 1, get_bid, reduce_only=True,
                                 label=f"{pos['underlying']}-EXIT-{reason}")
     exit_price = result.get("fill_price") or current_premium
-    pnl = exit_price - pos["entry_price"]
+    gross_pnl = exit_price - pos["entry_price"]
+
+    # ---- NEW 2026-08-14: genuinely deduct fees+GST — see
+    # estimate_options_fee() / OPTIONS_FEE_PCT_OF_NOTIONAL docstrings
+    # for the full reasoning. User's direct question: "profit milta hai
+    # toh fees+GST nikal jaayegi kya?" — answer: yes, and now the code
+    # genuinely reflects that instead of showing pure gross PnL. ----
+    entry_spot = pos.get("entry_spot_price")
+    exit_spot = get_spot_price(pos["underlying"] + "USD") or entry_spot
+    entry_fee = estimate_options_fee(pos["underlying"], entry_spot, pos["entry_price"]) if entry_spot else 0.0
+    exit_fee = estimate_options_fee(pos["underlying"], exit_spot, exit_price) if exit_spot else 0.0
+    total_fees = entry_fee + exit_fee
+    net_pnl = gross_pnl - total_fees
 
     trade_record = {**pos, "exit_price": exit_price, "exit_reason": reason,
-                     "exit_time": now.strftime("%Y-%m-%d %H:%M:%S.%f"), "pnl": pnl}
+                     "exit_time": now.strftime("%Y-%m-%d %H:%M:%S.%f"),
+                     "gross_pnl": gross_pnl, "fees_with_gst": total_fees, "pnl": net_pnl}
     state.setdefault("trade_history", []).append(trade_record)
     state["trade_history"] = state["trade_history"][-100:]
     state["position"] = None
@@ -498,7 +544,8 @@ def manage_open_position(state):
     save_state(state)
     LATEST_STATE["position"] = None
     LATEST_STATE["last_action"] = trade_record
-    print(f"  [EXIT] genuinely closed — PnL={pnl:.4f} — cooldown for {COOLDOWN_MINUTES}min")
+    print(f"  [EXIT] genuinely closed — Gross-PnL={gross_pnl:.4f}, Fees+GST={total_fees:.4f}, "
+          f"Net-PnL={net_pnl:.4f} — cooldown for {COOLDOWN_MINUTES}min")
 
 
 def bot_loop(stop_event=None):
