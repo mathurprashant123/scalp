@@ -1018,20 +1018,21 @@ PAGE_TEMPLATE = """
                 const badge = data.dry_run
                     ? '<span class="dryrun-badge">DRY-RUN (safe, no real orders)</span>'
                     : '<span class="live-badge">LIVE (real orders)</span>';
-                const windowStatus = data.in_golden_window
-                    ? '✅ Golden-Window active (5:30-10:30 PM)'
-                    : '⏳ Outside Golden-Window — idle';
-                let posHtml = '<div class="obRow"><span>Position</span><span>No open position</span></div>';
-                if (data.position) {
-                    const p = data.position;
-                    posHtml = `<div class="obRow"><span>Position</span><span>${p.underlying} ${p.side.toUpperCase()} — ${p.symbol}</span></div>` +
-                              `<div class="obRow"><span>Entry Price</span><span>${p.entry_price}</span></div>` +
-                              `<div class="obRow"><span>TP Target</span><span>${p.tp_target_premium}</span></div>` +
-                              `<div class="obRow"><span>SL Target</span><span>${p.sl_target_premium}</span></div>`;
-                }
-                let cooldownHtml = '';
-                if (data.cooldown_until) {
-                    cooldownHtml = `<div class="obRow"><span>Cooldown until</span><span>${data.cooldown_until}</span></div>`;
+                // ---- CHANGED 2026-08-17: Golden-Window removed, BTC
+                // and ETH positions shown side-by-side (both can be
+                // genuinely open at once now). ----
+                let posHtml = '';
+                const positions = data.positions || {};
+                for (const sym of ['BTC', 'ETH']) {
+                    const p = positions[sym];
+                    if (p) {
+                        posHtml += `<div class="obRow"><span>${sym} Position</span><span>${p.side.toUpperCase()} — ${p.symbol} (size=${p.size||1})</span></div>` +
+                                   `<div class="obRow"><span>&nbsp;&nbsp;Entry / TP / SL</span><span>${p.entry_price} / ${p.tp_target_premium} / ${p.sl_target_premium}</span></div>` +
+                                   `<div class="obRow"><span>&nbsp;&nbsp;Milestones locked</span><span>${p.milestones_locked||0} / 3</span></div>`;
+                    } else {
+                        const cd = (data.cooldowns || {})[sym];
+                        posHtml += `<div class="obRow"><span>${sym} Position</span><span>${cd ? 'Cooldown until ' + cd : 'No open position'}</span></div>`;
+                    }
                 }
                 let tradesHtml = '';
                 if (data.recent_trades && data.recent_trades.length > 0) {
@@ -1040,8 +1041,7 @@ PAGE_TEMPLATE = """
                                  `<div class="obRow"><span>&nbsp;&nbsp;(Gross / Fees+GST)</span><span>${(last.gross_pnl||0).toFixed(4)} / ${(last.fees_with_gst||0).toFixed(4)}</span></div>`;
                 }
                 el.innerHTML = `<h3>🎯 Options Trend-Bot ${badge}</h3>` +
-                                `<div class="obRow"><span>Window</span><span>${windowStatus}</span></div>` +
-                                posHtml + cooldownHtml + tradesHtml +
+                                posHtml + tradesHtml +
                                 `<div style="text-align:center; margin-top:8px;">` +
                                 `<a href="/options_trades" style="color:#4A90D9; font-size:12px;">` +
                                 `📊 Poора Options Trades Log Dekhein &rarr;</a></div>`;
@@ -1318,19 +1318,16 @@ def oi_warmup_status_route():
 
 @app.route("/options_status")
 def options_status_route():
-    """---- NEW 2026-08-14: status for the Options-Bot running in the
-    SAME process/service as this futures-bot dashboard (see the
-    threading.Thread(target=options_bot.bot_loop...) call at the bottom
-    of this file). Genuinely independent state from the futures bot —
-    reads options_bot's own state file directly. ----"""
+    """---- CHANGED 2026-08-17: updated for multi-position (BTC+ETH
+    simultaneously) and Golden-Window removal — see options_bot.py's
+    own constants-block docstring for the full reasoning. ----"""
     try:
         import options_bot
         state = options_bot.load_state()
         return jsonify({
             "dry_run": options_bot.DRY_RUN,
-            "in_golden_window": options_bot.in_golden_window(),
-            "position": state.get("position"),
-            "cooldown_until": state.get("cooldown_until"),
+            "positions": state.get("positions", {"BTC": None, "ETH": None}),
+            "cooldowns": state.get("cooldowns", {"BTC": None, "ETH": None}),
             "recent_trades": state.get("trade_history", [])[-10:],
         })
     except Exception as e:
