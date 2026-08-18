@@ -166,6 +166,41 @@ def save_state(state):
         print(f"  [WARN] Couldn't save state: {e}")
 
 
+# ---- NEW 2026-08-18: user's explicit request — "roz roz Environment
+# Variable thodi na change karta rahunga" — lot-size (and, since we're
+# at it, the LIVE/DRY-RUN switch too) now genuinely live in state.json
+# and can be changed from the dashboard at any time, no Render redeploy
+# needed. OPTIONS_LOT_SIZE env var still works as the STARTING default
+# (useful for a fresh deploy), but once the dashboard is used to change
+# it, state.json's value genuinely takes over. ----
+def get_lot_size(state):
+    return int(state.get("lot_size", LOT_SIZE))
+
+
+def set_lot_size(state, new_size):
+    new_size = max(1, int(new_size))
+    state["lot_size"] = new_size
+    save_state(state)
+    return new_size
+
+
+def get_live_mode(state):
+    """Returns True if genuinely LIVE (real orders), False if DRY_RUN.
+    state.json's "live_mode" key (if ever explicitly set via the
+    dashboard) takes priority over the OPTIONS_BOT_LIVE env var —
+    that's the whole point of this feature, so the person isn't stuck
+    needing a Render redeploy every time."""
+    if "live_mode" in state:
+        return bool(state["live_mode"])
+    return not DRY_RUN
+
+
+def set_live_mode(state, is_live):
+    state["live_mode"] = bool(is_live)
+    save_state(state)
+    return state["live_mode"]
+
+
 # ============================================================
 # Market-data helpers (self-contained — no dependency on
 # trend_scalp_live.py, per "genuinely alag file" agreement)
@@ -408,7 +443,7 @@ def estimate_options_fee(underlying, spot_price, premium, size=1):
 
 
 def limit_order_chase(product_id, side, size, get_current_price_fn, reduce_only=False,
-                       max_seconds=120, label=""):
+                       max_seconds=120, label="", live=None):
     """
     ---- Genuinely-shared "chasing" logic for entry, TP, and SL, exactly
     as agreed: place limit at current best price, wait
@@ -416,13 +451,23 @@ def limit_order_chase(product_id, side, size, get_current_price_fn, reduce_only=
     the (possibly moved) current price, repeat up to max_seconds total.
     In DRY_RUN, this just logs what WOULD happen and returns a fake
     "filled" result immediately at the first quoted price — genuinely
-    useful for watching decision-quality before risking real money. ----
+    useful for watching decision-quality before risking real money.
+
+    ---- CHANGED 2026-08-18: `live` parameter added so callers can pass
+    the genuinely current, dashboard-configurable live-mode
+    (get_live_mode(state)) instead of always falling back to the
+    module-level DRY_RUN (which only reflects the OPTIONS_BOT_LIVE env
+    var at process-start) — this is what makes the dashboard's
+    LIVE/DRY-RUN toggle actually take effect without a Render redeploy.
+    If `live` isn't passed, falls back to the old module-level DRY_RUN
+    for backward compatibility. ----
     """
+    is_live = live if live is not None else (not DRY_RUN)
     start = time.time()
     price = get_current_price_fn()
-    print(f"    [{label}] limit-chase starting @ {price} (DRY_RUN={DRY_RUN})")
+    print(f"    [{label}] limit-chase starting @ {price} (LIVE={is_live})")
 
-    if DRY_RUN:
+    if not is_live:
         return {"filled": True, "fill_price": price, "dry_run": True}
 
     order = place_order(product_id, side, size, price, reduce_only)
@@ -521,21 +566,23 @@ def run_one_cycle(state):
             continue
 
         product_id = atm["product_id"]
+        lot_size = get_lot_size(state)  # ---- CHANGED 2026-08-18: genuinely dashboard-configurable, not fixed at deploy-time ----
 
         def get_ask(symbol=atm["symbol"], fallback=atm.get("mark_price")):
             r = requests.get(f"{BASE_URL}/v2/tickers/{symbol}", timeout=10)
             return float(r.json().get("result", {}).get("quotes", {}).get("best_ask") or fallback)
 
-        print(f"  {underlying}: ENTERING {side.upper()} via {atm['symbol']} size={LOT_SIZE} "
+        print(f"  {underlying}: ENTERING {side.upper()} via {atm['symbol']} size={lot_size} "
               f"(milestones={milestone_refs}, SL-ref={sl_ref.get('mark_price')})")
-        result = limit_order_chase(product_id, "buy", LOT_SIZE, get_ask, label=f"{underlying}-ENTRY")
+        result = limit_order_chase(product_id, "buy", lot_size, get_ask, label=f"{underlying}-ENTRY",
+                                    live=get_live_mode(state))
         if not result["filled"]:
             print(f"  {underlying}: entry genuinely didn't fill, skipping this cycle")
             continue
 
         positions[underlying] = {
             "underlying": underlying, "symbol": atm["symbol"], "product_id": product_id,
-            "side": side, "size": LOT_SIZE, "entry_price": result["fill_price"],
+            "side": side, "size": lot_size, "entry_price": result["fill_price"],
             "entry_time": now.strftime("%Y-%m-%d %H:%M:%S.%f"),
             "entry_spot_price": spot,
             "tp_target_premium": milestone_refs[TP_ITM_STRIKES],
@@ -625,7 +672,7 @@ def manage_open_position(state, underlying):
     # ---- NEW 2026-08-17: exchange reconciliation (user's point 5).
     # Only meaningful when genuinely live — in DRY_RUN there's no real
     # exchange position to check against. ----
-    if not DRY_RUN:
+    if get_live_mode(state):
         exchange_size = get_exchange_position(pos["product_id"])
         if exchange_size is not None and exchange_size == 0:
             print(f"  [RECONCILE] {underlying}: exchange genuinely shows this position "
@@ -682,7 +729,8 @@ def manage_open_position(state, underlying):
 
     print(f"  [EXIT] {underlying} {pos['symbol']} closing due to {reason}")
     result = limit_order_chase(pos["product_id"], "sell", pos.get("size", 1), get_bid,
-                                reduce_only=True, label=f"{underlying}-EXIT-{reason}")
+                                reduce_only=True, label=f"{underlying}-EXIT-{reason}",
+                                live=get_live_mode(state))
     exit_price = result.get("fill_price") or current_premium
     _record_and_close(state, underlying, pos, exit_price, reason, now)
 
@@ -725,11 +773,37 @@ app = Flask(__name__)
 def dashboard():
     state = load_state()
     return jsonify({
-        "dry_run": DRY_RUN,
+        "dry_run": not get_live_mode(state),
+        "lot_size": get_lot_size(state),
         "positions": state.get("positions", {"BTC": None, "ETH": None}),
         "cooldowns": state.get("cooldowns", {"BTC": None, "ETH": None}),
         "recent_trades": state.get("trade_history", [])[-10:],
     })
+
+
+@app.route("/set_lot_size", methods=["POST"])
+def set_lot_size_route():
+    """---- NEW 2026-08-18: user's explicit request — genuinely change
+    lot-size from the dashboard, no Render redeploy needed. ----"""
+    from flask import request
+    state = load_state()
+    try:
+        new_size = int(request.json.get("lot_size", 1))
+    except Exception:
+        return jsonify({"ok": False, "message": "Genuinely invalid lot-size value."})
+    actual = set_lot_size(state, new_size)
+    return jsonify({"ok": True, "lot_size": actual})
+
+
+@app.route("/set_live_mode", methods=["POST"])
+def set_live_mode_route():
+    """---- NEW 2026-08-18: user's explicit request — genuinely toggle
+    LIVE/DRY-RUN from the dashboard, no Render redeploy needed. ----"""
+    from flask import request
+    state = load_state()
+    is_live = bool(request.json.get("live", False))
+    actual = set_live_mode(state, is_live)
+    return jsonify({"ok": True, "live": actual})
 
 
 @app.route("/health")

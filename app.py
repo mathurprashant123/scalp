@@ -670,6 +670,78 @@ PAGE_TEMPLATE = """
     <div id="regimeBanner" class="hidden"></div>
     <div id="trendMeter" class="hidden"></div>
     <div id="optionsBotCard" class="hidden"></div>
+    <!-- ---- NEW 2026-08-18: user's explicit request — "roz roz
+    Environment Variable thodi na change karta rahunga" — genuine
+    dashboard controls for Options-Bot's lot-size and LIVE/DRY-RUN
+    mode, no Render redeploy needed. Kept as a SEPARATE static block
+    (not inside optionsBotCard's auto-refreshed innerHTML) so typing
+    in the lot-size box doesn't get wiped every 5 seconds. ---- -->
+    <div id="optionsSettingsPanel" style="background:#1a1a2e; border:1px solid #4a4a8a;
+         border-radius:8px; padding:10px 16px; margin:10px 0; display:flex;
+         align-items:center; gap:12px; flex-wrap:wrap; font-size:13px;">
+        <span>🎯 Options-Bot Settings:</span>
+        <label>Lot Size:
+            <input id="optionsLotSizeInput" type="number" min="1" value="1"
+                   style="width:55px; padding:3px; border-radius:4px; border:1px solid #555;
+                          background:#0d0d0d; color:#ddd;">
+        </label>
+        <button onclick="saveLotSize()" style="padding:5px 12px; border-radius:5px; border:none;
+                background:#1f4a2a; color:#4CAF50; cursor:pointer;">Save Lot-Size</button>
+        <span id="liveModeStatusLabel" style="font-weight:bold;">—</span>
+        <button id="liveModeToggleBtn" onclick="toggleLiveMode()" style="padding:5px 12px;
+                border-radius:5px; border:none; background:#4a1f1f; color:#E85D5D; cursor:pointer;">
+            Toggle LIVE/DRY-RUN
+        </button>
+    </div>
+    <script>
+        let optionsLotSizeInputFocused = false;
+        document.addEventListener('DOMContentLoaded', () => {
+            const inp = document.getElementById('optionsLotSizeInput');
+            if (inp) {
+                inp.addEventListener('focus', () => { optionsLotSizeInputFocused = true; });
+                inp.addEventListener('blur', () => { optionsLotSizeInputFocused = false; });
+            }
+        });
+        function saveLotSize() {
+            const val = parseInt(document.getElementById('optionsLotSizeInput').value) || 1;
+            fetch('/set_lot_size', {method:'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({lot_size: val})})
+                .then(r => r.json()).then(data => {
+                    alert(data.ok ? `Lot-size genuinely set to ${data.lot_size}` : (data.message || 'Failed'));
+                });
+        }
+        function toggleLiveMode() {
+            fetch('/options_status').then(r => r.json()).then(status => {
+                const goingLive = status.dry_run;  // agar-abhi-dry_run-true-hai, toggle-karke-live-karenge
+                const msg = goingLive
+                    ? '⚠️ GENUINELY LIVE-MODE ON karna hai — REAL PAISA se REAL orders jayenge. Confirm karo?'
+                    : 'DRY-RUN mode par wapas jaana hai (safe, no real orders)? Confirm karo?';
+                if (!confirm(msg)) return;
+                fetch('/set_live_mode', {method:'POST', headers:{'Content-Type':'application/json'},
+                    body: JSON.stringify({live: goingLive})})
+                    .then(r => r.json()).then(data => {
+                        alert(data.ok ? `LIVE-mode genuinely set to: ${data.live}` : 'Failed');
+                        refreshOptionsSettings();
+                    });
+            });
+        }
+        function refreshOptionsSettings() {
+            fetch('/options_status').then(r => r.json()).then(data => {
+                if (data.error) return;
+                if (!optionsLotSizeInputFocused) {
+                    const inp = document.getElementById('optionsLotSizeInput');
+                    if (inp && data.lot_size !== undefined) inp.value = data.lot_size;
+                }
+                const label = document.getElementById('liveModeStatusLabel');
+                if (label) {
+                    label.textContent = data.dry_run ? '🟡 DRY-RUN (safe)' : '🔴 LIVE (real orders)';
+                    label.style.color = data.dry_run ? '#e8d84a' : '#ff6b6b';
+                }
+            });
+        }
+        setInterval(refreshOptionsSettings, 5000);
+        refreshOptionsSettings();
+    </script>
     <div id="pnlWidget" class="flat">
         <h3>Live Trade P&amp;L</h3>
         <div class="pnl-row" style="border-bottom:1px solid #333; padding-bottom:6px; margin-bottom:6px;">
@@ -1318,20 +1390,54 @@ def oi_warmup_status_route():
 
 @app.route("/options_status")
 def options_status_route():
-    """---- CHANGED 2026-08-17: updated for multi-position (BTC+ETH
-    simultaneously) and Golden-Window removal — see options_bot.py's
-    own constants-block docstring for the full reasoning. ----"""
+    """---- CHANGED 2026-08-18: now genuinely reflects the dashboard-
+    configurable live-mode/lot-size (options_bot.get_live_mode /
+    get_lot_size), not just the process-start DRY_RUN env-var. ----"""
     try:
         import options_bot
         state = options_bot.load_state()
         return jsonify({
-            "dry_run": options_bot.DRY_RUN,
+            "dry_run": not options_bot.get_live_mode(state),
+            "lot_size": options_bot.get_lot_size(state),
             "positions": state.get("positions", {"BTC": None, "ETH": None}),
             "cooldowns": state.get("cooldowns", {"BTC": None, "ETH": None}),
             "recent_trades": state.get("trade_history", [])[-10:],
         })
     except Exception as e:
         return jsonify({"error": f"Options-bot status genuinely unavailable: {e}"})
+
+
+@app.route("/set_lot_size", methods=["POST"])
+def set_lot_size_proxy():
+    """---- NEW 2026-08-18: this is the route the dashboard JS
+    genuinely calls (app.py's Flask app is the one actually serving
+    requests in the combined deployment — options_bot.py's own Flask
+    app object is never run in this architecture, only its functions
+    are imported and called directly). Proxies to options_bot's own
+    state-based lot-size setter. ----"""
+    try:
+        import options_bot
+        new_size = int(request.json.get("lot_size", 1))
+        state = options_bot.load_state()
+        actual = options_bot.set_lot_size(state, new_size)
+        return jsonify({"ok": True, "lot_size": actual})
+    except Exception as e:
+        return jsonify({"ok": False, "message": f"Genuinely failed: {e}"})
+
+
+@app.route("/set_live_mode", methods=["POST"])
+def set_live_mode_proxy():
+    """---- NEW 2026-08-18: same reasoning as set_lot_size_proxy above —
+    this is the route the dashboard's LIVE/DRY-RUN toggle genuinely
+    calls. ----"""
+    try:
+        import options_bot
+        is_live = bool(request.json.get("live", False))
+        state = options_bot.load_state()
+        actual = options_bot.set_live_mode(state, is_live)
+        return jsonify({"ok": True, "live": actual})
+    except Exception as e:
+        return jsonify({"ok": False, "message": f"Genuinely failed: {e}"})
 
 
 @app.route("/options_trades")
