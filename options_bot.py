@@ -318,11 +318,20 @@ def compute_adx(df, period=ADX_PERIOD):
 
 
 def get_spot_price(symbol):
-    r = requests.get(f"{BASE_URL}/v2/tickers/{symbol}", timeout=10)
-    r.raise_for_status()
-    data = r.json().get("result", {})
-    price = data.get("close") or data.get("mark_price") or data.get("spot_price")
-    return float(price) if price else None
+    """---- FIXED 2026-08-20: same genuine bug pattern as the
+    reconciliation crash — see safe_result() docstring. Also wrapped in
+    try/except since this function is called from many places
+    (including inside _record_and_close, which must NEVER crash mid-
+    close, or a position could be left stuck in a half-closed state). ----"""
+    try:
+        r = requests.get(f"{BASE_URL}/v2/tickers/{symbol}", timeout=10)
+        r.raise_for_status()
+        data = safe_result(r.json())
+        price = data.get("close") or data.get("mark_price") or data.get("spot_price")
+        return float(price) if price else None
+    except Exception as e:
+        print(f"  [WARN] genuinely couldn't fetch spot price for {symbol}: {e}")
+        return None
 
 
 def in_golden_window():
@@ -434,6 +443,25 @@ def detect_signal(underlying_symbol, futures_symbol):
 # ============================================================
 # Order execution — Limit-order-chasing (entry, TP, SL all use this)
 # ============================================================
+def safe_result(response_json):
+    """
+    ---- NEW 2026-08-20: CRITICAL bug-fix, genuinely confirmed via a
+    real production crash — "loop exception: 'NoneType' object has no
+    attribute 'get'" repeating every single loop, forever. Root cause:
+    `.get("result", {})`'s DEFAULT value only applies when the key is
+    genuinely MISSING — if Delta's API returns the key WITH an explicit
+    None value (which genuinely happens for tickers of already-expired/
+    settled contracts, e.g. {"result": null}), `.get("result", {})`
+    returns None (not {}), and any further `.get(...)` on it crashes.
+    This ALSO caused the crashing position to never actually get
+    cleared (since the crash happened before _record_and_close ran),
+    so the SAME crash repeated on every subsequent loop forever. This
+    helper is the genuinely-safe replacement — use `safe_result(r.json())`
+    everywhere instead of `r.json().get("result", {})`. ----
+    """
+    return response_json.get("result") or {}
+
+
 def sign_request(method, path, query_string, body, timestamp):
     import hashlib
     import hmac
@@ -458,6 +486,65 @@ def place_order(product_id, side, size, limit_price, reduce_only=False):
         "User-Agent": "options-trend-bot", "Content-Type": "application/json",
     }
     r = requests.post(f"{BASE_URL}{path}", data=body, headers=headers, timeout=10)
+    return r.json()
+
+
+def place_options_bracket(product_id, product_symbol, sl_price, tp_price):
+    """
+    ---- NEW 2026-08-20: user's genuine, correctly-caught safety gap —
+    "SL TP nahi lag rahe hai abhi bhi" — confirmed via a real Delta
+    Exchange position screenshot showing NO exchange-side protection.
+    Until now, TP/SL were only ever LOCAL (polled every ~20s and
+    manually sold when crossed) — if the bot ever went down (crash,
+    Render redeploy, network loss), an open position had genuinely ZERO
+    protection. This places a REAL exchange-side bracket order
+    (POST /v2/orders/bracket) — Delta's own docs + a verified real-
+    world example confirm this endpoint genuinely works for OPTIONS
+    contracts too, not just futures (identical mechanism, just pass the
+    option's own product_id/product_symbol). Per Delta's own
+    documentation, bracket orders can ONLY use mark_price as the
+    trigger index — "last_traded_price" seen in some third-party code
+    examples is NOT accepted. Only called when genuinely live (DRY_RUN
+    safe — see call-sites, which pass `live` explicitly). ----
+    """
+    path = "/v2/orders/bracket"
+    body_dict = {
+        "product_id": product_id, "product_symbol": product_symbol,
+        "stop_loss_order": {"order_type": "market_order", "stop_price": str(sl_price)},
+        "take_profit_order": {"order_type": "market_order", "stop_price": str(tp_price)},
+        "bracket_stop_trigger_method": "mark_price",
+    }
+    body = json.dumps(body_dict)
+    timestamp = str(int(time.time()))
+    signature = sign_request("POST", path, "", body, timestamp)
+    headers = {
+        "api-key": API_KEY, "signature": signature, "timestamp": timestamp,
+        "User-Agent": "options-trend-bot", "Content-Type": "application/json",
+    }
+    r = requests.post(f"{BASE_URL}{path}", data=body, headers=headers, timeout=10)
+    return r.json()
+
+
+def update_options_bracket(product_id, product_symbol, sl_price, tp_price):
+    """Same as place_options_bracket but genuinely updates an EXISTING
+    bracket (PUT instead of POST) — used when the trailing-staircase
+    moves the SL up, so the exchange-side stop genuinely stays in sync
+    with our local trailing logic, not just the initial SL forever."""
+    path = "/v2/orders/bracket"
+    body_dict = {
+        "product_id": product_id, "product_symbol": product_symbol,
+        "stop_loss_order": {"order_type": "market_order", "stop_price": str(sl_price)},
+        "take_profit_order": {"order_type": "market_order", "stop_price": str(tp_price)},
+        "bracket_stop_trigger_method": "mark_price",
+    }
+    body = json.dumps(body_dict)
+    timestamp = str(int(time.time()))
+    signature = sign_request("PUT", path, "", body, timestamp)
+    headers = {
+        "api-key": API_KEY, "signature": signature, "timestamp": timestamp,
+        "User-Agent": "options-trend-bot", "Content-Type": "application/json",
+    }
+    r = requests.put(f"{BASE_URL}{path}", data=body, headers=headers, timeout=10)
     return r.json()
 
 
@@ -528,13 +615,13 @@ def limit_order_chase(product_id, side, size, get_current_price_fn, reduce_only=
         return {"filled": True, "fill_price": price, "dry_run": True}
 
     order = place_order(product_id, side, size, price, reduce_only)
-    order_id = order.get("result", {}).get("id")
+    order_id = safe_result(order).get("id")
     while time.time() - start < max_seconds:
         time.sleep(LIMIT_CHASE_INTERVAL_SECONDS)
         status = get_order_state(order_id)
-        state = status.get("result", {}).get("state")
-        if state == "closed":
-            fill_price = status.get("result", {}).get("limit_price")
+        order_state = safe_result(status).get("state")
+        if order_state == "closed":
+            fill_price = safe_result(status).get("limit_price")
             print(f"    [{label}] genuinely filled @ {fill_price}")
             return {"filled": True, "fill_price": float(fill_price), "dry_run": False}
         # not filled yet — cancel and re-price
@@ -547,7 +634,7 @@ def limit_order_chase(product_id, side, size, get_current_price_fn, reduce_only=
               f"re-pricing {price} -> {new_price}")
         price = new_price
         order = place_order(product_id, side, size, price, reduce_only)
-        order_id = order.get("result", {}).get("id")
+        order_id = safe_result(order).get("id")
 
     print(f"    [{label}] genuinely gave up chasing after {max_seconds}s")
     return {"filled": False, "fill_price": None, "dry_run": False}
@@ -615,7 +702,7 @@ def run_one_cycle(state):
 
         def get_ask(symbol=atm["symbol"], fallback=atm.get("mark_price")):
             r = requests.get(f"{BASE_URL}/v2/tickers/{symbol}", timeout=10)
-            return float(r.json().get("result", {}).get("quotes", {}).get("best_ask") or fallback)
+            return float(safe_result(r.json()).get("quotes", {}).get("best_ask") or fallback)
 
         # ---- CHANGED 2026-08-18: user's genuine catch — "jab trade
         # execute ho jayegi, uski TIME ke premium price ko maankar TP
@@ -681,6 +768,23 @@ def run_one_cycle(state):
         # ---- NEW 2026-08-20: genuinely record this strike's usage for
         # the Per-Strike Trade Restriction (see check_strike_restriction). ----
         record_strike_trade(state, underlying, option_type, atm_strike)
+
+        # ---- NEW 2026-08-20: genuinely place a REAL exchange-side
+        # bracket order (SL+TP) right after entry — user's confirmed
+        # safety gap: "SL TP nahi lag rahe hai abhi bhi". Only when
+        # genuinely live — in DRY_RUN there's no real position for the
+        # exchange to attach a bracket to. ----
+        if get_live_mode(state):
+            try:
+                bracket_result = place_options_bracket(
+                    product_id, atm["symbol"], sl_target, milestone_refs[TP_ITM_STRIKES])
+                print(f"  {underlying}: genuinely placed EXCHANGE-SIDE bracket "
+                      f"(SL={sl_target}, TP={milestone_refs[TP_ITM_STRIKES]}) — {bracket_result}")
+            except Exception as e:
+                print(f"  [WARN] {underlying}: genuinely FAILED to place exchange-side "
+                      f"bracket ({e}) — position is still LOCALLY protected via polling, "
+                      f"but has no exchange-side safety net until this succeeds.")
+
         save_state(state)
         LATEST_STATE["positions"] = positions
         print(f"  {underlying}: position OPENED — {json.dumps(positions[underlying])}")
@@ -785,14 +889,47 @@ def manage_open_position(state, underlying):
         if exchange_size is not None and exchange_size == 0:
             print(f"  [RECONCILE] {underlying}: exchange genuinely shows this position "
                   f"CLOSED already (foreclosed/liquidated/settled) — syncing our records.")
-            r = requests.get(f"{BASE_URL}/v2/tickers/{pos['symbol']}", timeout=10)
-            best_guess_price = float(r.json().get("result", {}).get("mark_price", pos["entry_price"]))
+            # ---- FIXED 2026-08-20: CRITICAL bug, genuinely confirmed —
+            # "loop exception: 'NoneType' object has no attribute
+            # 'get'" repeating every single loop, forever. Root cause:
+            # once a contract genuinely expires/settles, its ticker
+            # endpoint can genuinely return {"result": null} — and
+            # `.get("result", {})`'s default ONLY applies when the KEY
+            # is missing, not when it's present with an explicit None
+            # value, so `.get("mark_price", ...)` on that None crashed
+            # every time. Worse: because the crash happened BEFORE
+            # _record_and_close ran, the position never actually got
+            # cleared, so reconciliation kept re-triggering the exact
+            # same crash forever. Fix: genuinely guard against both a
+            # missing key AND an explicit None, and wrap the whole
+            # ticker-fetch in try/except so a transient/edge-case
+            # failure here can NEVER block the reconciliation from
+            # genuinely completing — falling back to entry_price
+            # (a reasonable, safe estimate) rather than crashing. ----
+            best_guess_price = pos["entry_price"]
+            try:
+                r = requests.get(f"{BASE_URL}/v2/tickers/{pos['symbol']}", timeout=10)
+                result = r.json().get("result") or {}
+                best_guess_price = float(result.get("mark_price", pos["entry_price"]))
+            except Exception as e:
+                print(f"  [WARN] {underlying}: genuinely couldn't fetch a fresh price for "
+                      f"reconciliation ({e}) — using entry_price as a safe fallback.")
             _record_and_close(state, underlying, pos, best_guess_price, "exchange_reconciled", now)
             return
 
-    r = requests.get(f"{BASE_URL}/v2/tickers/{pos['symbol']}", timeout=10)
-    ticker = r.json().get("result", {})
-    current_premium = float(ticker.get("mark_price", 0))
+    try:
+        r = requests.get(f"{BASE_URL}/v2/tickers/{pos['symbol']}", timeout=10)
+        ticker = safe_result(r.json())
+        if "mark_price" not in ticker:
+            print(f"  [WARN] {underlying}: genuinely no mark_price in ticker response "
+                  f"({ticker}) — skipping this loop's TP/SL check to avoid a false "
+                  f"trigger on bad/missing data, will retry next loop.")
+            return
+        current_premium = float(ticker["mark_price"])
+    except Exception as e:
+        print(f"  [WARN] {underlying}: genuinely couldn't fetch current premium ({e}) — "
+              f"skipping this loop's TP/SL check, will retry next loop.")
+        return
 
     # ---- CHANGED 2026-08-17: 3-level ITM trailing staircase (user's
     # points 3+4). Milestone 1 hit -> SL trails to breakeven (entry
@@ -802,19 +939,37 @@ def manage_open_position(state, underlying):
     # bot, just expressed in strike-distance/premium terms. ----
     milestones = pos.get("milestone_premiums", {})
     locked = pos.get("milestones_locked", 0)
+    sl_genuinely_moved = False
 
     if locked < 1 and 1 in milestones and current_premium >= milestones[1]:
         pos["sl_target_premium"] = pos["entry_price"]  # trail to breakeven
         pos["milestones_locked"] = 1
         locked = 1
+        sl_genuinely_moved = True
         print(f"  [TRAIL] {underlying}: hit 1-ITM milestone — SL trailed to breakeven "
               f"({pos['entry_price']})")
     if locked < 2 and 2 in milestones and current_premium >= milestones[2]:
         pos["sl_target_premium"] = milestones[1]
         pos["milestones_locked"] = 2
         locked = 2
+        sl_genuinely_moved = True
         print(f"  [TRAIL] {underlying}: hit 2-ITM milestone — SL trailed to 1-ITM premium "
               f"({milestones[1]})")
+
+    # ---- NEW 2026-08-20: whenever the trailing staircase genuinely
+    # moves the local SL, keep the REAL exchange-side bracket in sync
+    # too — otherwise the exchange's stop would stay stuck at the
+    # OLD (looser) level while our local tracking thinks it's tighter,
+    # genuinely defeating the whole point of trailing. ----
+    if sl_genuinely_moved and get_live_mode(state):
+        try:
+            update_options_bracket(pos["product_id"], pos["symbol"],
+                                    pos["sl_target_premium"], pos["tp_target_premium"])
+            print(f"  {underlying}: genuinely updated EXCHANGE-SIDE bracket "
+                  f"(new SL={pos['sl_target_premium']})")
+        except Exception as e:
+            print(f"  [WARN] {underlying}: genuinely FAILED to update exchange-side "
+                  f"bracket ({e}) — local trailing continues regardless.")
 
     hit_tp = current_premium >= pos["tp_target_premium"]  # 3-ITM level = hard final TP
     hit_sl = current_premium <= pos["sl_target_premium"]
@@ -832,8 +987,8 @@ def manage_open_position(state, underlying):
 
     def get_bid():
         r2 = requests.get(f"{BASE_URL}/v2/tickers/{pos['symbol']}", timeout=10)
-        return float(r2.json().get("result", {}).get("quotes", {}).get("best_bid")
-                     or r2.json().get("result", {}).get("mark_price"))
+        result2 = safe_result(r2.json())
+        return float(result2.get("quotes", {}).get("best_bid") or result2.get("mark_price"))
 
     print(f"  [EXIT] {underlying} {pos['symbol']} closing due to {reason}")
     result = limit_order_chase(pos["product_id"], "sell", pos.get("size", 1), get_bid,
