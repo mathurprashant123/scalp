@@ -123,7 +123,12 @@ UNDERLYINGS = [("BTC", "BTCUSD"), ("ETH", "ETHUSD")]
 # Notional value = underlying spot price × contract_value × size —
 # same contract_value convention as the futures bot (0.001 BTC per
 # lot, 0.01 ETH per lot). ----
-OPTIONS_FEE_PCT_OF_NOTIONAL = 0.0003   # 0.03%, maker AND taker (options fees don't differ)
+OPTIONS_FEE_PCT_OF_NOTIONAL = 0.0001   # ---- FIXED 2026-08-20: genuinely 0.01%, NOT 0.03%
+# — the earlier 0.03% was from a web-search source that turned out
+# genuinely wrong for this account/product. Verified empirically
+# against the user's REAL Delta Exchange wallet-history: backing out
+# GST from actual fee transactions and dividing by notional
+# consistently gave ~0.01%, both for BTC and ETH option trades. ----
 OPTIONS_GST_RATE = 0.18                 # 18% GST on the fee amount
 OPTIONS_FEE_CAP_PCT_OF_PREMIUM = 0.035  # fee capped at 3.5% of premium
 CONTRACT_VALUE = {"BTC": 0.001, "ETH": 0.01}
@@ -199,6 +204,58 @@ def set_live_mode(state, is_live):
     state["live_mode"] = bool(is_live)
     save_state(state)
     return state["live_mode"]
+
+
+# ---- NEW 2026-08-20: Per-Strike Trade Restriction (user's explicit
+# request, points 1/2/5/6/7). A specific (underlying, option_type,
+# strike) combination — e.g. "BTC CALL 69200" — may genuinely be
+# re-selected as the ATM strike across multiple loops if the
+# underlying's spot price stays near it. Without this restriction, the
+# bot could genuinely re-enter the SAME contract repeatedly in quick
+# succession. This limits any single (underlying, option_type, strike)
+# to at most STRIKE_MAX_TRADES trades total, and requires at least
+# STRIKE_COOLDOWN_HOURS between the 1st and 2nd trade on that exact
+# strike. Genuinely does NOT affect other strikes — if the underlying
+# moves and a DIFFERENT strike becomes ATM, that's a fresh combination
+# with its own independent counter. CE and PE on the SAME strike price
+# are genuinely tracked as separate combinations (different
+# option_type in the key), per user's explicit point 7. ----
+STRIKE_MAX_TRADES = 2
+STRIKE_COOLDOWN_HOURS = 1.5
+
+
+def _strike_key(underlying, option_type, strike):
+    return f"{underlying}_{option_type}_{strike}"
+
+
+def check_strike_restriction(state, underlying, option_type, strike):
+    """Returns (allowed: bool, reason: str)."""
+    history = state.get("strike_trade_history", {})
+    key = _strike_key(underlying, option_type, strike)
+    entry = history.get(key)
+    if entry is None:
+        return True, ""
+    count = entry.get("count", 0)
+    if count >= STRIKE_MAX_TRADES:
+        return False, (f"{underlying} {option_type} strike={strike} genuinely already "
+                        f"traded {count}x (max {STRIKE_MAX_TRADES}) — skipping this strike")
+    last_time = datetime.strptime(entry["last_entry_time"], "%Y-%m-%d %H:%M:%S.%f")
+    elapsed_hours = (now_ist() - last_time).total_seconds() / 3600
+    if elapsed_hours < STRIKE_COOLDOWN_HOURS:
+        remaining = (STRIKE_COOLDOWN_HOURS - elapsed_hours) * 60
+        return False, (f"{underlying} {option_type} strike={strike} genuinely needs "
+                        f"{STRIKE_COOLDOWN_HOURS}hr gap since last trade on this exact strike "
+                        f"— {remaining:.0f}min remaining")
+    return True, ""
+
+
+def record_strike_trade(state, underlying, option_type, strike):
+    history = state.setdefault("strike_trade_history", {})
+    key = _strike_key(underlying, option_type, strike)
+    entry = history.setdefault(key, {"count": 0, "last_entry_time": None})
+    entry["count"] += 1
+    entry["last_entry_time"] = now_ist().strftime("%Y-%m-%d %H:%M:%S.%f")
+    save_state(state)
 
 
 # ============================================================
@@ -545,24 +602,12 @@ def run_one_cycle(state):
             continue
         atm_strike = float(atm["strike_price"])
 
-        # ---- CHANGED 2026-08-17: TP=3rd-ITM (final target), SL=2nd-OTM
-        # (initial safety stop) — see TP_ITM_STRIKES/SL_OTM_STRIKES
-        # docstring. Also fetch the 1st and 2nd ITM strikes now, so the
-        # trailing-milestone premiums are known from the start rather
-        # than re-fetched every loop. ----
-        milestone_refs = {}
-        for m in TRAIL_MILESTONE_STRIKES:
-            ref = find_strike_n_away(chain, atm_strike, option_type, m, "itm")
-            if ref is None:
-                print(f"  [WARN] {underlying}: couldn't find {m}-ITM strike (edge of chain)")
-                milestone_refs = None
-                break
-            milestone_refs[m] = float(ref.get("mark_price"))
-        if not milestone_refs:
-            continue
-        sl_ref = find_strike_n_away(chain, atm_strike, option_type, SL_OTM_STRIKES, "otm")
-        if sl_ref is None:
-            print(f"  [WARN] {underlying}: couldn't find {SL_OTM_STRIKES}-OTM strike (edge of chain)")
+        # ---- NEW 2026-08-20: Per-Strike Trade Restriction check
+        # (user's explicit request) — see check_strike_restriction()
+        # docstring above for the full reasoning. ----
+        allowed, restriction_reason = check_strike_restriction(state, underlying, option_type, atm_strike)
+        if not allowed:
+            print(f"  {underlying}: SKIP — {restriction_reason}")
             continue
 
         product_id = atm["product_id"]
@@ -572,26 +617,70 @@ def run_one_cycle(state):
             r = requests.get(f"{BASE_URL}/v2/tickers/{symbol}", timeout=10)
             return float(r.json().get("result", {}).get("quotes", {}).get("best_ask") or fallback)
 
-        print(f"  {underlying}: ENTERING {side.upper()} via {atm['symbol']} size={lot_size} "
-              f"(milestones={milestone_refs}, SL-ref={sl_ref.get('mark_price')})")
+        # ---- CHANGED 2026-08-18: user's genuine catch — "jab trade
+        # execute ho jayegi, uski TIME ke premium price ko maankar TP
+        # trail karega?" Answer: it SHOULD, and now it genuinely does.
+        # Previously, milestone/TP/SL reference premiums were computed
+        # from the option-chain snapshot taken BEFORE the entry's
+        # limit-order-chase started — but that chase can genuinely take
+        # up to LIMIT_CHASE_INTERVAL_SECONDS × several retries (well
+        # over a minute) before actually filling, during which the
+        # market can move meaningfully, making those pre-chase
+        # reference premiums stale by the time the trade is genuinely
+        # live. Fix: execute the entry FIRST, then re-fetch a FRESH
+        # option-chain snapshot and compute milestone/SL references
+        # from THAT — genuinely tied to the moment of actual execution,
+        # not the moment we merely decided to attempt entry. ----
+        print(f"  {underlying}: ENTERING {side.upper()} via {atm['symbol']} size={lot_size}")
         result = limit_order_chase(product_id, "buy", lot_size, get_ask, label=f"{underlying}-ENTRY",
                                     live=get_live_mode(state))
         if not result["filled"]:
             print(f"  {underlying}: entry genuinely didn't fill, skipping this cycle")
             continue
 
+        fresh_chain = get_option_chain(underlying)
+        milestone_refs = {}
+        if fresh_chain:
+            for m in TRAIL_MILESTONE_STRIKES:
+                ref = find_strike_n_away(fresh_chain, atm_strike, option_type, m, "itm")
+                if ref is not None:
+                    milestone_refs[m] = float(ref.get("mark_price"))
+            sl_ref_fresh = find_strike_n_away(fresh_chain, atm_strike, option_type, SL_OTM_STRIKES, "otm")
+        else:
+            sl_ref_fresh = None
+
+        if len(milestone_refs) < len(TRAIL_MILESTONE_STRIKES) or sl_ref_fresh is None:
+            # ---- Genuinely rare edge-case: chain became unavailable or
+            # strikes fell off the edge of it in the moments after fill.
+            # Fail-safe fallback: use the entry fill-price itself as the
+            # reference frame, so TP/SL are still meaningfully defined
+            # rather than silently missing. ----
+            print(f"  [WARN] {underlying}: couldn't get fresh post-fill milestone data — "
+                  f"falling back to entry-price-relative estimates.")
+            fill = result["fill_price"]
+            milestone_refs = {1: fill * 1.3, 2: fill * 1.6, 3: fill * 2.0}
+            sl_target = fill * 0.5
+        else:
+            sl_target = float(sl_ref_fresh.get("mark_price"))
+
+        print(f"  {underlying}: genuinely-fresh post-fill targets — "
+              f"milestones={milestone_refs}, SL={sl_target}")
+
         positions[underlying] = {
             "underlying": underlying, "symbol": atm["symbol"], "product_id": product_id,
             "side": side, "size": lot_size, "entry_price": result["fill_price"],
             "entry_time": now.strftime("%Y-%m-%d %H:%M:%S.%f"),
-            "entry_spot_price": spot,
+            "entry_spot_price": spot, "strike": atm_strike,
             "tp_target_premium": milestone_refs[TP_ITM_STRIKES],
-            "sl_target_premium": float(sl_ref.get("mark_price")),
-            "initial_sl_premium": float(sl_ref.get("mark_price")),
+            "sl_target_premium": sl_target,
+            "initial_sl_premium": sl_target,
             "milestone_premiums": milestone_refs,   # {1: premium, 2: premium, 3: premium}
             "milestones_locked": 0,                  # how many trail-up steps genuinely hit so far
             "option_type": option_type,
         }
+        # ---- NEW 2026-08-20: genuinely record this strike's usage for
+        # the Per-Strike Trade Restriction (see check_strike_restriction). ----
+        record_strike_trade(state, underlying, option_type, atm_strike)
         save_state(state)
         LATEST_STATE["positions"] = positions
         print(f"  {underlying}: position OPENED — {json.dumps(positions[underlying])}")
@@ -636,8 +725,27 @@ def get_exchange_position(product_id):
 def _record_and_close(state, underlying, pos, exit_price, reason, now):
     """Shared close-out logic — writes the trade record, clears the
     position, and starts this underlying's cooldown. Used by both the
-    normal TP/SL/time-exit path and the exchange-reconciliation path."""
-    gross_pnl = (exit_price - pos["entry_price"]) * pos.get("size", 1)
+    normal TP/SL/time-exit path and the exchange-reconciliation path.
+
+    ---- FIXED 2026-08-20: CRITICAL bug, genuinely confirmed via the
+    user's real Delta Exchange wallet-history data. gross_pnl was
+    missing the CONTRACT_VALUE multiplier — premium (exit-entry) is
+    genuinely quoted "$ per 1 FULL unit of underlying" (same convention
+    as the futures price itself, e.g. BTC~$63000/1-BTC), NOT "$ per
+    contract". A contract genuinely only controls CONTRACT_VALUE units
+    of underlying (0.001 BTC / 0.01 ETH), so the real dollar P&L must
+    be scaled down accordingly — exactly like the fee calculation
+    already correctly does via notional_value = spot*contract_value*
+    size. Verified against real wallet entries: e.g. ETH trade showing
+    "Gross P&L: 7.80" on the dashboard was genuinely only $0.078 in
+    real cashflow on the exchange (100x = 1/CONTRACT_VALUE_ETH) — this
+    was a DASHBOARD DISPLAY bug only; actual trade execution/sizing on
+    the exchange itself was always correct (Delta's own systems handle
+    real notional correctly regardless of our local display math), so
+    real money was never at the risk the old dashboard numbers implied.
+    ----"""
+    contract_value = CONTRACT_VALUE.get(underlying, 0.001)
+    gross_pnl = (exit_price - pos["entry_price"]) * contract_value * pos.get("size", 1)
     entry_spot = pos.get("entry_spot_price")
     exit_spot = get_spot_price(underlying + "USD") or entry_spot
     entry_fee = estimate_options_fee(underlying, entry_spot, pos["entry_price"],
