@@ -860,6 +860,27 @@ def bot_loop(stop_event=None):
     print(f"Options-bot starting. DRY_RUN={DRY_RUN}")
     while not should_stop():
         try:
+            # ---- FIXED 2026-08-20: CRITICAL concurrency bug, genuinely
+            # confirmed — "Lot Size button kaam nahi kar raha hai". The
+            # loop's `state` dict was loaded ONCE at start and reused
+            # for the entire lifetime; dashboard-triggered changes
+            # (Save-Lot-Size, Toggle-LIVE) write to disk correctly, but
+            # this loop's own STALE in-memory copy would genuinely
+            # overwrite them again the next time IT called save_state()
+            # — silently reverting the dashboard change within one
+            # loop cycle (~20s). Fix: genuinely re-read the
+            # dashboard-configurable fields (lot_size, live_mode) fresh
+            # from disk every single cycle, merging them into the
+            # long-lived in-memory state — WITHOUT touching the
+            # trading-critical fields (positions, trade_history,
+            # cooldowns, strike_trade_history) that this loop itself
+            # owns and must NOT reset from a stale disk-read. ----
+            fresh = load_state()
+            if "lot_size" in fresh:
+                state["lot_size"] = fresh["lot_size"]
+            if "live_mode" in fresh:
+                state["live_mode"] = fresh["live_mode"]
+
             run_one_cycle(state)
         except Exception as e:
             print(f"  [ERROR] loop exception: {e}")
