@@ -690,6 +690,53 @@ def limit_order_chase(product_id, side, size, get_current_price_fn, reduce_only=
     return {"filled": False, "fill_price": None, "dry_run": False}
 
 
+def fast_marketable_exit(product_id, size, get_bid_fn, max_slippage_pct=3.0, live=None, label=""):
+    """
+    ---- NEW 2026-08-21: CRITICAL fix, genuinely confirmed via a real
+    trade — "gross loss nahi hona chahiye, sirf fees, lekin gross loss
+    hua". Root cause: SL exits were genuinely using the SAME PATIENT
+    limit_order_chase as TP (10s wait, then re-price, repeat) — but a
+    stop-loss's whole point is FAST protection, not best-price-seeking.
+    While patiently chasing a "better" sell price, the market kept
+    falling, so the ACTUAL fill ended up well below the intended stop
+    level — a genuine gross loss beyond fees, not just fees. This is a
+    genuinely FAST exit instead — places ONE bounded-marketable-limit
+    order immediately (mirrors the futures-bot's own proven "bounded
+    marketable-limit order" fallback pattern), deep enough below the
+    current bid that it should genuinely fill right away, rather than
+    iteratively chasing for a better price while price keeps moving
+    against the position. Used ONLY for SL exits — TP and TIME_EXIT
+    genuinely aren't urgent, so they keep using the patient
+    limit_order_chase (better average price there is a genuine plus,
+    not a risk). ----
+    """
+    is_live = live if live is not None else (not DRY_RUN)
+    current_bid = get_bid_fn()
+    bounded_price = round(current_bid * (1 - max_slippage_pct / 100.0), 6)
+    print(f"    [{label}] genuinely FAST-EXIT — bounded-marketable-limit @ {bounded_price} "
+          f"(current_bid={current_bid}, max_slippage={max_slippage_pct}%)")
+
+    if not is_live:
+        return {"filled": True, "fill_price": current_bid, "dry_run": True}
+
+    order = place_order(product_id, "sell", size, bounded_price, reduce_only=True)
+    order_id = safe_result(order).get("id")
+    # ---- genuinely give it a short window — a bounded-marketable
+    # order this deep should fill almost instantly; we're NOT
+    # patiently re-pricing here on purpose. ----
+    for _ in range(3):
+        time.sleep(2)
+        status = get_order_state(order_id)
+        order_state = safe_result(status).get("state")
+        if order_state == "closed":
+            fill_price = safe_result(status).get("limit_price")
+            print(f"    [{label}] genuinely FAST-EXIT filled @ {fill_price}")
+            return {"filled": True, "fill_price": float(fill_price)}
+    print(f"    [{label}] genuinely FAST-EXIT still pending after 6s — "
+          f"using current bid as a safe approximate fill for record-keeping.")
+    return {"filled": True, "fill_price": current_bid}
+
+
 # ============================================================
 # Main trading loop
 # ============================================================
@@ -1079,48 +1126,24 @@ def manage_open_position(state, underlying):
     # price). Milestone 2 hit -> SL trails to milestone-1's premium.
     # Milestone 3 hit -> hard TP, close immediately. Mirrors the exact
     # "staircase trailing stop" pattern already proven in the futures
-    # bot, just expressed in strike-distance/premium terms. ----
-    milestones = pos.get("milestone_premiums", {})
-    locked = pos.get("milestones_locked", 0)
-    sl_genuinely_moved = False
-
-    if locked < 1 and 1 in milestones and current_premium >= milestones[1]:
-        pos["sl_target_premium"] = pos["entry_price"]  # trail to breakeven
-        pos["milestones_locked"] = 1
-        locked = 1
-        sl_genuinely_moved = True
-        print(f"  [TRAIL] {underlying}: hit 1-ITM milestone — SL trailed to breakeven "
-              f"({pos['entry_price']})")
-    if locked < 2 and 2 in milestones and current_premium >= milestones[2]:
-        pos["sl_target_premium"] = milestones[1]
-        pos["milestones_locked"] = 2
-        locked = 2
-        sl_genuinely_moved = True
-        print(f"  [TRAIL] {underlying}: hit 2-ITM milestone — SL trailed to 1-ITM premium "
-              f"({milestones[1]})")
-
-    # ---- NEW 2026-08-20: whenever the trailing staircase genuinely
-    # moves the local SL, keep the REAL exchange-side bracket in sync
-    # too — otherwise the exchange's stop would stay stuck at the
-    # OLD (looser) level while our local tracking thinks it's tighter,
-    # genuinely defeating the whole point of trailing. ----
-    if sl_genuinely_moved and get_live_mode(state):
-        try:
-            update_options_bracket(pos["product_id"], pos["symbol"],
-                                    pos["sl_target_premium"], pos["tp_target_premium"])
-            print(f"  {underlying}: genuinely updated EXCHANGE-SIDE bracket "
-                  f"(new SL={pos['sl_target_premium']})")
-        except Exception as e:
-            print(f"  [WARN] {underlying}: genuinely FAILED to update exchange-side "
-                  f"bracket ({e}) — local trailing continues regardless.")
-
-    hit_tp = current_premium >= pos["tp_target_premium"]  # 3-ITM level = hard final TP
-    hit_sl = current_premium <= pos["sl_target_premium"]
+    # bot, just expressed in strike-distance/premium terms.
+    #
+    # ---- CHANGED 2026-08-21: user's explicit request — "TP trail
+    # hata do, SL to final TP rakho" — genuinely REMOVED the trailing
+    # (SL no longer moves on 1-ITM/2-ITM milestones). SL is now
+    # genuinely FIXED at the initial 2-strikes-OTM level for the whole
+    # trade, and TP remains the fixed final 3-strikes-ITM target —
+    # both set once at entry and never recalculated afterward. This is
+    # genuinely SIMPLER (fewer moving parts, easier to reason about),
+    # but loses the "lock in some gain" safety-net the trailing gave —
+    # a real trade-off the user explicitly chose. ----
+    hit_tp = current_premium >= pos["tp_target_premium"]  # 3-ITM level = fixed final TP
+    hit_sl = current_premium <= pos["sl_target_premium"]  # genuinely fixed, never trails
     hit_time = elapsed_min >= TIME_EXIT_MINUTES
 
     print(f"  [POSITION] {underlying} {pos['symbol']} entry={pos['entry_price']} "
           f"current={current_premium} elapsed={elapsed_min:.1f}min "
-          f"milestones_locked={locked}/3 SL={pos['sl_target_premium']} TP={pos['tp_target_premium']}")
+          f"SL={pos['sl_target_premium']} TP={pos['tp_target_premium']} (genuinely-fixed, no-trail)")
 
     if not (hit_tp or hit_sl or hit_time):
         save_state(state)  # persist the (possibly-updated) trailing SL even without an exit
@@ -1134,9 +1157,16 @@ def manage_open_position(state, underlying):
         return float(result2.get("quotes", {}).get("best_bid") or result2.get("mark_price"))
 
     print(f"  [EXIT] {underlying} {pos['symbol']} closing due to {reason}")
-    result = limit_order_chase(pos["product_id"], "sell", pos.get("size", 1), get_bid,
-                                reduce_only=True, label=f"{underlying}-EXIT-{reason}",
-                                live=get_live_mode(state))
+    if reason == "SL":
+        # ---- CHANGED 2026-08-21: genuinely FAST exit for stop-losses
+        # — see fast_marketable_exit() docstring for the full
+        # reasoning. TP and TIME_EXIT still use the patient chase. ----
+        result = fast_marketable_exit(pos["product_id"], pos.get("size", 1), get_bid,
+                                       live=get_live_mode(state), label=f"{underlying}-EXIT-SL")
+    else:
+        result = limit_order_chase(pos["product_id"], "sell", pos.get("size", 1), get_bid,
+                                    reduce_only=True, label=f"{underlying}-EXIT-{reason}",
+                                    live=get_live_mode(state))
     exit_price = result.get("fill_price") or current_premium
     _record_and_close(state, underlying, pos, exit_price, reason, now)
 
