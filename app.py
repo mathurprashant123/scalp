@@ -572,6 +572,73 @@ OPTIONS_TRADES_PAGE_TEMPLATE = """
 """
 
 
+OPTIONS_SHADOW_TRADES_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Options-Bot Shadow-Tracking (Time-Exit What-If)</title>
+    <meta charset="utf-8">
+    <style>
+        body { background:#1e1e1e; color:#ddd; font-family: 'Segoe UI', sans-serif; margin:0; padding:20px; }
+        h1, h2 { text-align:center; }
+        a.back { color:#4A90D9; text-decoration:none; display:block; text-align:center; margin-bottom:15px; }
+        table { border-collapse: collapse; width:100%; margin-bottom: 25px; background:#0d0d0d; }
+        th, td { border:1px solid #333; padding:8px 10px; font-size:13px; text-align:center; }
+        th { background:#1a3c6e; color:white; }
+        tr.better { background:#0d2e0d; }
+        tr.worse { background:#2e0d0d; }
+        .summary-box { background:#0d0d0d; border-radius:8px; padding:15px 25px; margin: 0 auto 25px auto;
+                       max-width: 560px; text-align:center; font-size:16px; }
+        .pos { color:#4CAF50; font-weight:bold; }
+        .neg { color:#E85D5D; font-weight:bold; }
+        .note { text-align:center; color:#999; font-size:13px; margin-bottom:20px; }
+    </style>
+</head>
+<body>
+    <a class="back" href="/">&larr; Back to Dashboard</a>
+    <h1>Shadow-Tracking — "Agar Time-Exit Na Hota Toh?"</h1>
+    <div class="note">
+        Genuinely-passive tracking — NO real orders. Shows what would have happened if a
+        TIME_EXIT'd position had genuinely kept being held (same TP/SL), for up to 60 more minutes.
+    </div>
+
+    <div class="summary-box">
+        <div>Poора-Resolved Shadow-Trades: <b>{{ total }}</b> &nbsp;|&nbsp; Abhi-Active: <b>{{ still_active }}</b></div>
+        <div>Genuinely-Behtar-Hota (holding se): <span class="pos">{{ would_be_better }}</span>
+             &nbsp;|&nbsp; Genuinely-Badтar-Hota: <span class="neg">{{ would_be_worse }}</span></div>
+        <div>Real (TIME_EXIT) Cumulative: <span class="{{ 'pos' if real_total >= 0 else 'neg' }}">{{ '%.4f'|format(real_total) }}</span></div>
+        <div>Shadow (Hold-Karте) Cumulative: <span class="{{ 'pos' if shadow_total >= 0 else 'neg' }}">{{ '%.4f'|format(shadow_total) }}</span></div>
+    </div>
+
+    <h2>Trade-by-Trade — Real vs Shadow</h2>
+    <table>
+        <tr>
+            <th>Underlying</th><th>Symbol</th><th>Entry</th>
+            <th>Real-Exit (Time-Exit)</th><th>Real-PnL</th>
+            <th>Shadow-Exit (agar-hold-karте)</th><th>Shadow-Reason</th><th>Shadow-Gross-PnL</th>
+            <th>Extra-Elapsed(min)</th>
+        </tr>
+        {% for s in shadows %}
+        <tr class="{{ 'better' if s.shadow_gross_pnl > s.real_exit_pnl else 'worse' }}">
+            <td>{{ s.underlying }}</td><td>{{ s.symbol }}</td>
+            <td>{{ '%.4f'|format(s.entry_price) }}</td>
+            <td>{{ '%.4f'|format(s.real_exit_price) }}</td>
+            <td class="{{ 'pos' if s.real_exit_pnl >= 0 else 'neg' }}">{{ '%.4f'|format(s.real_exit_pnl) }}</td>
+            <td>{{ '%.4f'|format(s.shadow_exit_price) }}</td>
+            <td>{{ s.shadow_exit_reason }}</td>
+            <td class="{{ 'pos' if s.shadow_gross_pnl >= 0 else 'neg' }}">{{ '%.4f'|format(s.shadow_gross_pnl) }}</td>
+            <td>{{ s.shadow_elapsed_min }}</td>
+        </tr>
+        {% endfor %}
+        {% if shadows|length == 0 %}
+        <tr><td colspan="9">Genuinely-abhi-tak-koई-shadow-trade-resolve-nahi-huई.</td></tr>
+        {% endif %}
+    </table>
+</body>
+</html>
+"""
+
+
 class WebLogRedirector:
     """Captures print() output from the algo into our log buffer."""
     def write(self, message):
@@ -1480,6 +1547,35 @@ def options_trades_page():
             day_summary=day_summary, dry_run=options_bot.DRY_RUN)
     except Exception as e:
         return f"Options-bot trades genuinely unavailable: {e}", 500
+
+
+@app.route("/options_shadow_trades")
+def options_shadow_trades_page():
+    """---- NEW 2026-08-21: user's explicit request — "agar time-exit
+    nahi hota toh kya hota" — since we couldn't answer that with a
+    guess, this shows the REAL answer using shadow-tracking data (see
+    options_bot.py's check_shadow_positions()/SHADOW_TRACKING_ENABLED
+    docstrings for the full reasoning). Compares what genuinely
+    happened (real TIME_EXIT) vs what would genuinely have happened had
+    the position kept being held (same TP/SL, tracked passively, no
+    real order). ----"""
+    try:
+        import options_bot
+        state = options_bot.load_state()
+        shadows = list(reversed(state.get("shadow_trade_history", [])))
+        still_active = sum(len(v) for v in state.get("shadow_positions", {}).values())
+
+        would_be_better = sum(1 for s in shadows if s["shadow_gross_pnl"] > s["real_exit_pnl"])
+        would_be_worse = len(shadows) - would_be_better
+        real_total = sum(s["real_exit_pnl"] for s in shadows)
+        shadow_total = sum(s["shadow_gross_pnl"] for s in shadows)
+
+        return render_template_string(
+            OPTIONS_SHADOW_TRADES_TEMPLATE, shadows=shadows, still_active=still_active,
+            would_be_better=would_be_better, would_be_worse=would_be_worse,
+            real_total=real_total, shadow_total=shadow_total, total=len(shadows))
+    except Exception as e:
+        return f"Options-bot shadow-trades genuinely unavailable: {e}", 500
 
 
 @app.route("/live_pnl")

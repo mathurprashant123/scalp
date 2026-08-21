@@ -220,6 +220,11 @@ def set_live_mode(state, is_live):
 # with its own independent counter. CE and PE on the SAME strike price
 # are genuinely tracked as separate combinations (different
 # option_type in the key), per user's explicit point 7. ----
+# ---- NEW 2026-08-21: Shadow-Tracking (user's explicit request) — see
+# _record_and_close() docstring for the full reasoning. ----
+SHADOW_TRACKING_ENABLED = True
+SHADOW_MAX_MINUTES = 60
+
 STRIKE_MAX_TRADES = 2
 STRIKE_COOLDOWN_HOURS = 1.5
 
@@ -643,12 +648,81 @@ def limit_order_chase(product_id, side, size, get_current_price_fn, reduce_only=
 # ============================================================
 # Main trading loop
 # ============================================================
+def check_shadow_positions(state):
+    """
+    ---- NEW 2026-08-21: Shadow-Tracking (user's explicit request) —
+    genuinely re-checks every open shadow every loop. A shadow is a
+    PASSIVE, no-real-order copy of a position that genuinely exited via
+    TIME_EXIT — this keeps watching the SAME TP/SL it had at exit-time,
+    to answer "would holding longer have helped" with real subsequent
+    price data. Resolves (records outcome, removes from active list)
+    when: the shadow's own TP or SL is genuinely crossed, OR
+    SHADOW_MAX_MINUTES elapses without either (recorded as
+    "shadow_TIMEOUT"). Never places any real order — pure observation. ----
+    """
+    shadows = state.get("shadow_positions", {})
+    now = now_ist()
+    for underlying, shadow_list in list(shadows.items()):
+        still_active = []
+        for sh in shadow_list:
+            try:
+                r = requests.get(f"{BASE_URL}/v2/tickers/{sh['symbol']}", timeout=10)
+                ticker = safe_result(r.json())
+                if "mark_price" not in ticker:
+                    still_active.append(sh)
+                    continue
+                current = float(ticker["mark_price"])
+            except Exception as e:
+                print(f"  [SHADOW-WARN] {underlying}: genuinely couldn't fetch price ({e})")
+                still_active.append(sh)
+                continue
+
+            start_time = datetime.strptime(sh["shadow_start_time"], "%Y-%m-%d %H:%M:%S.%f")
+            elapsed_min = (now - start_time).total_seconds() / 60
+            hit_tp = current >= sh["tp_target_premium"]
+            hit_sl = current <= sh["sl_target_premium"]
+            timed_out = elapsed_min >= SHADOW_MAX_MINUTES
+
+            if not (hit_tp or hit_sl or timed_out):
+                still_active.append(sh)
+                continue
+
+            shadow_reason = "shadow_TP" if hit_tp else "shadow_SL" if hit_sl else "shadow_TIMEOUT"
+            contract_value = CONTRACT_VALUE.get(underlying, 0.001)
+            shadow_gross = (current - sh["entry_price"]) * contract_value * sh.get("size", 1)
+            # ---- genuinely-honest note: shadow P&L does NOT deduct a
+            # 2nd round of fees (the real trade already paid entry-fee;
+            # only a hypothetical extra exit-fee would apply here, and
+            # since this never really executes, we skip re-modelling it
+            # — shadow numbers are for DIRECTIONAL insight, not exact
+            # accounting). ----
+            shadow_record = {
+                "underlying": underlying, "symbol": sh["symbol"],
+                "entry_price": sh["entry_price"], "real_exit_price": sh["real_exit_price"],
+                "real_exit_pnl": sh["real_exit_pnl"], "shadow_exit_price": current,
+                "shadow_exit_reason": shadow_reason, "shadow_gross_pnl": shadow_gross,
+                "shadow_elapsed_min": round(elapsed_min, 1),
+                "shadow_start_time": sh["shadow_start_time"],
+                "shadow_end_time": now.strftime("%Y-%m-%d %H:%M:%S.%f"),
+            }
+            state.setdefault("shadow_trade_history", []).append(shadow_record)
+            state["shadow_trade_history"] = state["shadow_trade_history"][-100:]
+            print(f"  [SHADOW-RESOLVED] {underlying}: {shadow_reason} — genuinely-would-have "
+                  f"pnl={shadow_gross:.4f} (real-time-exit-pnl-was={sh['real_exit_pnl']:.4f})")
+        shadows[underlying] = still_active
+    state["shadow_positions"] = shadows
+
+
 def run_one_cycle(state):
     now = now_ist()
 
     # ---- CHANGED 2026-08-17: Golden-Window check REMOVED — Regime=B
     # is now the ONLY gate (see constants block docstring above for the
     # full trade-off reasoning). ----
+
+    # ---- NEW 2026-08-21: genuinely check all active shadow-positions
+    # every loop, regardless of what else happens this cycle. ----
+    check_shadow_positions(state)
 
     positions = state.setdefault("positions", {"BTC": None, "ETH": None})
     cooldowns = state.setdefault("cooldowns", {"BTC": None, "ETH": None})
@@ -864,6 +938,25 @@ def _record_and_close(state, underlying, pos, exit_price, reason, now):
                      "gross_pnl": gross_pnl, "fees_with_gst": total_fees, "pnl": net_pnl}
     state.setdefault("trade_history", []).append(trade_record)
     state["trade_history"] = state["trade_history"][-100:]
+
+    # ---- NEW 2026-08-21: Shadow-Tracking (user's explicit request) —
+    # "Time-Exit ke baad price dekhta rahe, record kare ki agar hold
+    # karte toh kya hota". Only meaningful for TIME_EXIT (TP/SL/
+    # reconciled already reached their genuine natural conclusion —
+    # there's nothing to "what-if" there). Creates a passive, no-real-
+    # order shadow copy that keeps tracking the SAME TP/SL this
+    # position had at the moment of exit, for up to
+    # SHADOW_MAX_MINUTES more, to genuinely answer "would holding
+    # longer have helped" with real subsequent price data instead of a
+    # guess. ----
+    if reason == "TIME_EXIT" and SHADOW_TRACKING_ENABLED:
+        shadow = {**pos, "shadow_start_time": now.strftime("%Y-%m-%d %H:%M:%S.%f"),
+                  "real_exit_price": exit_price, "real_exit_pnl": net_pnl}
+        state.setdefault("shadow_positions", {}).setdefault(underlying, []).append(shadow)
+        print(f"  [SHADOW] {underlying}: genuinely started shadow-tracking "
+              f"(will keep watching TP={pos['tp_target_premium']}/SL={pos['sl_target_premium']} "
+              f"for up to {SHADOW_MAX_MINUTES}min more, no real order)")
+
     state["positions"][underlying] = None
     state.setdefault("cooldowns", {})[underlying] = \
         (now + timedelta(minutes=COOLDOWN_MINUTES)).strftime("%Y-%m-%d %H:%M:%S.%f")
