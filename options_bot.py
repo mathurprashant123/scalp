@@ -431,18 +431,22 @@ def detect_signal(underlying_symbol, futures_symbol):
     symbol_meter = meter[underlying_symbol + "USD"]
     state_label = symbol_meter.get("state")
 
-    # ---- CHANGED 2026-08-17: ADX check REMOVED per user's explicit
-    # request ("ADX hata do, Regim-B hi kaafi hai OR trend direction
-    # confirm"). Entry now requires ONLY Regime=B (already checked
-    # above) + a clear UP/DOWN Trend-Meter reading — no speed/
-    # consistency check beyond what the futures-bot's own regime+trend
-    # computation already provides. ----
-    if state_label in ("UPTREND-ACTIVE", "UPTREND-FORMING"):
+    # ---- CHANGED 2026-08-21: user's explicit request — "sirf ACTIVE
+    # dekhe, FORMING nahi" — "-FORMING" states are genuinely a WEAKER,
+    # still-developing signal (the trend hasn't genuinely confirmed
+    # yet), while "-ACTIVE" is the futures-bot's own stronger,
+    # confirmed reading. Session-wise data (21-Aug) showed the
+    # Late-Night session — where many FORMING-based entries happened —
+    # performing genuinely worst (12% win-rate), motivating this
+    # tightening. ADX check was removed earlier (2026-08-17); this is
+    # genuinely a DIFFERENT, tighter quality-filter using the trend-
+    # meter's own confidence level instead. ----
+    if state_label == "UPTREND-ACTIVE":
         return "long", {"reason": f"Futures-bot regime=B, Trend-Meter={state_label} confirmed"}
-    elif state_label in ("DOWNTREND-ACTIVE", "DOWNTREND-FORMING"):
+    elif state_label == "DOWNTREND-ACTIVE":
         return "short", {"reason": f"Futures-bot regime=B, Trend-Meter={state_label} confirmed"}
     return None, {"reason": f"Trend-Meter state '{state_label}' genuinely not "
-                             f"UP/DOWN (probably NEUTRAL)"}
+                             f"UPTREND-ACTIVE/DOWNTREND-ACTIVE (FORMING/NEUTRAL genuinely not enough anymore)"}
 
 
 # ============================================================
