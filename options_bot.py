@@ -96,7 +96,14 @@ TP_ITM_STRIKES = 3                  # final hard-TP: 3rd ITM strike's premium
 SL_OTM_STRIKES = 2                  # initial hard-SL: 2nd OTM strike's premium
 TRAIL_MILESTONE_STRIKES = [1, 2, 3]  # ITM levels that trigger a trail-up
 TIME_EXIT_MINUTES = 17.5           # midpoint of the agreed 15-20 min window
-COOLDOWN_MINUTES = 17.5            # midpoint of the agreed 15-20 min window
+# ---- CHANGED 2026-08-21: user's explicit, genuinely-clarified request
+# — "SIRФ simple 8-min cooldown chahiye, WIN ho ya LOSS, dono mein
+# genuinely 8-min hi lage, koई alag 4-loss wala extended cooldown
+# nahi" — a simpler earlier win/loss-differentiated + consecutive-loss
+# design was tried first, but genuinely NOT what was wanted. This is
+# the final, simple version: ONE flat cooldown, same for every exit
+# reason, both underlyings. ----
+COOLDOWN_MINUTES = 8
 LIMIT_CHASE_INTERVAL_SECONDS = 10
 LOOP_INTERVAL_SECONDS = 20
 # ---- CHANGED 2026-08-17: manual, configurable lot-size (user's
@@ -410,8 +417,10 @@ def find_strike_n_away(chain, atm_strike_price, option_type, n, direction):
 # fast enough move" requirement) — but the underlying direction+regime
 # read is now genuinely identical to the futures bot's.
 # ============================================================
-def detect_signal(underlying_symbol, futures_symbol):
-    """Returns ("long"/"short"/None, debug_info_dict)."""
+def detect_signal(underlying_symbol, futures_symbol, state):
+    """Returns ("long"/"short"/None, debug_info_dict). `state` is
+    genuinely needed now for the trend-meter persistence-gate (tracks
+    consecutive-loop counts across calls)."""
     try:
         import trend_scalp_live as algo
     except ImportError:
@@ -441,12 +450,44 @@ def detect_signal(underlying_symbol, futures_symbol):
     # tightening. ADX check was removed earlier (2026-08-17); this is
     # genuinely a DIFFERENT, tighter quality-filter using the trend-
     # meter's own confidence level instead. ----
+    if state_label not in ("UPTREND-ACTIVE", "DOWNTREND-ACTIVE"):
+        # ---- genuinely reset persistence-count whenever it's NOT
+        # active, so a later fresh ACTIVE-streak has to genuinely
+        # start from 1 again. ----
+        state.setdefault("trend_meter_persistence", {})[underlying_symbol] = \
+            {"state": state_label, "count": 0}
+        return None, {"reason": f"Trend-Meter state '{state_label}' genuinely not "
+                                 f"UPTREND-ACTIVE/DOWNTREND-ACTIVE (FORMING/NEUTRAL genuinely not enough anymore)"}
+
+    # ---- NEW 2026-08-21: user's explicit request — "4 loops mein
+    # active rahe tab trade le" — genuinely the SAME "persistence gate"
+    # philosophy already proven for market-regime (Logic C's own
+    # REGIME-GATE, "not a single-loop flicker") — a single-loop ACTIVE
+    # reading could genuinely be a brief flicker; requiring 4
+    # CONSECUTIVE loops of the SAME ACTIVE direction before trusting it
+    # genuinely filters that out. Counter resets to 1 if the direction
+    # flips (UP->DOWN) even if still "ACTIVE" on both, since that's
+    # genuinely a different signal, not a continuation. ----
+    persistence = state.setdefault("trend_meter_persistence", {})
+    prev = persistence.get(underlying_symbol, {"state": None, "count": 0})
+    if prev["state"] == state_label:
+        new_count = prev["count"] + 1
+    else:
+        new_count = 1
+    persistence[underlying_symbol] = {"state": state_label, "count": new_count}
+
+    REQUIRED_CONSECUTIVE_LOOPS = 4
+    if new_count < REQUIRED_CONSECUTIVE_LOOPS:
+        return None, {"reason": f"Trend-Meter genuinely just became {state_label} "
+                                 f"({new_count}/{REQUIRED_CONSECUTIVE_LOOPS} consecutive loops so far) — "
+                                 f"waiting for this to be sustained, not a single-loop flicker."}
+
     if state_label == "UPTREND-ACTIVE":
-        return "long", {"reason": f"Futures-bot regime=B, Trend-Meter={state_label} confirmed"}
-    elif state_label == "DOWNTREND-ACTIVE":
-        return "short", {"reason": f"Futures-bot regime=B, Trend-Meter={state_label} confirmed"}
-    return None, {"reason": f"Trend-Meter state '{state_label}' genuinely not "
-                             f"UPTREND-ACTIVE/DOWNTREND-ACTIVE (FORMING/NEUTRAL genuinely not enough anymore)"}
+        return "long", {"reason": f"Futures-bot regime=B, Trend-Meter={state_label} "
+                                   f"genuinely sustained for {new_count} loops — confirmed"}
+    else:
+        return "short", {"reason": f"Futures-bot regime=B, Trend-Meter={state_label} "
+                                    f"genuinely sustained for {new_count} loops — confirmed"}
 
 
 # ============================================================
@@ -749,7 +790,7 @@ def run_one_cycle(state):
                 continue
             cooldowns[underlying] = None
 
-        side, debug = detect_signal(underlying, futures_symbol)
+        side, debug = detect_signal(underlying, futures_symbol, state)
         print(f"  {underlying}: {debug.get('reason')}")
         if side is None:
             continue
@@ -962,6 +1003,11 @@ def _record_and_close(state, underlying, pos, exit_price, reason, now):
               f"for up to {SHADOW_MAX_MINUTES}min more, no real order)")
 
     state["positions"][underlying] = None
+
+    # ---- CHANGED 2026-08-21: user's genuinely-final, clarified request
+    # — SIMPLE flat cooldown, same for WIN or LOSS, both underlyings.
+    # (An earlier win/loss-differentiated + 4-consecutive-loss version
+    # was tried first, but genuinely wasn't what was wanted — reverted.) ----
     state.setdefault("cooldowns", {})[underlying] = \
         (now + timedelta(minutes=COOLDOWN_MINUTES)).strftime("%Y-%m-%d %H:%M:%S.%f")
     save_state(state)
