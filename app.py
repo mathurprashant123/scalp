@@ -1657,6 +1657,35 @@ def options_ai_log_page():
         return f"Options-bot AI-log genuinely unavailable: {e}", 500
 
 
+@app.route("/test_ai_key")
+def test_ai_key():
+    """---- NEW 2026-08-22: user's explicit request — "cross-check
+    karne ka tarika hai kya API-key sahi daali hai ya nahi" — genuinely
+    makes ONE tiny, cheap test call to the Anthropic API right now
+    (doesn't wait for a real trade signal) and reports back whether the
+    key genuinely works, so the person doesn't have to wait for market
+    conditions to line up just to check the key. ----"""
+    try:
+        import options_bot
+        if not options_bot.ANTHROPIC_API_KEY:
+            return "❌ Genuinely NO ANTHROPIC_API_KEY set in Render's environment variables."
+        r = options_bot.requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": options_bot.ANTHROPIC_API_KEY,
+                     "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-sonnet-5", "max_tokens": 20,
+                  "messages": [{"role": "user", "content": "Reply with only the word: OK"}]},
+            timeout=15)
+        if r.status_code == 200:
+            reply = r.json()["content"][0]["text"].strip()
+            return f"✅ Genuinely SUCCESS — API-key sahi hai. Claude replied: '{reply}'"
+        else:
+            return (f"❌ Genuinely FAILED — HTTP {r.status_code}. "
+                     f"Response: {r.text[:300]}")
+    except Exception as e:
+        return f"❌ Genuinely FAILED — Exception: {e}"
+
+
 @app.route("/live_pnl")
 def live_pnl():
     pos = algo.LATEST_STATE.get("position")
