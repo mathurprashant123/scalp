@@ -546,7 +546,7 @@ def get_ai_confirmation(underlying, direction, regime_label, trend_meter_state,
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01",
                      "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-6", "max_tokens": 200,
+            json={"model": "claude-sonnet-5", "max_tokens": 200,
                   "messages": [{"role": "user", "content": prompt}]},
             timeout=15)
         r.raise_for_status()
