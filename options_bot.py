@@ -55,6 +55,21 @@ def now_ist():
 
 API_KEY = os.environ.get("DELTA_API_KEY", "")
 API_SECRET = os.environ.get("DELTA_API_SECRET", "")
+# ---- NEW 2026-08-21: user's explicit request — "AI chart-pattern,
+# greeks, OI sab dekhe fir bataye" — genuinely uses Claude (via
+# Anthropic API) as a final judgment layer AFTER the existing 3 gates
+# (Regime=B, Trend-Meter=ACTIVE-4-loop-sustained, Strike-Restriction)
+# pass. Sends a real market snapshot (regime, trend-meter, ATM
+# option's own Greeks — confirmed available from Delta's API, recent
+# candle-pattern summary) and asks for a genuine confidence judgment
+# before the actual entry. Requires ANTHROPIC_API_KEY set on Render —
+# if missing or the call fails, genuinely FAILS OPEN (allows the trade
+# through on the original 3-gate logic alone) rather than silently
+# blocking all trading, since an API outage should never be a genuine
+# reason to freeze the whole bot. ----
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+AI_CONFIRMATION_ENABLED = os.environ.get("AI_CONFIRMATION_ENABLED", "false").lower() == "true"
+AI_CONFIDENCE_THRESHOLD = 60  # genuinely 0-100; below this, AI recommends skipping
 
 DRY_RUN = os.environ.get("OPTIONS_BOT_LIVE", "false").lower() != "true"
 
@@ -399,6 +414,154 @@ def find_strike_n_away(chain, atm_strike_price, option_type, n, direction):
     if 0 <= target_idx < len(candidates):
         return candidates[target_idx]
     return None
+
+
+def get_recent_candle_summary(underlying_symbol, count=20):
+    """
+    ---- CHANGED 2026-08-22: user's explicit, further request —
+    "AI-chart-pattern-bhi-padega, dekhega-bhi-kya-chal-raha-hai" — the
+    earlier version only sent aggregate stats (green/red count), which
+    genuinely isn't enough for real pattern-reading. This version
+    genuinely gives Claude much more to work with:
+    - the RAW sequence of recent closes (so it can see the actual shape)
+    - swing-structure: is price making Higher-Highs/Higher-Lows
+      (genuine uptrend structure) or Lower-Highs/Lower-Lows (genuine
+      downtrend structure), by comparing the first-half vs second-half
+      of the window
+    - how far current price is from the recent swing high/low (genuine
+      breakout vs pullback context)
+    Still fails safe — returns None on any error. ----
+    """
+    try:
+        symbol = underlying_symbol + "USD"
+        r = requests.get(f"{BASE_URL}/v2/history/candles",
+                          params={"resolution": "5m", "symbol": symbol,
+                                   "start": int(time.time()) - count * 300,
+                                   "end": int(time.time())}, timeout=10)
+        data = safe_result(r.json())
+        candles = data if isinstance(data, list) else []
+        if len(candles) < 4:
+            return None
+        candles = candles[-count:]
+        closes = [float(c["close"]) for c in candles]
+        opens = [float(c["open"]) for c in candles]
+        highs = [float(c["high"]) for c in candles]
+        lows = [float(c["low"]) for c in candles]
+        greens = sum(1 for o, c in zip(opens, closes) if c > o)
+        reds = len(candles) - greens
+        net_move_pct = (closes[-1] - closes[0]) / closes[0] * 100
+        ranges = [h - l for h, l in zip(highs, lows)]
+        expanding = ranges[-1] > (sum(ranges[:-1]) / len(ranges[:-1]) if len(ranges) > 1 else ranges[-1])
+
+        # ---- genuinely-simple swing structure: compare first-half vs
+        # second-half highs/lows to detect HH-HL (uptrend) or LH-LL
+        # (downtrend) or neither (range-bound/choppy). ----
+        mid = len(candles) // 2
+        first_half_high, first_half_low = max(highs[:mid]), min(lows[:mid])
+        second_half_high, second_half_low = max(highs[mid:]), min(lows[mid:])
+        if second_half_high > first_half_high and second_half_low > first_half_low:
+            structure = "Higher-Highs-Higher-Lows (genuine uptrend structure)"
+        elif second_half_high < first_half_high and second_half_low < first_half_low:
+            structure = "Lower-Highs-Lower-Lows (genuine downtrend structure)"
+        else:
+            structure = "Mixed/choppy — no clean directional structure"
+
+        swing_high, swing_low = max(highs), min(lows)
+        current_price = closes[-1]
+        dist_from_high_pct = (swing_high - current_price) / current_price * 100
+        dist_from_low_pct = (current_price - swing_low) / current_price * 100
+
+        return {
+            "candles_count": len(candles), "green_candles": greens, "red_candles": reds,
+            "net_move_pct": round(net_move_pct, 3),
+            "range_expanding": expanding,
+            "recent_closes": [round(c, 2) for c in closes],
+            "swing_structure": structure,
+            "swing_high": round(swing_high, 2), "swing_low": round(swing_low, 2),
+            "pct_below_swing_high": round(dist_from_high_pct, 3),
+            "pct_above_swing_low": round(dist_from_low_pct, 3),
+        }
+    except Exception as e:
+        print(f"  [WARN] genuinely couldn't fetch candle-summary for {underlying_symbol}: {e}")
+        return None
+
+
+def get_atm_greeks(chain, atm_strike_price, option_type):
+    """Genuinely extracts the ATM option's own Greeks (delta/gamma/
+    theta/vega) from the chain data — confirmed available from Delta's
+    ticker response. Returns None if genuinely not present (fails safe,
+    doesn't crash)."""
+    match = next((t for t in chain if t.get("contract_type") == option_type
+                  and t.get("strike_price") is not None
+                  and float(t["strike_price"]) == atm_strike_price), None)
+    if not match:
+        return None
+    return match.get("greeks")
+
+
+def get_ai_confirmation(underlying, direction, regime_label, trend_meter_state,
+                         greeks, candle_summary):
+    """
+    ---- NEW 2026-08-21: user's explicit, final request — genuinely
+    "AI chart-pattern samझe, greeks dekhe, sab kuch dekhe fir bataye".
+    Calls Claude (Anthropic API) with a real market snapshot and asks
+    for a genuine confidence judgment BEFORE the actual entry — this
+    is the 4th gate, layered on top of the existing 3 (Regime=B,
+    Trend-Meter=ACTIVE-4-loop, Strike-Restriction). FAILS OPEN by
+    design: if AI_CONFIRMATION_ENABLED is False, or the API key is
+    missing, or the call genuinely fails for any reason, this returns
+    an "allow" verdict — an API hiccup should never freeze the whole
+    bot; the original 3 gates remain the real safety net. ----
+    """
+    if not AI_CONFIRMATION_ENABLED:
+        return {"allow": True, "confidence": None, "reasoning": "AI-confirmation genuinely disabled"}
+    if not ANTHROPIC_API_KEY:
+        return {"allow": True, "confidence": None,
+                "reasoning": "genuinely no ANTHROPIC_API_KEY set — failing open"}
+
+    snapshot = {
+        "underlying": underlying, "proposed_direction": direction,
+        "market_regime": regime_label, "trend_meter_state": trend_meter_state,
+        "atm_option_greeks": greeks or "not available",
+        "recent_5min_candle_summary": candle_summary or "not available",
+    }
+    prompt = (
+        "You are evaluating a crypto options entry setup. Genuinely read the "
+        "recent_5min_candle_summary as a real chart: look at the swing_structure "
+        "(Higher-Highs-Higher-Lows vs Lower-Highs-Lower-Lows vs choppy), the "
+        "recent_closes sequence (does the shape support the proposed_direction, "
+        "or does it look exhausted/reversing?), how close price is to the "
+        "swing_high/swing_low (pct_below_swing_high, pct_above_swing_low — is this "
+        "a fresh breakout or a stretched, late move?), and range_expanding (is "
+        "momentum building or fading). Combine this with atm_option_greeks (e.g. "
+        "very high theta relative to premium makes an entry riskier — time is "
+        "working against you) and market_regime/trend_meter_state. "
+        "Reply with ONLY a JSON object, no other text: "
+        "{\"confidence\": <0-100 integer>, \"recommendation\": \"ENTER\" or \"SKIP\", "
+        "\"reasoning\": \"<one short sentence citing the specific chart/greeks detail that mattered most>\"}.\n\n"
+        f"Setup snapshot:\n{json.dumps(snapshot, indent=2)}"
+    )
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json={"model": "claude-sonnet-4-6", "max_tokens": 200,
+                  "messages": [{"role": "user", "content": prompt}]},
+            timeout=15)
+        r.raise_for_status()
+        text = r.json()["content"][0]["text"].strip()
+        text = text.replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(text)
+        confidence = int(parsed.get("confidence", 0))
+        allow = confidence >= AI_CONFIDENCE_THRESHOLD and parsed.get("recommendation") == "ENTER"
+        print(f"  [AI-CONFIRM] {underlying}: confidence={confidence}, "
+              f"recommendation={parsed.get('recommendation')}, reasoning={parsed.get('reasoning')}")
+        return {"allow": allow, "confidence": confidence, "reasoning": parsed.get("reasoning", "")}
+    except Exception as e:
+        print(f"  [WARN] AI-confirmation genuinely failed ({e}) — failing open, "
+              f"falling back to the original 3-gate logic.")
+        return {"allow": True, "confidence": None, "reasoning": f"genuinely failed: {e}"}
 
 
 # ============================================================
@@ -861,6 +1024,41 @@ def run_one_cycle(state):
         allowed, restriction_reason = check_strike_restriction(state, underlying, option_type, atm_strike)
         if not allowed:
             print(f"  {underlying}: SKIP — {restriction_reason}")
+            continue
+
+        # ---- NEW 2026-08-21: user's explicit, final request — 4th
+        # gate, genuinely a Claude-powered judgment using the ATM
+        # option's own Greeks + recent candle-pattern + regime/trend-
+        # meter, layered ON TOP of the existing 3 gates. See
+        # get_ai_confirmation()'s docstring for the fail-open design. ----
+        greeks = get_atm_greeks(chain, atm_strike, option_type)
+        candle_summary = get_recent_candle_summary(underlying)
+        try:
+            import trend_scalp_live as algo
+            regime_label = algo.LATEST_STATE.get("market_regime", {}).get("label") \
+                if algo.LATEST_STATE.get("market_regime") else None
+            trend_state = algo.LATEST_STATE.get("trend_meter", {}).get(futures_symbol, {}).get("state")
+        except ImportError:
+            regime_label, trend_state = None, None
+        ai_result = get_ai_confirmation(underlying, side, regime_label, trend_state,
+                                         greeks, candle_summary)
+        # ---- NEW 2026-08-22: user's explicit request — "hume dikhega
+        # bhi kya" — genuinely stores every REAL AI-confirmation call
+        # (allowed or declined) into a persistent, dashboard-visible
+        # history, not just buried in the scrolling logs. Only logs
+        # when AI-confirmation is genuinely ENABLED — otherwise every
+        # single loop would add a meaningless "disabled" entry. ----
+        if AI_CONFIRMATION_ENABLED:
+            state.setdefault("ai_confirmation_history", []).append({
+                "time": now_ist().strftime("%Y-%m-%d %H:%M:%S"), "underlying": underlying,
+                "direction": side, "confidence": ai_result["confidence"],
+                "allowed": ai_result["allow"], "reasoning": ai_result["reasoning"],
+            })
+            state["ai_confirmation_history"] = state["ai_confirmation_history"][-100:]
+            save_state(state)
+        if not ai_result["allow"]:
+            print(f"  {underlying}: SKIP — genuinely AI-confirmation declined "
+                  f"(confidence={ai_result['confidence']}, reasoning={ai_result['reasoning']})")
             continue
 
         product_id = atm["product_id"]

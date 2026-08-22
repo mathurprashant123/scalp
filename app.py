@@ -639,6 +639,63 @@ OPTIONS_SHADOW_TRADES_TEMPLATE = """
 """
 
 
+OPTIONS_AI_LOG_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Options-Bot AI-Confirmation Log</title>
+    <meta charset="utf-8">
+    <style>
+        body { background:#1e1e1e; color:#ddd; font-family: 'Segoe UI', sans-serif; margin:0; padding:20px; }
+        h1 { text-align:center; }
+        a.back { color:#4A90D9; text-decoration:none; display:block; text-align:center; margin-bottom:15px; }
+        table { border-collapse: collapse; width:100%; background:#0d0d0d; }
+        th, td { border:1px solid #333; padding:8px 10px; font-size:13px; text-align:center; }
+        th { background:#1a3c6e; color:white; }
+        tr.allowed { background:#0d2e0d; }
+        tr.declined { background:#2e0d0d; }
+        .summary-box { background:#0d0d0d; border-radius:8px; padding:15px 25px; margin: 0 auto 25px auto;
+                       max-width: 560px; text-align:center; font-size:16px; }
+        .status-on { color:#4CAF50; font-weight:bold; }
+        .status-off { color:#E85D5D; font-weight:bold; }
+        .reasoning { max-width: 280px; text-align:left; }
+    </style>
+</head>
+<body>
+    <a class="back" href="/">&larr; Back to Dashboard</a>
+    <h1>Options-Bot — AI-Confirmation Log</h1>
+
+    <div class="summary-box">
+        <div>AI-Confirmation genuinely: <span class="{{ 'status-on' if ai_enabled else 'status-off' }}">
+            {{ 'ENABLED' if ai_enabled else 'DISABLED (default)' }}</span></div>
+        <div>Total Genuinely-Evaluated: <b>{{ total }}</b>
+             &nbsp;|&nbsp; Allowed: <b style="color:#4CAF50">{{ allowed_count }}</b>
+             &nbsp;|&nbsp; Declined: <b style="color:#E85D5D">{{ declined_count }}</b></div>
+    </div>
+
+    <table>
+        <tr>
+            <th>Time</th><th>Underlying</th><th>Direction</th>
+            <th>Confidence</th><th>Verdict</th><th>Reasoning</th>
+        </tr>
+        {% for e in entries %}
+        <tr class="{{ 'allowed' if e.allowed else 'declined' }}">
+            <td>{{ e.time }}</td><td>{{ e.underlying }}</td><td>{{ e.direction }}</td>
+            <td>{{ e.confidence if e.confidence is not none else 'N/A' }}</td>
+            <td>{{ 'ENTER' if e.allowed else 'SKIP' }}</td>
+            <td class="reasoning">{{ e.reasoning }}</td>
+        </tr>
+        {% endfor %}
+        {% if entries|length == 0 %}
+        <tr><td colspan="6">Genuinely-abhi-tak-koई-AI-confirmation-call-nahi-huई
+            {{ '(AI-confirmation-abhi-disabled-hai)' if not ai_enabled else '' }}.</td></tr>
+        {% endif %}
+    </table>
+</body>
+</html>
+"""
+
+
 class WebLogRedirector:
     """Captures print() output from the algo into our log buffer."""
     def write(self, message):
@@ -1183,7 +1240,9 @@ PAGE_TEMPLATE = """
                                 posHtml + tradesHtml +
                                 `<div style="text-align:center; margin-top:8px;">` +
                                 `<a href="/options_trades" style="color:#4A90D9; font-size:12px;">` +
-                                `📊 Poора Options Trades Log Dekhein &rarr;</a></div>`;
+                                `📊 Poора Options Trades Log Dekhein &rarr;</a> &nbsp;|&nbsp; ` +
+                                `<a href="/options_ai_log" style="color:#4A90D9; font-size:12px;">` +
+                                `🤖 AI-Confirmation Log Dekhein &rarr;</a></div>`;
             });
         }
         setInterval(refreshOptionsBot, 5000);
@@ -1576,6 +1635,26 @@ def options_shadow_trades_page():
             real_total=real_total, shadow_total=shadow_total, total=len(shadows))
     except Exception as e:
         return f"Options-bot shadow-trades genuinely unavailable: {e}", 500
+
+
+@app.route("/options_ai_log")
+def options_ai_log_page():
+    """---- NEW 2026-08-22: user's explicit request — "hume dikhega bhi
+    kya" — genuinely surfaces every real AI-confirmation decision
+    (allowed or declined) that options_bot.py made, so it's visible on
+    a dashboard page instead of only buried in the scrolling logs. ----"""
+    try:
+        import options_bot
+        state = options_bot.load_state()
+        entries = list(reversed(state.get("ai_confirmation_history", [])))
+        allowed_count = sum(1 for e in entries if e["allowed"])
+        declined_count = len(entries) - allowed_count
+        return render_template_string(
+            OPTIONS_AI_LOG_TEMPLATE, entries=entries, allowed_count=allowed_count,
+            declined_count=declined_count, total=len(entries),
+            ai_enabled=options_bot.AI_CONFIRMATION_ENABLED)
+    except Exception as e:
+        return f"Options-bot AI-log genuinely unavailable: {e}", 500
 
 
 @app.route("/live_pnl")
