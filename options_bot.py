@@ -486,19 +486,6 @@ def get_recent_candle_summary(underlying_symbol, count=20):
         return None
 
 
-def get_atm_greeks(chain, atm_strike_price, option_type):
-    """Genuinely extracts the ATM option's own Greeks (delta/gamma/
-    theta/vega) from the chain data — confirmed available from Delta's
-    ticker response. Returns None if genuinely not present (fails safe,
-    doesn't crash)."""
-    match = next((t for t in chain if t.get("contract_type") == option_type
-                  and t.get("strike_price") is not None
-                  and float(t["strike_price"]) == atm_strike_price), None)
-    if not match:
-        return None
-    return match.get("greeks")
-
-
 def get_ai_confirmation(underlying, direction, regime_label, trend_meter_state,
                          greeks, candle_summary):
     """
@@ -550,8 +537,23 @@ def get_ai_confirmation(underlying, direction, regime_label, trend_meter_state,
                   "messages": [{"role": "user", "content": prompt}]},
             timeout=15)
         r.raise_for_status()
-        text = r.json()["content"][0]["text"].strip()
-        text = text.replace("```json", "").replace("```", "").strip()
+        # ---- FIXED 2026-08-23: CRITICAL bug, genuinely confirmed via
+        # real production data — 2 real calls genuinely failed with
+        # "genuinely failed: 'text'" and fell back to fail-open
+        # (allowing entry WITHOUT a real AI judgment). Root cause:
+        # blindly assuming content[0] always has a "text" key — but
+        # Claude's response can genuinely include other block types
+        # first (or, rarely, an empty content array), so content[0]
+        # isn't always the text block. Fix: genuinely search ALL
+        # content blocks for the first one with a "text" field, and
+        # raise a clear, catchable error if none exists (still fails
+        # open, but the log will show the CORRECT diagnosis instead of
+        # a generic 'text' KeyError). ----
+        content_blocks = r.json().get("content", [])
+        text = next((b.get("text") for b in content_blocks if b.get("text")), None)
+        if text is None:
+            raise ValueError(f"genuinely no text block found in response content: {content_blocks}")
+        text = text.strip().replace("```json", "").replace("```", "").strip()
         parsed = json.loads(text)
         confidence = int(parsed.get("confidence", 0))
         allow = confidence >= AI_CONFIDENCE_THRESHOLD and parsed.get("recommendation") == "ENTER"
@@ -1018,20 +1020,43 @@ def run_one_cycle(state):
             continue
         atm_strike = float(atm["strike_price"])
 
-        # ---- NEW 2026-08-20: Per-Strike Trade Restriction check
-        # (user's explicit request) — see check_strike_restriction()
-        # docstring above for the full reasoning. ----
-        allowed, restriction_reason = check_strike_restriction(state, underlying, option_type, atm_strike)
-        if not allowed:
-            print(f"  {underlying}: SKIP — {restriction_reason}")
-            continue
+        # ---- NEW 2026-08-24: user's explicit, genuinely-reasoned
+        # request — "2-ITM strike pe trade karein, Greeks bhi pareshan
+        # nahi karenge?" — genuinely trades a strike 2-ITM from real
+        # ATM instead of ATM itself. Reasoning (confirmed with user):
+        # an ITM option's premium is genuinely PART intrinsic value
+        # (never decays) and part time-value (decays via theta) — so a
+        # SMALLER fraction of the premium is exposed to theta than a
+        # pure-time-value ATM option, at the cost of a higher premium
+        # (less leverage) and higher delta (more directional exposure,
+        # less "optionality"). Falls back to ATM itself if genuinely
+        # not enough ITM strikes exist on the chain (edge of the chain). ----
+        ENTRY_ITM_STRIKES = 2
+        entry_data = find_strike_n_away(chain, atm_strike, option_type, ENTRY_ITM_STRIKES, "itm")
+        if entry_data is None:
+            print(f"  [WARN] {underlying}: genuinely not enough ITM strikes on chain — "
+                  f"falling back to ATM for this entry.")
+            entry_data = atm
+        entry_strike = float(entry_data["strike_price"])
+        entry_is_fallback_atm = (entry_data is atm)
+
+        # ---- CHANGED 2026-08-24: user's explicit request — "same
+        # strike restriction hata do" — genuinely REMOVED. The bot can
+        # now trade the same strike repeatedly, no max-2-trades or
+        # 1.5hr-gap limit. record_strike_trade() call below is
+        # genuinely kept (harmless bookkeeping, still visible in state
+        # if ever needed again) but check_strike_restriction() is no
+        # longer called as a gate. ----
 
         # ---- NEW 2026-08-21: user's explicit, final request — 4th
-        # gate, genuinely a Claude-powered judgment using the ATM
+        # gate, genuinely a Claude-powered judgment using the traded
         # option's own Greeks + recent candle-pattern + regime/trend-
         # meter, layered ON TOP of the existing 3 gates. See
         # get_ai_confirmation()'s docstring for the fail-open design. ----
-        greeks = get_atm_greeks(chain, atm_strike, option_type)
+        # ---- CHANGED 2026-08-24: genuinely uses entry_data (the ACTUAL
+        # traded strike, now 2-ITM by default) instead of atm, so the AI
+        # sees the real Greeks of what's about to be bought. ----
+        greeks = entry_data.get("greeks")
         candle_summary = get_recent_candle_summary(underlying)
         try:
             import trend_scalp_live as algo
@@ -1061,10 +1086,10 @@ def run_one_cycle(state):
                   f"(confidence={ai_result['confidence']}, reasoning={ai_result['reasoning']})")
             continue
 
-        product_id = atm["product_id"]
+        product_id = entry_data["product_id"]
         lot_size = get_lot_size(state)  # ---- CHANGED 2026-08-18: genuinely dashboard-configurable, not fixed at deploy-time ----
 
-        def get_ask(symbol=atm["symbol"], fallback=atm.get("mark_price")):
+        def get_ask(symbol=entry_data["symbol"], fallback=entry_data.get("mark_price")):
             r = requests.get(f"{BASE_URL}/v2/tickers/{symbol}", timeout=10)
             return float(safe_result(r.json()).get("quotes", {}).get("best_ask") or fallback)
 
@@ -1082,7 +1107,8 @@ def run_one_cycle(state):
         # option-chain snapshot and compute milestone/SL references
         # from THAT — genuinely tied to the moment of actual execution,
         # not the moment we merely decided to attempt entry. ----
-        print(f"  {underlying}: ENTERING {side.upper()} via {atm['symbol']} size={lot_size}")
+        print(f"  {underlying}: ENTERING {side.upper()} via {entry_data['symbol']} "
+              f"(genuinely {'ATM-fallback' if entry_is_fallback_atm else f'{ENTRY_ITM_STRIKES}-ITM from ATM'}) size={lot_size}")
         result = limit_order_chase(product_id, "buy", lot_size, get_ask, label=f"{underlying}-ENTRY",
                                     live=get_live_mode(state))
         if not result["filled"]:
@@ -1093,10 +1119,10 @@ def run_one_cycle(state):
         milestone_refs = {}
         if fresh_chain:
             for m in TRAIL_MILESTONE_STRIKES:
-                ref = find_strike_n_away(fresh_chain, atm_strike, option_type, m, "itm")
+                ref = find_strike_n_away(fresh_chain, entry_strike, option_type, m, "itm")
                 if ref is not None:
                     milestone_refs[m] = float(ref.get("mark_price"))
-            sl_ref_fresh = find_strike_n_away(fresh_chain, atm_strike, option_type, SL_OTM_STRIKES, "otm")
+            sl_ref_fresh = find_strike_n_away(fresh_chain, entry_strike, option_type, SL_OTM_STRIKES, "otm")
         else:
             sl_ref_fresh = None
 
@@ -1118,10 +1144,10 @@ def run_one_cycle(state):
               f"milestones={milestone_refs}, SL={sl_target}")
 
         positions[underlying] = {
-            "underlying": underlying, "symbol": atm["symbol"], "product_id": product_id,
+            "underlying": underlying, "symbol": entry_data["symbol"], "product_id": product_id,
             "side": side, "size": lot_size, "entry_price": result["fill_price"],
             "entry_time": now.strftime("%Y-%m-%d %H:%M:%S.%f"),
-            "entry_spot_price": spot, "strike": atm_strike,
+            "entry_spot_price": spot, "strike": entry_strike,
             "tp_target_premium": milestone_refs[TP_ITM_STRIKES],
             "sl_target_premium": sl_target,
             "initial_sl_premium": sl_target,
@@ -1131,7 +1157,7 @@ def run_one_cycle(state):
         }
         # ---- NEW 2026-08-20: genuinely record this strike's usage for
         # the Per-Strike Trade Restriction (see check_strike_restriction). ----
-        record_strike_trade(state, underlying, option_type, atm_strike)
+        record_strike_trade(state, underlying, option_type, entry_strike)
 
         # ---- NEW 2026-08-20: genuinely place a REAL exchange-side
         # bracket order (SL+TP) right after entry — user's confirmed
@@ -1141,7 +1167,7 @@ def run_one_cycle(state):
         if get_live_mode(state):
             try:
                 bracket_result = place_options_bracket(
-                    product_id, atm["symbol"], sl_target, milestone_refs[TP_ITM_STRIKES])
+                    product_id, entry_data["symbol"], sl_target, milestone_refs[TP_ITM_STRIKES])
                 print(f"  {underlying}: genuinely placed EXCHANGE-SIDE bracket "
                       f"(SL={sl_target}, TP={milestone_refs[TP_ITM_STRIKES]}) — {bracket_result}")
             except Exception as e:
@@ -1337,11 +1363,19 @@ def manage_open_position(state, underlying):
     # a real trade-off the user explicitly chose. ----
     hit_tp = current_premium >= pos["tp_target_premium"]  # 3-ITM level = fixed final TP
     hit_sl = current_premium <= pos["sl_target_premium"]  # genuinely fixed, never trails
-    hit_time = elapsed_min >= TIME_EXIT_MINUTES
+    # ---- CHANGED 2026-08-24: user's explicit request — "exit time
+    # limit hata do" — genuinely REMOVED the 17.5-min forced time-exit.
+    # Position now genuinely stays open until fixed TP or SL is hit
+    # (or the exchange's own bracket order fires, whichever is first).
+    # Honest risk noted to the user: without a time-exit, a position
+    # that sits in a stalled range between SL and TP can genuinely stay
+    # open indefinitely, continuing to bleed theta with no exit
+    # mechanism except the fixed SL/TP. ----
+    hit_time = False
 
     print(f"  [POSITION] {underlying} {pos['symbol']} entry={pos['entry_price']} "
           f"current={current_premium} elapsed={elapsed_min:.1f}min "
-          f"SL={pos['sl_target_premium']} TP={pos['tp_target_premium']} (genuinely-fixed, no-trail)")
+          f"SL={pos['sl_target_premium']} TP={pos['tp_target_premium']} (genuinely-fixed, no-trail, no-time-exit)")
 
     if not (hit_tp or hit_sl or hit_time):
         save_state(state)  # persist the (possibly-updated) trailing SL even without an exit
