@@ -546,7 +546,8 @@ def get_ai_confirmation(underlying, direction, regime_label, trend_meter_state,
         "trend_meter_state when it shows a clear, sustained, structural break "
         "(not just the last few candles), or when price has moved a meaningful "
         "distance against the proposed direction.\n\n"
-        "Reply with ONLY a JSON object, no other text: "
+        "Reply with ONLY a JSON object, no other text. Keep the reasoning field "
+        "genuinely SHORT (max ~20 words) so the JSON is never cut off: "
         "{\"confidence\": <0-100 integer>, \"recommendation\": \"ENTER\" or \"SKIP\", "
         "\"reasoning\": \"<one short sentence citing the specific chart/greeks detail that mattered most>\"}.\n\n"
         f"Setup snapshot:\n{json.dumps(snapshot, indent=2)}"
@@ -556,7 +557,7 @@ def get_ai_confirmation(underlying, direction, regime_label, trend_meter_state,
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01",
                      "content-type": "application/json"},
-            json={"model": "claude-sonnet-5", "max_tokens": 200,
+            json={"model": "claude-sonnet-5", "max_tokens": 400,
                   "messages": [{"role": "user", "content": prompt}]},
             timeout=15)
         r.raise_for_status()
