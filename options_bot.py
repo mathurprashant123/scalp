@@ -451,6 +451,24 @@ def get_recent_candle_summary(underlying_symbol, count=40):
         candles = data if isinstance(data, list) else []
         if len(candles) < 4:
             return None
+        # ---- FIXED 2026-08-24: CRITICAL bug, genuinely confirmed via
+        # Delta's own community forum + real production evidence — the
+        # AI was declining 100% of trades even during CLEAR, visible
+        # uptrends (BTC genuinely climbing $78,340→$78,655 in the logs,
+        # yet AI said "Lower-Highs-Lower-Lows, price near swing low").
+        # Root cause: Delta's /v2/history/candles genuinely returns
+        # candles NEWEST-FIRST (confirmed: "first object in the array
+        # is the latest one, last object is the first one" — Delta's
+        # own community forum) — but this code assumed OLDEST-FIRST,
+        # so `candles[-1]` (used as "current price") was actually the
+        # OLDEST candle in the window, and the whole first-half/second-
+        # half swing-structure comparison was genuinely INVERTED —
+        # reading every uptrend as a downtrend and vice versa. Fix:
+        # genuinely sort by the candle's own "time" field ascending —
+        # this is robust regardless of whatever order the API actually
+        # returns them in, rather than trusting an assumption either way. ----
+        if all("time" in c for c in candles):
+            candles = sorted(candles, key=lambda c: c["time"])
         candles = candles[-count:]
         closes = [float(c["close"]) for c in candles]
         opens = [float(c["open"]) for c in candles]
