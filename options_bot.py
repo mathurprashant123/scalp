@@ -416,8 +416,17 @@ def find_strike_n_away(chain, atm_strike_price, option_type, n, direction):
     return None
 
 
-def get_recent_candle_summary(underlying_symbol, count=20):
+def get_recent_candle_summary(underlying_symbol, count=40):
     """
+    ---- CHANGED 2026-08-24: user's explicit, real-data-confirmed
+    request — genuinely widened from 20 to 40 candles (~3.3 hours
+    instead of 100 minutes). Root cause it fixes: a REAL confirmed case
+    (BTC genuinely rallying $76,000→$77,500) where AI's narrow
+    100-minute window saw only a brief pullback and mistook it for a
+    full "Lower-Highs-Lower-Lows" reversal, declining a genuinely good
+    long. A wider window gives the AI more of the actual bigger-picture
+    trend structure to judge against.
+
     ---- CHANGED 2026-08-22: user's explicit, further request —
     "AI-chart-pattern-bhi-padega, dekhega-bhi-kya-chal-raha-hai" — the
     earlier version only sent aggregate stats (green/red count), which
@@ -522,7 +531,21 @@ def get_ai_confirmation(underlying, direction, regime_label, trend_meter_state,
         "a fresh breakout or a stretched, late move?), and range_expanding (is "
         "momentum building or fading). Combine this with atm_option_greeks (e.g. "
         "very high theta relative to premium makes an entry riskier — time is "
-        "working against you) and market_regime/trend_meter_state. "
+        "working against you) and market_regime/trend_meter_state.\n\n"
+        "IMPORTANT: trend_meter_state is a genuinely higher-timeframe signal "
+        "(15-min EMA-based, already sustained for several loops before this call "
+        "even happens) — it represents the established, larger trend. The "
+        "recent_5min_candle_summary is a genuinely shorter, ~3.3-hour window. If "
+        "the candle data shows a brief pullback or minor countertrend wiggle that "
+        "does NOT break the broader structure (e.g., price still well above the "
+        "window's earlier lows, or the 'Lower-Highs-Lower-Lows' pattern is only in "
+        "the most recent few candles rather than the whole window), do NOT treat "
+        "that alone as a reason to reject a trade aligned with trend_meter_state — "
+        "a short pullback inside a larger confirmed trend is normal, not a genuine "
+        "reversal. Only weight the recent candle pattern heavily against "
+        "trend_meter_state when it shows a clear, sustained, structural break "
+        "(not just the last few candles), or when price has moved a meaningful "
+        "distance against the proposed direction.\n\n"
         "Reply with ONLY a JSON object, no other text: "
         "{\"confidence\": <0-100 integer>, \"recommendation\": \"ENTER\" or \"SKIP\", "
         "\"reasoning\": \"<one short sentence citing the specific chart/greeks detail that mattered most>\"}.\n\n"
