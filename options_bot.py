@@ -647,34 +647,38 @@ def detect_signal(underlying_symbol, futures_symbol, state):
     symbol_meter = meter[underlying_symbol + "USD"]
     state_label = symbol_meter.get("state")
 
-    # ---- CHANGED 2026-08-21: user's explicit request — "sirf ACTIVE
-    # dekhe, FORMING nahi" — "-FORMING" states are genuinely a WEAKER,
-    # still-developing signal (the trend hasn't genuinely confirmed
-    # yet), while "-ACTIVE" is the futures-bot's own stronger,
-    # confirmed reading. Session-wise data (21-Aug) showed the
-    # Late-Night session — where many FORMING-based entries happened —
-    # performing genuinely worst (12% win-rate), motivating this
-    # tightening. ADX check was removed earlier (2026-08-17); this is
-    # genuinely a DIFFERENT, tighter quality-filter using the trend-
-    # meter's own confidence level instead. ----
-    if state_label not in ("UPTREND-ACTIVE", "DOWNTREND-ACTIVE"):
+    # ---- CHANGED 2026-08-24: user's explicit, further request —
+    # "isko FORMING mein bhi enable kardo, kyuki abh AI hai" — earlier
+    # (2026-08-21) this was tightened to ACTIVE-only because there was
+    # NO other quality-filter and FORMING-based entries genuinely
+    # performed worst (12% win-rate in the Late-Night session data).
+    # Now that AI-confirmation genuinely exists as a 4th gate (reading
+    # real chart-structure + Greeks before every entry), it can
+    # genuinely do the job the ACTIVE-only restriction was covering —
+    # so FORMING states are allowed through again, with AI as the
+    # actual quality-filter instead of a blunt ACTIVE/FORMING label.
+    # NEUTRAL still genuinely blocks (no directional signal at all —
+    # nothing for AI to even evaluate a direction against). ----
+    if state_label not in ("UPTREND-ACTIVE", "DOWNTREND-ACTIVE",
+                            "UPTREND-FORMING", "DOWNTREND-FORMING"):
         # ---- genuinely reset persistence-count whenever it's NOT
-        # active, so a later fresh ACTIVE-streak has to genuinely
-        # start from 1 again. ----
+        # a directional state, so a later fresh streak has to
+        # genuinely start from 1 again. ----
         state.setdefault("trend_meter_persistence", {})[underlying_symbol] = \
             {"state": state_label, "count": 0}
-        return None, {"reason": f"Trend-Meter state '{state_label}' genuinely not "
-                                 f"UPTREND-ACTIVE/DOWNTREND-ACTIVE (FORMING/NEUTRAL genuinely not enough anymore)"}
+        return None, {"reason": f"Trend-Meter state '{state_label}' genuinely NEUTRAL — "
+                                 f"no directional signal to evaluate"}
 
     # ---- NEW 2026-08-21: user's explicit request — "4 loops mein
     # active rahe tab trade le" — genuinely the SAME "persistence gate"
     # philosophy already proven for market-regime (Logic C's own
-    # REGIME-GATE, "not a single-loop flicker") — a single-loop ACTIVE
-    # reading could genuinely be a brief flicker; requiring 4
-    # CONSECUTIVE loops of the SAME ACTIVE direction before trusting it
-    # genuinely filters that out. Counter resets to 1 if the direction
-    # flips (UP->DOWN) even if still "ACTIVE" on both, since that's
-    # genuinely a different signal, not a continuation. ----
+    # REGIME-GATE, "not a single-loop flicker") — a single-loop
+    # directional reading could genuinely be a brief flicker; requiring
+    # 4 CONSECUTIVE loops of the SAME state before trusting it
+    # genuinely filters that out. Counter resets to 1 if the state
+    # changes at all (including ACTIVE<->FORMING flips within the same
+    # direction), since a state-transition genuinely deserves fresh
+    # confirmation, not silent continuation. ----
     persistence = state.setdefault("trend_meter_persistence", {})
     prev = persistence.get(underlying_symbol, {"state": None, "count": 0})
     if prev["state"] == state_label:
@@ -689,12 +693,14 @@ def detect_signal(underlying_symbol, futures_symbol, state):
                                  f"({new_count}/{REQUIRED_CONSECUTIVE_LOOPS} consecutive loops so far) — "
                                  f"waiting for this to be sustained, not a single-loop flicker."}
 
-    if state_label == "UPTREND-ACTIVE":
+    if state_label in ("UPTREND-ACTIVE", "UPTREND-FORMING"):
         return "long", {"reason": f"Futures-bot regime=B, Trend-Meter={state_label} "
-                                   f"genuinely sustained for {new_count} loops — confirmed"}
+                                   f"genuinely sustained for {new_count} loops — confirmed "
+                                   f"(AI-confirmation will genuinely judge quality)"}
     else:
         return "short", {"reason": f"Futures-bot regime=B, Trend-Meter={state_label} "
-                                    f"genuinely sustained for {new_count} loops — confirmed"}
+                                    f"genuinely sustained for {new_count} loops — confirmed "
+                                    f"(AI-confirmation will genuinely judge quality)"}
 
 
 # ============================================================
