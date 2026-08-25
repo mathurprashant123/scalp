@@ -867,6 +867,7 @@ PAGE_TEMPLATE = """
     <div id="regimeBanner" class="hidden"></div>
     <div id="trendMeter" class="hidden"></div>
     <div id="supportResistance" class="hidden"></div>
+    <div id="orderBookSR" class="hidden"></div>
     <div id="optionsBotCard" class="hidden"></div>
     <!-- ---- NEW 2026-08-18: user's explicit request — "roz roz
     Environment Variable thodi na change karta rahunga" — genuine
@@ -1290,7 +1291,7 @@ PAGE_TEMPLATE = """
                     const d = data[sym];
                     const res = d.resistance ? `${d.resistance.level} <span class="touches">(${d.resistance.touches}x)</span>` : 'N/A';
                     const sup = d.support ? `${d.support.level} <span class="touches">(${d.support.touches}x)</span>` : 'N/A';
-                    return `<div class="sr-card"><div class="sym">${sym} — S/R</div>` +
+                    return `<div class="sr-card"><div class="sym">${sym} — Chart-S/R</div>` +
                            `<div class="levels"><span class="sup">S: ${sup}</span>` +
                            `<span class="res">R: ${res}</span></div></div>`;
                 }).join('');
@@ -1298,6 +1299,28 @@ PAGE_TEMPLATE = """
         }
         setInterval(refreshSupportResistance, 5000);
         refreshSupportResistance();
+
+        function refreshOrderBookSR() {
+            fetch('/order_book_sr').then(r => r.json()).then(data => {
+                const el = document.getElementById('orderBookSR');
+                const syms = Object.keys(data || {});
+                if (syms.length === 0) {
+                    el.className = 'hidden';
+                    return;
+                }
+                el.className = '';
+                el.innerHTML = syms.map(sym => {
+                    const d = data[sym];
+                    const res = d.resistance ? `${d.resistance.price} <span class="touches">(size ${d.resistance.size})</span>` : 'N/A';
+                    const sup = d.support ? `${d.support.price} <span class="touches">(size ${d.support.size})</span>` : 'N/A';
+                    return `<div class="sr-card"><div class="sym">${sym} — Order-Book-S/R (Live)</div>` +
+                           `<div class="levels"><span class="sup">S: ${sup}</span>` +
+                           `<span class="res">R: ${res}</span></div></div>`;
+                }).join('');
+            });
+        }
+        setInterval(refreshOrderBookSR, 5000);
+        refreshOrderBookSR();
 
         function refreshOptionsBot() {
             fetch('/options_status').then(r => r.json()).then(data => {
@@ -1591,6 +1614,18 @@ def support_resistance():
     if sr is None:
         return jsonify({})
     return jsonify(sr)
+
+
+@app.route("/order_book_sr")
+def order_book_sr():
+    """---- NEW 2026-08-25: user's explicit, valid point — "chota
+    account testing amount hai, technical-quality kam mat karo" —
+    genuinely a JSON API for the LIVE order-book based S/R, same
+    pattern as /support_resistance. ----"""
+    ob_sr = algo.LATEST_STATE.get("order_book_sr")
+    if ob_sr is None:
+        return jsonify({})
+    return jsonify(ob_sr)
 
 
 @app.route("/start_oi_warmup", methods=["POST"])

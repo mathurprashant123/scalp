@@ -1245,6 +1245,46 @@ def get_open_interest(symbol):
         return None, None
 
 
+def get_order_book_support_resistance(symbol):
+    """
+    ---- NEW 2026-08-25: user's explicit, well-reasoned request —
+    "chota account hai, yeh sirf testing amount hai... jab lagega sab
+    sahi hai, balance increased deposit ho jayega" — genuinely correct
+    point that account-size shouldn't limit technical quality. This
+    genuinely uses Delta's REAL, LIVE order-book depth (confirmed via
+    Delta's own docs: /v2/l2orderbook/{symbol}, public endpoint, no
+    auth needed) rather than historical candle-based swing-pivots.
+
+    Finds the SINGLE largest-size level on each side (buy-side =
+    genuine support "wall", sell-side = genuine resistance "wall") —
+    a genuinely forward-looking, real-time signal, complementing (not
+    replacing) the candle-based Chart-S/R which is backward-looking.
+    Fails safe — returns None on any failure. ----
+    """
+    try:
+        r = requests.get(f"{config.REAL_DATA_BASE_URL}/v2/l2orderbook/{symbol}", timeout=10)
+        r.raise_for_status()
+        result = r.json().get("result", {})
+        buy_levels = result.get("buy", [])
+        sell_levels = result.get("sell", [])
+        if not buy_levels or not sell_levels:
+            return None
+
+        biggest_buy = max(buy_levels, key=lambda lvl: float(lvl.get("size", 0)))
+        biggest_sell = max(sell_levels, key=lambda lvl: float(lvl.get("size", 0)))
+
+        return {
+            "support": {"price": round(float(biggest_buy["price"]), 2),
+                        "size": int(float(biggest_buy["size"]))},
+            "resistance": {"price": round(float(biggest_sell["price"]), 2),
+                           "size": int(float(biggest_sell["size"]))},
+        }
+    except Exception as e:
+        print(f"    [WARN] Couldn't fetch order-book S/R for {symbol} ({e}) — "
+              f"skipping this loop, Chart-S/R still genuinely available.")
+        return None
+
+
 def start_oi_warmup(state):
     """
     ---- NEW 2026-08-13: user-triggered OI Warm-Up. Clears existing OI
@@ -5042,8 +5082,19 @@ def run_one_signal_only_iteration(state):
     # ---- NEW 2026-08-25: user's explicit request — "Jaise-Upar-
     # Uptrend-Downtrend-Dikhta-Hai, Aise-Hi-Support-Resistance-Bhi-
     # Dikhe" — genuinely computed alongside regime/trend-meter, same
-    # cadence. ----
+    # cadence. compute_support_resistance() genuinely stores directly
+    # into LATEST_STATE["support_resistance"] itself. ----
     compute_support_resistance(symbol_data_a)
+    # ---- NEW 2026-08-25: user's explicit, valid point — "chota
+    # account testing amount hai, technical-quality kam mat karo" —
+    # genuinely LIVE order-book based S/R alongside the candle-based
+    # Chart-S/R computed above. ----
+    ob_sr_results = {}
+    for sym in symbol_data_a.keys():
+        ob_sr = get_order_book_support_resistance(sym)
+        if ob_sr is not None:
+            ob_sr_results[sym] = ob_sr
+    LATEST_STATE["order_book_sr"] = ob_sr_results if ob_sr_results else None
     print(f"  [SIGNAL] regime={LATEST_STATE.get('market_regime', {}).get('label') if LATEST_STATE.get('market_regime') else None} "
           f"trend_meter={ {s: v.get('state') for s, v in (LATEST_STATE.get('trend_meter') or {}).items()} }")
 
