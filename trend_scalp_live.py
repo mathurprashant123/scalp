@@ -4767,6 +4767,91 @@ def look_for_entry_c(state, symbol_data, bias_data, products):
 # Main loop — wrapped so it NEVER stops on its own
 # ============================================================
 
+def compute_support_resistance(symbol_data_a):
+    """
+    ---- NEW 2026-08-25: user's explicit request — "Jaise-Upar-Uptrend-
+    Downtrend-Dikhta-Hai, Aise-Hi-Support-And-Resistance-Bhi-Dikhe" —
+    genuinely finds the nearest meaningful Support (below current
+    price) and Resistance (above current price) levels using swing-
+    pivot detection + clustering on the SAME 15-min, 60-hour dataset
+    already being fetched for Logic-A (no extra API calls needed).
+
+    Method (genuinely standard technical-analysis approach):
+    1. Find local swing highs/lows — a candle's high/low is a genuine
+       "pivot" if it's the highest/lowest point within a small window
+       on both sides (filters out noise, keeps real turning points).
+    2. Cluster nearby pivots together (within CLUSTER_TOLERANCE_PCT of
+       each other) — a level genuinely "tested" multiple times is more
+       meaningful than one touched only once.
+    3. Pick the cluster with the MOST touches on each side of current
+       price (nearest-below = Support, nearest-above = Resistance),
+       genuinely preferring well-tested levels over the single most
+       extreme high/low.
+    Stores results in LATEST_STATE["support_resistance"]. Fails safe —
+    a symbol with insufficient data genuinely gets None for both. ----
+    """
+    PIVOT_WINDOW = 5           # genuinely-candles-on-each-side to confirm a swing point
+    CLUSTER_TOLERANCE_PCT = 0.3  # genuinely-group-pivots-within-0.3%-of-each-other
+    RECENT_CANDLES = 150       # genuinely-look-back-window-for-pivot-search (~37hr on 15m)
+
+    results = {}
+    for sym, df in symbol_data_a.items():
+        if df is None or len(df) < PIVOT_WINDOW * 2 + 10:
+            results[sym] = {"support": None, "resistance": None}
+            continue
+
+        recent = df.tail(RECENT_CANDLES).reset_index(drop=True)
+        current_price = float(recent["close"].iloc[-1])
+        highs = recent["high"].values
+        lows = recent["low"].values
+
+        swing_highs, swing_lows = [], []
+        for i in range(PIVOT_WINDOW, len(recent) - PIVOT_WINDOW):
+            window_highs = highs[i - PIVOT_WINDOW:i + PIVOT_WINDOW + 1]
+            window_lows = lows[i - PIVOT_WINDOW:i + PIVOT_WINDOW + 1]
+            if highs[i] == window_highs.max():
+                swing_highs.append(float(highs[i]))
+            if lows[i] == window_lows.min():
+                swing_lows.append(float(lows[i]))
+
+        def cluster_and_rank(pivots):
+            """Genuinely groups nearby pivots, returns [(level, touch_count), ...] sorted by touches desc."""
+            if not pivots:
+                return []
+            pivots_sorted = sorted(pivots)
+            clusters = [[pivots_sorted[0]]]
+            for p in pivots_sorted[1:]:
+                if abs(p - clusters[-1][-1]) / clusters[-1][-1] * 100 <= CLUSTER_TOLERANCE_PCT:
+                    clusters[-1].append(p)
+                else:
+                    clusters.append([p])
+            return sorted([(sum(c) / len(c), len(c)) for c in clusters],
+                          key=lambda x: x[1], reverse=True)
+
+        resistance_clusters = [(lvl, cnt) for lvl, cnt in cluster_and_rank(swing_highs) if lvl > current_price]
+        support_clusters = [(lvl, cnt) for lvl, cnt in cluster_and_rank(swing_lows) if lvl < current_price]
+
+        # ---- genuinely prefer the level with the most touches among
+        # those genuinely closest to price (top-3 by touches, then
+        # pick nearest) — avoids picking a well-tested but very-far
+        # level over a closer, still-meaningful one. ----
+        def pick_nearest_of_top(clusters, price, n=3):
+            if not clusters:
+                return None
+            top = sorted(clusters, key=lambda x: x[1], reverse=True)[:n]
+            nearest = min(top, key=lambda x: abs(x[0] - price))
+            return {"level": round(nearest[0], 2), "touches": nearest[1]}
+
+        results[sym] = {
+            "support": pick_nearest_of_top(support_clusters, current_price),
+            "resistance": pick_nearest_of_top(resistance_clusters, current_price),
+            "current_price": round(current_price, 2),
+        }
+
+    LATEST_STATE["support_resistance"] = results
+    return results
+
+
 def compute_trend_meter(state, symbol_data_a):
     """
     ---- NEW 2026-08-12: Market Trend-Prediction Meter ----
@@ -4954,6 +5039,11 @@ def run_one_signal_only_iteration(state):
 
     compute_market_regime(symbol_data_a)
     compute_trend_meter(state, symbol_data_a)
+    # ---- NEW 2026-08-25: user's explicit request — "Jaise-Upar-
+    # Uptrend-Downtrend-Dikhta-Hai, Aise-Hi-Support-Resistance-Bhi-
+    # Dikhe" — genuinely computed alongside regime/trend-meter, same
+    # cadence. ----
+    compute_support_resistance(symbol_data_a)
     print(f"  [SIGNAL] regime={LATEST_STATE.get('market_regime', {}).get('label') if LATEST_STATE.get('market_regime') else None} "
           f"trend_meter={ {s: v.get('state') for s, v in (LATEST_STATE.get('trend_meter') or {}).items()} }")
 
@@ -5141,6 +5231,10 @@ def run_one_loop_iteration(state, products):
 
     compute_market_regime(symbol_data_a)
     compute_trend_meter(state, symbol_data_a)
+    # ---- NEW 2026-08-25: user's explicit request — genuinely computed
+    # here too, so it works whether Signal-only or the full Future-bot
+    # loop is what's running. ----
+    compute_support_resistance(symbol_data_a)
 
     # ---- Logic C bias data (1-hour) — only fetched when actually needed ----
     symbol_data_c_bias = {}

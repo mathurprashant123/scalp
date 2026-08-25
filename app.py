@@ -827,6 +827,15 @@ PAGE_TEMPLATE = """
         #oiWarmupBanner.hidden { display:none; }
         #trendMeter { display:flex; gap:10px; margin-bottom:18px; }
         #trendMeter.hidden { display:none; }
+        #supportResistance { display:flex; gap:10px; margin-bottom:18px; }
+        #supportResistance.hidden { display:none; }
+        .sr-card { background:#0d0d0d; border-radius:8px; padding:10px 16px; flex:1;
+                   border-left:4px solid #4A90D9; }
+        .sr-card .sym { font-weight:bold; font-size:13px; color:#aaa; }
+        .sr-card .levels { display:flex; justify-content:space-between; margin-top:4px; }
+        .sr-card .res { color:#E85D5D; font-weight:bold; }
+        .sr-card .sup { color:#4CAF50; font-weight:bold; }
+        .sr-card .touches { font-size:11px; color:#888; }
         .trend-card { flex:1; text-align:center; padding:10px; border-radius:8px; font-size:13px; }
         .trend-card .sym { font-weight:bold; font-size:14px; margin-bottom:4px; }
         .trend-card .state { font-weight:bold; }
@@ -857,6 +866,7 @@ PAGE_TEMPLATE = """
 <body>
     <div id="regimeBanner" class="hidden"></div>
     <div id="trendMeter" class="hidden"></div>
+    <div id="supportResistance" class="hidden"></div>
     <div id="optionsBotCard" class="hidden"></div>
     <!-- ---- NEW 2026-08-18: user's explicit request — "roz roz
     Environment Variable thodi na change karta rahunga" — genuine
@@ -1267,6 +1277,28 @@ PAGE_TEMPLATE = """
         setInterval(refreshTrendMeter, 5000);
         refreshTrendMeter();
 
+        function refreshSupportResistance() {
+            fetch('/support_resistance').then(r => r.json()).then(data => {
+                const el = document.getElementById('supportResistance');
+                const syms = Object.keys(data || {});
+                if (syms.length === 0) {
+                    el.className = 'hidden';
+                    return;
+                }
+                el.className = '';
+                el.innerHTML = syms.map(sym => {
+                    const d = data[sym];
+                    const res = d.resistance ? `${d.resistance.level} <span class="touches">(${d.resistance.touches}x)</span>` : 'N/A';
+                    const sup = d.support ? `${d.support.level} <span class="touches">(${d.support.touches}x)</span>` : 'N/A';
+                    return `<div class="sr-card"><div class="sym">${sym} — S/R</div>` +
+                           `<div class="levels"><span class="sup">S: ${sup}</span>` +
+                           `<span class="res">R: ${res}</span></div></div>`;
+                }).join('');
+            });
+        }
+        setInterval(refreshSupportResistance, 5000);
+        refreshSupportResistance();
+
         function refreshOptionsBot() {
             fetch('/options_status').then(r => r.json()).then(data => {
                 const el = document.getElementById('optionsBotCard');
@@ -1547,6 +1579,18 @@ def trend_meter():
     if meter is None:
         return jsonify({})
     return jsonify(meter)
+
+
+@app.route("/support_resistance")
+def support_resistance():
+    """---- NEW 2026-08-25: user's explicit request — "Jaise-Upar-
+    Uptrend-Downtrend-Dikhta-Hai, Aise-Hi-Support-Resistance-Bhi-
+    Dikhe" — genuinely a JSON API the dashboard's own JS polls, same
+    pattern as /trend_meter. ----"""
+    sr = algo.LATEST_STATE.get("support_resistance")
+    if sr is None:
+        return jsonify({})
+    return jsonify(sr)
 
 
 @app.route("/start_oi_warmup", methods=["POST"])
