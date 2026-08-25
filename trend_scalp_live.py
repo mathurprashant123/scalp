@@ -4909,17 +4909,37 @@ def signal_only_loop(stop_event=None):
     """Runs run_one_signal_only_iteration on a loop, same cadence as
     the full futures loop, until stop_event is set. Genuinely its own
     state file (signal_only_state.json) — only used for OI-history
-    persistence, never touches the real trading state.json."""
+    persistence, never touches the real trading state.json.
+
+    ---- NEW 2026-08-24: user's explicit request — genuinely also
+    scans ALL open positions on the exchange (bot-opened OR manually-
+    opened, futures OR options) every ~5 loops and asks AI for a
+    hold-vs-exit review, storing results for the dashboard's
+    Position-Advisor page. Purely advisory — never places any real
+    order. Uses options_bot's Delta-API-signing + AI infra (avoids
+    duplicating it here). Fails safe — if options_bot genuinely isn't
+    importable or the scan fails, the signal loop keeps running
+    regardless. ----
+    """
     def should_stop():
         return stop_event is not None and stop_event.is_set()
 
     state = {"oi_history": {}}
     print("Signal-Only loop starting — computing market_regime + trend_meter, NO trading.")
+    loop_count = 0
     while not should_stop():
         try:
             run_one_signal_only_iteration(state)
         except Exception as e:
             print(f"  [SIGNAL] [ERROR] {e}")
+        loop_count += 1
+        if loop_count % 5 == 0:
+            try:
+                import options_bot
+                ob_state = options_bot.load_state()
+                options_bot.scan_and_review_all_positions(ob_state)
+            except Exception as e:
+                print(f"  [SIGNAL] [POSITION-ADVISOR-WARN] genuinely skipped this scan: {e}")
         for _ in range(LOOP_INTERVAL_SECONDS):
             if should_stop():
                 break

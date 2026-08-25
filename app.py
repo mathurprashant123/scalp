@@ -696,6 +696,67 @@ OPTIONS_AI_LOG_TEMPLATE = """
 """
 
 
+POSITION_ADVISOR_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Position-Advisor — All-Positions Hold/Exit Review</title>
+    <meta charset="utf-8">
+    <style>
+        body { background:#1e1e1e; color:#ddd; font-family: 'Segoe UI', sans-serif; margin:0; padding:20px; }
+        h1 { text-align:center; }
+        a.back { color:#4A90D9; text-decoration:none; display:block; text-align:center; margin-bottom:15px; }
+        table { border-collapse: collapse; width:100%; background:#0d0d0d; }
+        th, td { border:1px solid #333; padding:8px 10px; font-size:13px; text-align:center; }
+        th { background:#1a3c6e; color:white; }
+        tr.hold { background:#0d2e0d; }
+        tr.exit { background:#2e2e0d; }
+        .summary-box { background:#0d0d0d; border-radius:8px; padding:15px 25px; margin: 0 auto 25px auto;
+                       max-width: 600px; text-align:center; font-size:16px; }
+        .note { text-align:center; color:#999; font-size:13px; margin-bottom:20px; }
+        .reasoning { max-width: 280px; text-align:left; }
+    </style>
+</head>
+<body>
+    <a class="back" href="/">&larr; Back to Dashboard</a>
+    <h1>Position-Advisor</h1>
+    <div class="note">
+        Genuinely-passive AI-review of EVERY open position on the account (bot-opened OR
+        manually-opened, futures OR options). Purely advisory — never places any order.
+        Runs automatically inside the Signal-loop, regardless of Future/Options bot status.
+    </div>
+
+    <div class="summary-box">
+        <div>Last Genuinely-Scanned: <b>{{ last_scan }}</b></div>
+        <div>Total-Positions-Reviewed: <b>{{ total }}</b>
+             &nbsp;|&nbsp; HOLD: <b style="color:#4CAF50">{{ hold_count }}</b>
+             &nbsp;|&nbsp; CONSIDER_EXIT: <b style="color:#E8A93D">{{ exit_count }}</b></div>
+    </div>
+
+    <table>
+        <tr>
+            <th>Time</th><th>Symbol</th><th>Side</th><th>Entry</th>
+            <th>Unrealized-PnL</th><th>Confidence</th><th>Verdict</th><th>Reasoning</th>
+        </tr>
+        {% for r in reviews %}
+        <tr class="{{ 'hold' if r.verdict == 'HOLD' else 'exit' }}">
+            <td>{{ r.time }}</td><td>{{ r.symbol }}</td><td>{{ r.side }}</td>
+            <td>{{ r.entry_price }}</td><td>{{ r.unrealized_pnl }}</td>
+            <td>{{ r.confidence if r.confidence is not none else 'N/A' }}</td>
+            <td>{{ r.verdict }}</td>
+            <td class="reasoning">{{ r.reasoning }}</td>
+        </tr>
+        {% endfor %}
+        {% if reviews|length == 0 %}
+        <tr><td colspan="8">Genuinely-abhi-tak-koई-open-position-nahi-mili, ya-scan-abhi-hui-nahi.</td></tr>
+        {% endif %}
+    </table>
+</body>
+</html>
+"""
+
+
+
 class WebLogRedirector:
     """Captures print() output from the algo into our log buffer."""
     def write(self, message):
@@ -1655,6 +1716,29 @@ def options_ai_log_page():
             ai_enabled=options_bot.AI_CONFIRMATION_ENABLED)
     except Exception as e:
         return f"Options-bot AI-log genuinely unavailable: {e}", 500
+
+
+@app.route("/position_advisor")
+def position_advisor_page():
+    """---- NEW 2026-08-24: user's explicit request — "Delta-Exchange-
+    Par-Jo-Bhi-Trade-Lagi-Ho-Usko-Yeh-Scanning-Kare... Chahe-Woh-
+    Manually-Hi-Le-Rakhi-Ho" — genuinely shows AI's hold-vs-exit review
+    for EVERY open position on the account (bot-opened OR manually-
+    opened, futures OR options). Purely advisory — this page never
+    places any order, only shows a recommendation. ----"""
+    try:
+        import options_bot
+        state = options_bot.load_state()
+        advisor = state.get("position_advisor", {})
+        reviews = advisor.get("reviews", [])
+        last_scan = advisor.get("last_scan", "genuinely-not-scanned-yet")
+        hold_count = sum(1 for r in reviews if r.get("verdict") == "HOLD")
+        exit_count = len(reviews) - hold_count
+        return render_template_string(
+            POSITION_ADVISOR_TEMPLATE, reviews=reviews, last_scan=last_scan,
+            hold_count=hold_count, exit_count=exit_count, total=len(reviews))
+    except Exception as e:
+        return f"Position-advisor genuinely unavailable: {e}", 500
 
 
 @app.route("/test_ai_key")

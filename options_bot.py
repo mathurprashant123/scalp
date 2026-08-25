@@ -1228,7 +1228,149 @@ def run_one_cycle(state):
         print(f"  {underlying}: position OPENED — {json.dumps(positions[underlying])}")
 
 
-def get_exchange_position(product_id):
+def get_all_open_positions():
+    """
+    ---- NEW 2026-08-24: user's explicit request — "Delta-Exchange-Par
+    Jo-Bhi-Trade-Lagi-Ho-Usko-Yeh-Scanning-Kare, Chahe-Woh-Trade-Manually-
+    Hi-Le-Rakhi-Ho" — genuinely fetches EVERY open position on the
+    account (both futures AND options, bot-opened OR manually-opened —
+    Delta's own API is genuinely account-level, doesn't distinguish
+    who/what placed a position). Uses Delta's own "get margined
+    positions" endpoint (confirmed via Delta's official docs listing).
+    Returns a list of dicts (genuinely empty list on any failure —
+    fails safe, never crashes the caller). ----
+    """
+    path = "/v2/positions/margined"
+    timestamp = str(int(time.time()))
+    signature = sign_request("GET", path, "", "", timestamp)
+    headers = {"api-key": API_KEY, "signature": signature, "timestamp": timestamp,
+               "User-Agent": "options-trend-bot"}
+    try:
+        r = requests.get(f"{BASE_URL}{path}", headers=headers, timeout=15)
+        result = safe_result(r.json())
+        positions = result if isinstance(result, list) else []
+        # ---- genuinely only keep positions with a real, non-zero size
+        # — Delta's endpoint can include closed/flat entries too. ----
+        return [p for p in positions if float(p.get("size", 0)) != 0]
+    except Exception as e:
+        print(f"  [WARN] get_all_open_positions genuinely failed: {e} — returning empty list")
+        return []
+
+
+def get_position_review(position, regime_label, trend_meter_state, candle_summary, greeks=None):
+    """
+    ---- NEW 2026-08-24: user's explicit request — genuinely reviews an
+    EXISTING open position (bot-opened OR manually-opened) and asks
+    Claude "should this genuinely be held or considered for exit",
+    using the same chart-pattern + regime/trend-meter + Greeks approach
+    as get_ai_confirmation(), just for an ongoing position instead of a
+    fresh entry decision. `greeks` is genuinely None for futures
+    positions (no Greeks concept applies there) — the prompt adapts.
+    Fails open (returns a neutral "HOLD, review unavailable" verdict)
+    on any error, same philosophy as get_ai_confirmation(). This is
+    PURELY ADVISORY — it never places any real order, only shows a
+    recommendation on the dashboard. ----
+    """
+    if not ANTHROPIC_API_KEY:
+        return {"verdict": "HOLD", "confidence": None,
+                "reasoning": "genuinely no ANTHROPIC_API_KEY set"}
+
+    snapshot = {
+        "symbol": position.get("product_symbol"), "side": position.get("side"),
+        "size": position.get("size"), "entry_price": position.get("entry_price"),
+        "unrealized_pnl": position.get("unrealized_pnl", "not available"),
+        "market_regime": regime_label, "trend_meter_state": trend_meter_state,
+        "greeks": greeks or "not applicable (futures position)",
+        "recent_5min_candle_summary": candle_summary or "not available",
+    }
+    prompt = (
+        "You are reviewing an EXISTING open position (already entered — this is NOT "
+        "an entry decision, it's a hold-vs-exit review). Genuinely read the "
+        "recent_5min_candle_summary as a real chart (swing_structure, recent_closes "
+        "shape, distance from swing_high/swing_low, range_expanding), combine with "
+        "market_regime/trend_meter_state and (if present) greeks, and judge whether "
+        "the ORIGINAL thesis for this position still genuinely holds, or whether the "
+        "chart now shows a genuine structural change that argues for considering an "
+        "exit. Keep reasoning genuinely SHORT (max ~20 words) so the JSON is never "
+        "cut off. Reply with ONLY a JSON object, no other text: "
+        "{\"verdict\": \"HOLD\" or \"CONSIDER_EXIT\", \"confidence\": <0-100 integer>, "
+        "\"reasoning\": \"<short reason>\"}.\n\n"
+        f"Position snapshot:\n{json.dumps(snapshot, indent=2)}"
+    )
+    try:
+        r = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json={"model": "claude-sonnet-5", "max_tokens": 400,
+                  "messages": [{"role": "user", "content": prompt}]},
+            timeout=15)
+        r.raise_for_status()
+        content_blocks = r.json().get("content", [])
+        text = next((b.get("text") for b in content_blocks if b.get("text")), None)
+        if text is None:
+            raise ValueError(f"genuinely no text block found in response content: {content_blocks}")
+        text = text.strip().replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(text)
+        return {"verdict": parsed.get("verdict", "HOLD"),
+                "confidence": int(parsed.get("confidence", 0)),
+                "reasoning": parsed.get("reasoning", "")}
+    except Exception as e:
+        print(f"  [WARN] Position-review genuinely failed ({e}) — showing neutral HOLD.")
+        return {"verdict": "HOLD", "confidence": None, "reasoning": f"genuinely failed: {e}"}
+
+
+def scan_and_review_all_positions(state):
+    """
+    ---- NEW 2026-08-24: user's explicit request — the actual periodic
+    scanner. Genuinely fetches every open position on the account,
+    builds a fresh chart-summary + regime/trend-meter snapshot for
+    each one's underlying, and gets an AI review — storing results in
+    state["position_advisor"] for the dashboard. Never places any real
+    order. Fails safe throughout (one bad position's review failing
+    doesn't stop the others). ----
+    """
+    positions = get_all_open_positions()
+    reviews = []
+    try:
+        import trend_scalp_live as algo
+        regime_label = algo.LATEST_STATE.get("market_regime", {}).get("label") \
+            if algo.LATEST_STATE.get("market_regime") else None
+        trend_meter = algo.LATEST_STATE.get("trend_meter", {}) or {}
+    except ImportError:
+        regime_label, trend_meter = None, {}
+
+    for pos in positions:
+        symbol = pos.get("product_symbol", "")
+        # ---- genuinely-simple underlying-extraction: futures symbols
+        # look like "BTCUSD", options like "C-BTC-78000-250826" — pull
+        # the coin name out of either format. ----
+        underlying = None
+        for coin in ("BTC", "ETH"):
+            if symbol.startswith(coin) or f"-{coin}-" in symbol:
+                underlying = coin
+                break
+        trend_state = trend_meter.get(f"{underlying}USD", {}).get("state") if underlying else None
+        candle_summary = get_recent_candle_summary(underlying) if underlying else None
+        greeks = pos.get("greeks")  # genuinely present for options positions only
+
+        review = get_position_review(pos, regime_label, trend_state, candle_summary, greeks)
+        reviews.append({
+            "time": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
+            "symbol": symbol, "side": pos.get("side"), "size": pos.get("size"),
+            "entry_price": pos.get("entry_price"),
+            "unrealized_pnl": pos.get("unrealized_pnl"),
+            "verdict": review["verdict"], "confidence": review["confidence"],
+            "reasoning": review["reasoning"],
+        })
+
+    state["position_advisor"] = {"last_scan": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
+                                   "reviews": reviews}
+    save_state(state)
+    return reviews
+
+
+
     """
     ---- NEW 2026-08-17: user's explicit request (point 5) — "Bot
     manually dekhe exchange par, kyunki foreclose kar sakte trade ko".
