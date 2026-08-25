@@ -735,20 +735,23 @@ POSITION_ADVISOR_TEMPLATE = """
 
     <table>
         <tr>
-            <th>Time</th><th>Symbol</th><th>Side</th><th>Entry</th>
+            <th>Time</th><th>Symbol</th><th>Side</th><th>Entry</th><th>SL</th><th>TP</th>
             <th>Unrealized-PnL</th><th>Confidence</th><th>Verdict</th><th>Reasoning</th>
         </tr>
         {% for r in reviews %}
         <tr class="{{ 'hold' if r.verdict == 'HOLD' else 'exit' }}">
             <td>{{ r.time }}</td><td>{{ r.symbol }}</td><td>{{ r.side }}</td>
-            <td>{{ r.entry_price }}</td><td>{{ r.unrealized_pnl }}</td>
+            <td>{{ r.entry_price }}</td>
+            <td>{{ r.sl if r.sl else 'None-Set' }}</td>
+            <td>{{ r.tp if r.tp else 'None-Set' }}</td>
+            <td>{{ r.unrealized_pnl }}</td>
             <td>{{ r.confidence if r.confidence is not none else 'N/A' }}</td>
             <td>{{ r.verdict }}</td>
             <td class="reasoning">{{ r.reasoning }}</td>
         </tr>
         {% endfor %}
         {% if reviews|length == 0 %}
-        <tr><td colspan="8">Genuinely-abhi-tak-koई-open-position-nahi-mili, ya-scan-abhi-hui-nahi.</td></tr>
+        <tr><td colspan="10">Genuinely-abhi-tak-koई-open-position-nahi-mili, ya-scan-abhi-hui-nahi.</td></tr>
         {% endif %}
     </table>
 </body>

@@ -1228,6 +1228,43 @@ def run_one_cycle(state):
         print(f"  {underlying}: position OPENED — {json.dumps(positions[underlying])}")
 
 
+def get_position_bracket_info(product_id):
+    """
+    ---- NEW 2026-08-25: user's explicit, valid catch — "SL TP bhi
+    dikh raha hai na AI ko?" — genuinely confirmed it was MISSING.
+    Position data from Delta's own /v2/positions/margined endpoint
+    does NOT include SL/TP (those are separate stop_loss_order/
+    take_profit_order legs, not position attributes) — this genuinely
+    fetches any OPEN orders for this product_id and pulls out the
+    stop_price of the SL/TP legs, if a bracket is genuinely attached.
+    Returns {"sl": price_or_None, "tp": price_or_None} — genuinely
+    None for either/both if no bracket is attached (e.g. a manual
+    trade with no stop set), which is itself useful information for
+    the AI to see. Fails safe — never crashes the caller. ----
+    """
+    path = "/v2/orders"
+    query_string = f"?product_id={product_id}&state=open"
+    timestamp = str(int(time.time()))
+    signature = sign_request("GET", path, query_string, "", timestamp)
+    headers = {"api-key": API_KEY, "signature": signature, "timestamp": timestamp,
+               "User-Agent": "options-trend-bot"}
+    try:
+        r = requests.get(f"{BASE_URL}{path}", headers=headers,
+                          params={"product_id": product_id, "state": "open"}, timeout=10)
+        orders = safe_result(r.json())
+        orders = orders if isinstance(orders, list) else []
+        sl_price, tp_price = None, None
+        for o in orders:
+            if o.get("stop_order_type") == "stop_loss_order":
+                sl_price = o.get("stop_price")
+            elif o.get("stop_order_type") == "take_profit_order":
+                tp_price = o.get("stop_price")
+        return {"sl": sl_price, "tp": tp_price}
+    except Exception as e:
+        print(f"  [WARN] get_position_bracket_info genuinely failed for product_id={product_id}: {e}")
+        return {"sl": None, "tp": None}
+
+
 def get_all_open_positions():
     """
     ---- NEW 2026-08-24: user's explicit request — "Delta-Exchange-Par
@@ -1257,7 +1294,8 @@ def get_all_open_positions():
         return []
 
 
-def get_position_review(position, regime_label, trend_meter_state, candle_summary, greeks=None):
+def get_position_review(position, regime_label, trend_meter_state, candle_summary,
+                         greeks=None, bracket_info=None):
     """
     ---- NEW 2026-08-24: user's explicit request — genuinely reviews an
     EXISTING open position (bot-opened OR manually-opened) and asks
@@ -1269,7 +1307,15 @@ def get_position_review(position, regime_label, trend_meter_state, candle_summar
     Fails open (returns a neutral "HOLD, review unavailable" verdict)
     on any error, same philosophy as get_ai_confirmation(). This is
     PURELY ADVISORY — it never places any real order, only shows a
-    recommendation on the dashboard. ----
+    recommendation on the dashboard.
+
+    ---- CHANGED 2026-08-25: user's explicit, valid catch — "SL TP
+    bhi dikh raha hai na AI ko?" — genuinely ADDS the position's
+    actual SL/TP (from its exchange-side bracket, if one exists) to
+    what Claude sees. Knowing the ORIGINAL risk-plan is genuinely
+    important context — e.g. "price is genuinely close to the SL" vs
+    "no SL is set at all" are very different situations for a
+    hold-vs-exit judgment. ----
     """
     if not ANTHROPIC_API_KEY:
         return {"verdict": "HOLD", "confidence": None,
@@ -1277,10 +1323,13 @@ def get_position_review(position, regime_label, trend_meter_state, candle_summar
 
     genuine_size = float(position.get("size", 0))
     genuine_side = "long" if genuine_size > 0 else "short" if genuine_size < 0 else "flat"
+    bracket_info = bracket_info or {"sl": None, "tp": None}
     snapshot = {
         "symbol": position.get("product_symbol"), "side": genuine_side,
         "size": abs(genuine_size), "entry_price": position.get("entry_price"),
         "unrealized_pnl": position.get("unrealized_pnl", "not available"),
+        "stop_loss_price": bracket_info["sl"] or "genuinely no SL currently set on the exchange",
+        "take_profit_price": bracket_info["tp"] or "genuinely no TP currently set on the exchange",
         "market_regime": regime_label, "trend_meter_state": trend_meter_state,
         "greeks": greeks or "not applicable (futures position)",
         "recent_5min_candle_summary": candle_summary or "not available",
@@ -1367,12 +1416,19 @@ def scan_and_review_all_positions(state):
         raw_size = float(pos.get("size", 0))
         genuine_side = "long" if raw_size > 0 else "short" if raw_size < 0 else "flat"
 
-        review = get_position_review(pos, regime_label, trend_state, candle_summary, greeks)
+        # ---- NEW 2026-08-25: user's explicit, valid catch — genuinely
+        # fetch this position's own SL/TP (bracket-order legs) before
+        # asking AI to review it. ----
+        bracket_info = get_position_bracket_info(pos.get("product_id"))
+
+        review = get_position_review(pos, regime_label, trend_state, candle_summary,
+                                      greeks, bracket_info)
         reviews.append({
             "time": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
             "symbol": symbol, "side": genuine_side, "size": abs(raw_size),
             "entry_price": pos.get("entry_price"),
             "unrealized_pnl": pos.get("unrealized_pnl"),
+            "sl": bracket_info["sl"], "tp": bracket_info["tp"],
             "verdict": review["verdict"], "confidence": review["confidence"],
             "reasoning": review["reasoning"],
         })
