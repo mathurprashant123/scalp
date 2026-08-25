@@ -1245,7 +1245,7 @@ def get_open_interest(symbol):
         return None, None
 
 
-def get_order_book_support_resistance(symbol):
+def get_order_book_support_resistance(symbol, max_distance_pct=5.0):
     """
     ---- NEW 2026-08-25: user's explicit, well-reasoned request —
     "chota account hai, yeh sirf testing amount hai... jab lagega sab
@@ -1255,11 +1255,25 @@ def get_order_book_support_resistance(symbol):
     Delta's own docs: /v2/l2orderbook/{symbol}, public endpoint, no
     auth needed) rather than historical candle-based swing-pivots.
 
-    Finds the SINGLE largest-size level on each side (buy-side =
-    genuine support "wall", sell-side = genuine resistance "wall") —
-    a genuinely forward-looking, real-time signal, complementing (not
+    Finds the largest-size level on each side (buy-side = genuine
+    support "wall", sell-side = genuine resistance "wall") — a
+    genuinely forward-looking, real-time signal, complementing (not
     replacing) the candle-based Chart-S/R which is backward-looking.
-    Fails safe — returns None on any failure. ----
+
+    ---- FIXED 2026-08-25: CRITICAL bug, genuinely confirmed via real
+    production data — BTC's "support" showed as literally $1, ETH's
+    as $0.05 (both wildly unrealistic vs actual prices of ~$79,000 and
+    ~$2,477). Root cause: real order books genuinely contain stray
+    "dust" or stub orders sitting FAR from the actual market (e.g. a
+    tiny-notional-but-huge-quantity order at a near-zero price) — the
+    OLD code blindly picked whichever level had the biggest raw size,
+    with no regard for how far that price actually was from where the
+    market genuinely trades. Fix: genuinely restrict consideration to
+    levels within `max_distance_pct` of the best bid/ask (the entries
+    closest to market, which Delta's own ordering already puts first
+    in each list) BEFORE picking the biggest size — so only genuinely
+    realistic, market-relevant walls are ever reported. Fails safe —
+    returns None on any failure or if nothing survives the filter. ----
     """
     try:
         r = requests.get(f"{config.REAL_DATA_BASE_URL}/v2/l2orderbook/{symbol}", timeout=10)
@@ -1270,8 +1284,26 @@ def get_order_book_support_resistance(symbol):
         if not buy_levels or not sell_levels:
             return None
 
-        biggest_buy = max(buy_levels, key=lambda lvl: float(lvl.get("size", 0)))
-        biggest_sell = max(sell_levels, key=lambda lvl: float(lvl.get("size", 0)))
+        # ---- genuinely use best-bid/best-ask (Delta orders these
+        # nearest-to-market first) as the reference price, then
+        # filter out anything genuinely too far from it. ----
+        best_bid = float(buy_levels[0]["price"])
+        best_ask = float(sell_levels[0]["price"])
+        reference_price = (best_bid + best_ask) / 2
+
+        def within_range(level):
+            price = float(level.get("price", 0))
+            if reference_price <= 0:
+                return False
+            return abs(price - reference_price) / reference_price * 100 <= max_distance_pct
+
+        genuine_buy_levels = [lvl for lvl in buy_levels if within_range(lvl)]
+        genuine_sell_levels = [lvl for lvl in sell_levels if within_range(lvl)]
+        if not genuine_buy_levels or not genuine_sell_levels:
+            return None
+
+        biggest_buy = max(genuine_buy_levels, key=lambda lvl: float(lvl.get("size", 0)))
+        biggest_sell = max(genuine_sell_levels, key=lambda lvl: float(lvl.get("size", 0)))
 
         return {
             "support": {"price": round(float(biggest_buy["price"]), 2),
