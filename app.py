@@ -1303,7 +1303,9 @@ PAGE_TEMPLATE = """
                                 `<a href="/options_trades" style="color:#4A90D9; font-size:12px;">` +
                                 `📊 Poора Options Trades Log Dekhein &rarr;</a> &nbsp;|&nbsp; ` +
                                 `<a href="/options_ai_log" style="color:#4A90D9; font-size:12px;">` +
-                                `🤖 AI-Confirmation Log Dekhein &rarr;</a></div>`;
+                                `🤖 AI-Confirmation Log Dekhein &rarr;</a> &nbsp;|&nbsp; ` +
+                                `<a href="/position_advisor" style="color:#4A90D9; font-size:12px;">` +
+                                `📋 Position-Advisor Dekhein &rarr;</a></div>`;
             });
         }
         setInterval(refreshOptionsBot, 5000);
