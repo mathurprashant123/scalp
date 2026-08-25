@@ -1404,6 +1404,18 @@ def start_signal():
             return jsonify({"ok": False, "already_running": True,
                              "message": "Signal-loop is already running."})
         signal_info["stop_event"] = threading.Event()
+        # ---- FIXED 2026-08-25: CRITICAL bug, genuinely confirmed —
+        # "loops nahi dikh rahe... signal se chal raha hai" — the
+        # Future-bot's own /start route genuinely does
+        # `sys.stdout = WebLogRedirector()`, but /start_signal never
+        # did — meaning if Signal is started WITHOUT ever starting
+        # Future first, every print() call (including the new
+        # detailed diagnostics) genuinely never got captured for the
+        # dashboard's log-box — it went to Render's own raw console
+        # instead. Since sys.stdout is genuinely process-global (not
+        # per-thread), redirecting it here fixes this for every
+        # thread, regardless of which bot(s) are actually running. ----
+        sys.stdout = WebLogRedirector()
 
         def run():
             try:
@@ -1446,6 +1458,11 @@ def start_options():
             return jsonify({"ok": False, "message": f"Couldn't import options_bot: {e}"})
 
         options_info["stop_event"] = threading.Event()
+        # ---- FIXED 2026-08-25: same genuine bug as /start_signal —
+        # if Options-bot is started WITHOUT Future ever being started
+        # first, its print() calls genuinely never got captured for
+        # the dashboard's log-box either. ----
+        sys.stdout = WebLogRedirector()
 
         def run():
             try:
