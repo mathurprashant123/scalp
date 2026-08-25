@@ -1275,9 +1275,11 @@ def get_position_review(position, regime_label, trend_meter_state, candle_summar
         return {"verdict": "HOLD", "confidence": None,
                 "reasoning": "genuinely no ANTHROPIC_API_KEY set"}
 
+    genuine_size = float(position.get("size", 0))
+    genuine_side = "long" if genuine_size > 0 else "short" if genuine_size < 0 else "flat"
     snapshot = {
-        "symbol": position.get("product_symbol"), "side": position.get("side"),
-        "size": position.get("size"), "entry_price": position.get("entry_price"),
+        "symbol": position.get("product_symbol"), "side": genuine_side,
+        "size": abs(genuine_size), "entry_price": position.get("entry_price"),
         "unrealized_pnl": position.get("unrealized_pnl", "not available"),
         "market_regime": regime_label, "trend_meter_state": trend_meter_state,
         "greeks": greeks or "not applicable (futures position)",
@@ -1354,10 +1356,21 @@ def scan_and_review_all_positions(state):
         candle_summary = get_recent_candle_summary(underlying) if underlying else None
         greeks = pos.get("greeks")  # genuinely present for options positions only
 
+        # ---- FIXED 2026-08-25: CRITICAL bug, genuinely confirmed via
+        # real production data — "side" genuinely showed "None" for
+        # every position. Root cause: Delta's own /v2/positions
+        # response schema genuinely has NO "side" field at all — 
+        # direction is genuinely represented by the SIGN of "size"
+        # (positive = long/buy, negative = short/sell), confirmed via
+        # Delta's own official code examples ("abs(size)" pattern used
+        # when they need a direction-agnostic size). ----
+        raw_size = float(pos.get("size", 0))
+        genuine_side = "long" if raw_size > 0 else "short" if raw_size < 0 else "flat"
+
         review = get_position_review(pos, regime_label, trend_state, candle_summary, greeks)
         reviews.append({
             "time": now_ist().strftime("%Y-%m-%d %H:%M:%S"),
-            "symbol": symbol, "side": pos.get("side"), "size": pos.get("size"),
+            "symbol": symbol, "side": genuine_side, "size": abs(raw_size),
             "entry_price": pos.get("entry_price"),
             "unrealized_pnl": pos.get("unrealized_pnl"),
             "verdict": review["verdict"], "confidence": review["confidence"],
