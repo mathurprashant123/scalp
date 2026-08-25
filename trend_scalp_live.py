@@ -4855,6 +4855,52 @@ def compute_trend_meter(state, symbol_data_a):
     LATEST_STATE["trend_meter"] = meter if meter else None
 
 
+def print_market_diagnostics(state, symbol_data_a):
+    """
+    ---- NEW 2026-08-25: user's explicit request — "Signal-Only-Loop
+    (Future-Bot-Band-Rahте-Hue-Bhi) Poora-Detailed-Market-Data (OI,
+    RSI, VWAP-Distance) Print-Kare" — genuinely mirrors the same
+    per-coin diagnostic prints that look_for_entry_a() shows (price,
+    EMA200, VWAP-distance, CVD, OI-status, RSI-status), but GENUINELY
+    READ-ONLY — no entry-decision logic, no "-> SKIP" reasoning, just
+    the raw market-state visibility the user is used to seeing every
+    loop. Kept as a genuinely SEPARATE function (not a refactor of
+    look_for_entry_a) to avoid any risk of touching real trading
+    logic. ----
+    """
+    for sym, df in symbol_data_a.items():
+        i = len(df) - 1
+        row = df.iloc[i]
+        price = row["close"]
+        ema = row.get(f"ema_{EMA_PERIOD}") if hasattr(row, "get") else row[f"ema_{EMA_PERIOD}"]
+        vwap = row.get("vwap") if hasattr(row, "get") else row["vwap"]
+        if pd.isna(ema) or pd.isna(vwap):
+            print(f"  [SIGNAL] {sym}: EMA/VWAP not ready yet (still warming up)")
+            continue
+
+        bullish = price > ema
+        dist_from_vwap_pct = abs(price - vwap) / price * 100
+        trend_label = "BULLISH (price>EMA200)" if bullish else "BEARISH (price<EMA200)"
+        cvd_now = df["cvd"].iloc[i] if "cvd" in df.columns else None
+        cvd_rising_flag = cvd_rising(df, i, CVD_LOOKBACK) if cvd_now is not None else None
+        cvd_falling_flag = cvd_falling(df, i, CVD_LOOKBACK) if cvd_now is not None else None
+
+        cvd_display = f"{cvd_now:.1f}" if cvd_now is not None else "N/A"
+        print(f"  [SIGNAL] {sym}: price={price:.5f} EMA200={ema:.5f} ({trend_label}) "
+              f"VWAP={vwap:.5f} (dist={dist_from_vwap_pct:.3f}%, need<={VWAP_PROXIMITY_PCT}%) "
+              f"CVD_now={cvd_display} "
+              f"rising={cvd_rising_flag} falling={cvd_falling_flag}")
+        print_oi_status(state, sym)
+
+        rsi_val = row.get("rsi") if hasattr(row, "get") else (row["rsi"] if "rsi" in row.index else None)
+        if rsi_val is not None and pd.notna(rsi_val):
+            rsi_zone = ("OVERSOLD" if rsi_val < RSI_OVERSOLD
+                        else "OVERBOUGHT" if rsi_val > RSI_OVERBOUGHT else "normal")
+            print(f"    [SIGNAL] [RSI-status] {sym}: RSI={rsi_val:.1f} ({rsi_zone})")
+        else:
+            print(f"    [SIGNAL] [RSI-status] {sym}: not ready yet (still warming up)")
+
+
 def run_one_signal_only_iteration(state):
     """
     ---- NEW 2026-08-14: "Signal-Only" loop. User's own idea: decouple
@@ -4898,6 +4944,13 @@ def run_one_signal_only_iteration(state):
 
     for _oi_symbol in LOGIC_C_SYMBOLS:
         sample_oi_history(state, _oi_symbol)  # trend_meter's OI-confirm needs this history
+
+    # ---- NEW 2026-08-25: user's explicit request — genuinely prints
+    # the same per-coin diagnostic detail (price, EMA, VWAP-distance,
+    # CVD, OI-status, RSI-status) that the full Future-bot's loop
+    # shows — so this is genuinely visible even with Future+Options
+    # both stopped, Signal alone running. ----
+    print_market_diagnostics(state, symbol_data_a)
 
     compute_market_regime(symbol_data_a)
     compute_trend_meter(state, symbol_data_a)
