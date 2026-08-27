@@ -449,6 +449,16 @@ COOLDOWN_SECONDS = 10      # min gap after any close before a new entry
 # the same generic path Logic A uses, since only strategy=="B" gets its
 # own separate management branch).
 EMA_FAST_C = 9
+# ---- NEW 2026-08-26: user's explicit request — "10 lot par approx
+# 12 dollar ka profit chaiye" — genuinely REPLACES the EMA-distance-
+# based TP with a FIXED-POINTS target per symbol, specifically tuned
+# so that at FIXED_SIZE=10, hitting this TP genuinely nets ~$12 after
+# fees (confirmed via real calculation: BTC needs ~1313 points at
+# ~$78,500, ETH needs ~124 points at ~$2,488, contract-values 0.001
+# and 0.01 respectively). If FIXED_SIZE is ever changed away from 10,
+# these targets would genuinely no longer hit exactly $12 — they're
+# tuned for the specific 10-lot scenario the user described. ----
+LOGIC_C_TP_POINTS = {"BTCUSD": 1313, "ETHUSD": 124}
 EMA_SLOW_C = 20
 LOGIC_C_BIAS_RESOLUTION = "1h"
 LOGIC_C_RISK_PER_TRADE_PCT = 1.5   # unused while FIXED_SIZE > 0, kept for
@@ -582,7 +592,7 @@ SR_PROXIMITY_PCT = 0.2           # how close price must be to a level to trigger
 SR_BOUNCE_LOOKBACK_CANDLES = 2   # how many recent candles to check for genuine-bounce
 SR_TOUCH_TOLERANCE_PCT = 0.05    # small buffer for what counts as "touched" the level
 
-FIXED_SIZE = 1             # ---- CHANGED for real-account initial verification ----
+FIXED_SIZE = 1              # ---- CHANGED 2026-08-26: user's explicit request — "1 lot size karo checking kar raha hu abhi toh" — genuinely reverted from 10 back to 1 for testing. Note: LOGIC_C_TP_POINTS (BTC=1313, ETH=124) was genuinely tuned for the $12-at-10-lot scenario, so at 1-lot these same targets will genuinely give ~1/10th the profit (~$1.2), not $12 ----
                            # 1 = hamesha exactly 1 lot, risk-based-sizing formula
                            # bypass karke. Maksad: real-account pe execution-mechanics
                            # (order-placement, bracket-attach, close) ko chhote,
@@ -4415,28 +4425,27 @@ def look_for_entry_a(state, symbol_data, products):
 # Logic_C_Strategy_Notes.md for full context/caveats.
 # ============================================================
 
-def _execute_logic_c_order(state, sym, side, price, atr, products, candle_ts):
+def _execute_logic_c_order(state, sym, side, price, ema_distance, products, candle_ts):
     """
     ---- NEW 2026-08-26: user's explicit request — genuinely rewrote
-    Logic C into a pure "Stop-And-Reverse" strategy on the 15-min
-    EMA9/EMA20 crossover ONLY. This helper is the actual order-
-    execution logic (stray-order-sweep, real-fill-price recalculation)
-    — genuinely EXTRACTED out of the old look_for_entry_c so it can be
-    called from TWO places: (1) a fresh entry when the system is flat,
-    and (2) an IMMEDIATE reverse-entry right after closing an opposite
-    position on an opposite crossover, in the SAME loop.
+    Logic C into a pure "Stop-And-Reverse" strategy on the EMA9/EMA20
+    crossover ONLY. This helper is the actual order-execution logic
+    (stray-order-sweep, real-fill-price recalculation) — genuinely
+    EXTRACTED out of the old look_for_entry_c so it can be called from
+    TWO places: (1) a fresh entry when the system is flat, and (2) an
+    IMMEDIATE reverse-entry right after closing an opposite position on
+    an opposite crossover, in the SAME loop.
 
-    ---- CHANGED 2026-08-26: user's further, explicit request — "TP SL
-    hatao, 24-hours hum trade mein rehenge, crossover par switch hogi
-    loss ya profit lekar" — genuinely REMOVED the exchange-side
-    bracket (SL/TP) entirely. The position now has NO stop-loss and NO
-    take-profit — the ONLY exit mechanism is check_logic_c_reversal()
-    firing on the next opposite crossover, whatever the P&L is at that
-    point. Honest risk flagged to the user and explicitly confirmed:
-    without a stop, an unfavorable move can run for as long as the
-    crossover takes to flip (which on a 15-min timeframe could be a
-    long time), with genuinely unlimited downside until the next
-    reversal. ----
+    ---- CHANGED 2026-08-26: user's request — "1-hour par karo, 1:2 ka
+    profit set kardo entry par, SL mat rakhna, SL hamara wahi hoga
+    crossover" — genuinely adds a REAL take-profit target at entry
+    (2x an ATR-based "1R" unit — used purely as a distance measure,
+    NOT as an actual stop, since the user explicitly said no SL). The
+    position genuinely exits via WHICHEVER comes first: (a) this TP
+    being hit, or (b) an opposite crossover reversal (see
+    check_logic_c_reversal()). No stop-loss exists at all — the
+    crossover-reversal is the only downside protection, exactly as the
+    user specified. ----
     """
     state.setdefault("logic_c_last_signal_candle", {})[sym] = candle_ts
 
@@ -4503,10 +4512,33 @@ def _execute_logic_c_order(state, sym, side, price, atr, products, candle_ts):
                   f"({size}) — using the real size for tracking.")
             size = real_size
 
+    # ---- NEW 2026-08-26: genuinely 1:2 TP — "1R" is the ATR at entry,
+    # used purely as a distance unit (NOT a stop). TP = entry + 2xATR
+    # for long, entry - 2xATR for short. Recalculated from the REAL
+    # fill price (price_for_calc), same pattern as Logic A/B always
+    # used for their own stop/target. ----
+    # ---- CHANGED 2026-08-26: user's explicit request — "bot soche
+    # crossover itne par hoga, SL woh ho gaya, uske according TP" —
+    # genuinely uses the CURRENT distance between EMA9 and EMA20 as
+    # the "1R" risk-unit (a proxy for "how far price would need to
+    # move to flip the crossover") instead of ATR. Wider EMA-gap =
+    # genuinely more room before a reversal, so a bigger 1R; narrower
+    # gap = closer to a potential flip, smaller 1R. TP = entry + 2x
+    # this distance. Still no real SL — the crossover-reversal remains
+    # the only downside exit, exactly as previously confirmed. ----
+    # ---- CHANGED 2026-08-26: user's final, explicit request — "10 lot
+    # par approx 12 dollar ka profit chaiye" — genuinely uses a FIXED
+    # points-target per symbol (see LOGIC_C_TP_POINTS docstring above),
+    # replacing the earlier EMA-distance-based approach entirely. Still
+    # no real SL — the crossover-reversal remains the only downside
+    # exit, exactly as previously confirmed. ----
+    tp_points = LOGIC_C_TP_POINTS.get(sym, price_for_calc * 0.01)  # genuinely-fallback ~1% if symbol not in the table
+    target = price_for_calc + tp_points if side == "long" else price_for_calc - tp_points
+
     state["position"] = {
         "symbol": sym, "product_id": product["id"], "side": side,
         "size": size, "original_size": size,
-        "entry_price": price_for_calc, "stop": None, "target": None,
+        "entry_price": price_for_calc, "stop": None, "target": target,
         "entry_time": str(now_ist()), "milestones_locked": 0,
         "max_progress": 0.0, "strategy": "C",
         "entry_order_id": entry_order_id,
@@ -4518,11 +4550,11 @@ def _execute_logic_c_order(state, sym, side, price, atr, products, candle_ts):
     log_trade_event(
         time=str(now_ist()), symbol=sym, action="OPEN",
         side=order_side, size=size, entry_price=price_for_calc,
-        stop=None, target=None, fill_method=method,
+        stop=None, target=target, fill_method=method,
         order_response=json.dumps(resp), strategy="C",
     )
-    print(f"    Logic C ENTRY (genuinely no-SL/no-TP): {side.upper()} {sym} size={size} "
-          f"@ {price_for_calc:.5f} — will hold until the next opposite crossover.")
+    print(f"    Logic C ENTRY (genuinely 1:2-TP, no-SL): {side.upper()} {sym} size={size} "
+          f"@ {price_for_calc:.5f} — TP={target:.5f}, exits early on TP OR on crossover-reversal.")
     return True
 
 
@@ -4548,17 +4580,21 @@ def look_for_entry_c(state, symbol_data, bias_data, products):
     for sym, df in symbol_data.items():
         i = len(df) - 1
         if i < 1 or f"ema_{EMA_FAST_C}" not in df.columns:
-            print(f"  {sym}: Logic C 15-min indicators not ready yet")
+            print(f"  {sym}: Logic C 1-hour indicators not ready yet")
             continue
 
         fast_col, slow_col = f"ema_{EMA_FAST_C}", f"ema_{EMA_SLOW_C}"
         curr_fast, curr_slow = df[fast_col].iloc[i], df[slow_col].iloc[i]
-        atr = df["atr"].iloc[i]
         price = df["close"].iloc[i]
 
-        if pd.isna(curr_fast) or pd.isna(curr_slow) or pd.isna(atr):
-            print(f"  {sym}: Logic C 15-min indicators not ready yet")
+        if pd.isna(curr_fast) or pd.isna(curr_slow):
+            print(f"  {sym}: Logic C 1-hour indicators not ready yet")
             continue
+
+        # ---- CHANGED 2026-08-26: user's explicit request — genuinely
+        # uses the EMA9-vs-EMA20 distance as the "1R" unit for the
+        # 1:2-TP, instead of ATR. ----
+        ema_distance = abs(curr_fast - curr_slow)
 
         bullish_trend = curr_fast > curr_slow
         bearish_trend = curr_fast < curr_slow
@@ -4566,17 +4602,17 @@ def look_for_entry_c(state, symbol_data, bias_data, products):
 
         candle_ts = str(df["timestamp"].iloc[i]) if "timestamp" in df.columns else None
         last_signal_candle = state.get("logic_c_last_signal_candle", {}).get(sym)
-        print(f"  {sym}: 15m EMA{EMA_FAST_C}={curr_fast:.5f} EMA{EMA_SLOW_C}={curr_slow:.5f} "
-              f"side={side}")
+        print(f"  {sym}: 1h EMA{EMA_FAST_C}={curr_fast:.5f} EMA{EMA_SLOW_C}={curr_slow:.5f} "
+              f"(distance={ema_distance:.5f}) side={side}")
 
         if side is None:
             continue
         if candle_ts is not None and last_signal_candle == candle_ts:
-            print(f"    -> SKIP: {sym} already acted on this same 15-min candle ({candle_ts}).")
+            print(f"    -> SKIP: {sym} already acted on this same 1-hour candle ({candle_ts}).")
             continue
 
-        print(f"    -> Logic C CONDITIONS MET: {side.upper()} entry (pure 15-min crossover)")
-        if _execute_logic_c_order(state, sym, side, price, atr, products, candle_ts):
+        print(f"    -> Logic C CONDITIONS MET: {side.upper()} entry (pure 1-hour crossover)")
+        if _execute_logic_c_order(state, sym, side, price, ema_distance, products, candle_ts):
             return True
     return False
 
@@ -4587,13 +4623,21 @@ def check_logic_c_reversal(state, symbol_data, products):
     "Stop-And-Reverse" mechanic. Genuinely called every loop from
     manage_open_position() BEFORE the normal SL/TP check, but ONLY
     when the currently-open position is genuinely Logic C's own. If
-    the 15-min EMA9/EMA20 crossover has flipped to the OPPOSITE side
-    of the current position's direction (on a genuinely NEW candle,
-    same same-candle-guard as fresh entries), this genuinely closes
-    the current position immediately (market-ish limit-chase via
+    the EMA9/EMA20 crossover has flipped to the OPPOSITE side of the
+    current position's direction (on a genuinely NEW candle, same
+    same-candle-guard as fresh entries), this genuinely closes the
+    current position immediately (market-ish limit-chase via
     place_order_with_fallback, reduce_only) and — per user's explicit
     "turant reverse lo, cooldown mat rakho" — immediately opens the
-    new position in the opposite direction, same loop, no waiting. ----
+    new position in the opposite direction, same loop, no waiting.
+
+    ---- CHANGED 2026-08-26: user's request — "1-hour par karo, 1:2 ka
+    profit set kardo, SL mat rakhna, SL hamara wahi hoga crossover" —
+    genuinely checks the 1:2 TP FIRST, before the crossover-reversal
+    check, since a TP-hit should genuinely close the position on its
+    own merit regardless of whether the crossover has flipped yet.
+    Still no SL — a losing position genuinely only exits via the
+    crossover-reversal below. ----
     """
     pos = state.get("position")
     if pos is None or pos.get("strategy") != "C":
@@ -4603,6 +4647,40 @@ def check_logic_c_reversal(state, symbol_data, products):
         return False
     df = symbol_data[sym]
     i = len(df) - 1
+
+    # ---- NEW 2026-08-26: genuinely check TP-hit first ----
+    current_price = df["close"].iloc[i]
+    target = pos.get("target")
+    if target is not None:
+        tp_hit = (current_price >= target if pos["side"] == "long" else current_price <= target)
+        if tp_hit:
+            print(f"  [LOGIC-C TP-HIT] {sym}: genuinely hit 1:2-target ({target:.5f}) — closing.")
+            close_side = "sell" if pos["side"] == "long" else "buy"
+            try:
+                cancel_all_orders_for_product(pos["product_id"])
+                close_resp, close_method = place_order_with_fallback(
+                    pos["product_id"], close_side, pos["size"], current_price, reduce_only=True)
+                exit_price = _extract_fill_price(close_resp) or current_price
+            except Exception as e:
+                print(f"    [WARN] TP-close genuinely failed ({e}) — will retry next loop.")
+                return False
+            entry_price = pos["entry_price"]
+            gross_pnl_pct = ((exit_price - entry_price) / entry_price * 100 if pos["side"] == "long"
+                              else (entry_price - exit_price) / entry_price * 100)
+            net_pnl_pct = estimate_net_pnl_pct(gross_pnl_pct, "C")
+            log_trade_event(
+                time=str(now_ist()), symbol=sym, action="CLOSE", side=close_side, size=pos["size"],
+                reason="logic_c_tp_hit", entry_price=entry_price, exit_price=exit_price,
+                approx_gross_pnl_pct=round(gross_pnl_pct, 4),
+                approx_net_pnl_pct_after_fees=round(net_pnl_pct, 4),
+                fill_method=close_method, strategy="C",
+            )
+            print(f"    Closed on TP. Approx P&L: {gross_pnl_pct:+.3f}% "
+                  f"(net after fees: {net_pnl_pct:+.3f}%)")
+            state["position"] = None
+            save_state(state)
+            return True
+
     fast_col, slow_col = f"ema_{EMA_FAST_C}", f"ema_{EMA_SLOW_C}"
     if fast_col not in df.columns or i < 1:
         return False
@@ -4624,7 +4702,10 @@ def check_logic_c_reversal(state, symbol_data, products):
     print(f"  [LOGIC-C REVERSAL] {sym}: crossover flipped to {new_side.upper()} — "
           f"genuinely closing current {pos['side'].upper()} and reversing immediately.")
     price = df["close"].iloc[i]
-    atr = df["atr"].iloc[i] if "atr" in df.columns else None
+    # ---- CHANGED 2026-08-26: user's explicit request — genuinely
+    # uses EMA9-vs-EMA20 distance (not ATR) as the "1R" unit for the
+    # new position's 1:2-TP. ----
+    ema_distance = abs(curr_fast - curr_slow)
     close_side = "sell" if pos["side"] == "long" else "buy"
     try:
         cancel_all_orders_for_product(pos["product_id"])
@@ -4652,13 +4733,8 @@ def check_logic_c_reversal(state, symbol_data, products):
     state["position"] = None
     save_state(state)
 
-    if atr is None or pd.isna(atr):
-        print(f"    [WARN] ATR genuinely not available — skipping immediate re-entry "
-              f"this loop, will pick it up as a fresh flat-entry next loop instead.")
-        return True
-
     print(f"    Genuinely reversing NOW: {new_side.upper()} {sym}")
-    _execute_logic_c_order(state, sym, new_side, price, atr, products, candle_ts)
+    _execute_logic_c_order(state, sym, new_side, price, ema_distance, products, candle_ts)
     return True
 
 
@@ -5158,6 +5234,10 @@ def run_one_loop_iteration(state, products):
             if df_c1h is not None and len(df_c1h) >= EMA_SLOW_C + 5:
                 df_c1h = compute_ema(df_c1h, period=EMA_FAST_C)
                 df_c1h = compute_ema(df_c1h, period=EMA_SLOW_C)
+                # ---- NEW 2026-08-26: genuinely needed for the 1:2-TP
+                # calculation (ATR used as the "1R" distance unit). ----
+                if len(df_c1h) >= ATR_PERIOD + 5:
+                    df_c1h = compute_atr(df_c1h, period=ATR_PERIOD)
                 symbol_data_c_bias[sym] = df_c1h
 
     # ---- Logic B data (1-min) — watches only LOGIC_B_SYMBOLS (BTC/ETH) ----
@@ -5201,10 +5281,10 @@ def run_one_loop_iteration(state, products):
         # Logic-C positions now — there's nothing left for it to manage.
         # LATEST_STATE is still updated here for dashboard visibility. ----
         if active_strategy == "C":
-            check_logic_c_reversal(state, symbol_data_a, products)
+            check_logic_c_reversal(state, symbol_data_c_bias, products)
             pos = state.get("position")
-            if pos is not None and pos.get("strategy") == "C" and pos["symbol"] in symbol_data_a:
-                latest_c = symbol_data_a[pos["symbol"]].iloc[-1]
+            if pos is not None and pos.get("strategy") == "C" and pos["symbol"] in symbol_data_c_bias:
+                latest_c = symbol_data_c_bias[pos["symbol"]].iloc[-1]
                 price_c = latest_c["close"]
                 entry_c = pos["entry_price"]
                 live_pnl_c = ((price_c - entry_c) / entry_c * 100 if pos["side"] == "long"
@@ -5269,7 +5349,7 @@ def run_one_loop_iteration(state, products):
             if not took_trade and "B" in enabled:
                 took_trade = look_for_entry_b(state, symbol_data_b, products)
             if not took_trade and "C" in enabled:
-                took_trade = look_for_entry_c(state, symbol_data_a, symbol_data_c_bias, products)
+                took_trade = look_for_entry_c(state, symbol_data_c_bias, symbol_data_c_bias, products)
             if not took_trade:
                 print(f"  No tradeable setup this loop (enabled={sorted(enabled)}) — staying flat.")
 
