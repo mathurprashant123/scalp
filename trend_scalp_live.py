@@ -4425,6 +4425,43 @@ def look_for_entry_a(state, symbol_data, products):
 # Logic_C_Strategy_Notes.md for full context/caveats.
 # ============================================================
 
+def place_resting_tp_order(product_id, side, size, tp_price):
+    """
+    ---- NEW 2026-08-27: user's explicit, valid point — "trade lagte
+    hi TP bhi lag jaye" (TP should genuinely be a REAL exchange-side
+    order placed IMMEDIATELY at entry, not just checked via polling
+    every loop). Polling only checks price roughly every 20-25 seconds
+    — a price spike that touches TP and retraces before the next
+    check would genuinely be MISSED entirely. This places a genuine
+    RESTING reduce-only limit order at the TP price (does NOT wait for
+    a fill, does NOT fall back to market — that would defeat the
+    purpose of a resting target order). The exchange itself will fill
+    it instantly whenever price reaches it, regardless of our own loop
+    timing. Returns the order_id (or None on failure) so it can be
+    cancelled later if a reversal happens first. Fails safe — a
+    failure here doesn't block the entry itself; the polling-based
+    check_logic_c_reversal() TP-check remains as a genuine fallback. ----
+    """
+    close_side = "sell" if side == "long" else "buy"
+    order = {
+        "product_id": product_id, "size": size, "side": close_side,
+        "order_type": "limit_order", "limit_price": str(round(tp_price, 6)),
+        "reduce_only": True,
+    }
+    try:
+        print(f"    Placing genuine RESTING TP-order: {order}")
+        response = client.create_order(order)
+        order_id = _extract_order_id(response)
+        if order_id is None:
+            print(f"    [WARN] TP-order genuinely placed but couldn't confirm its id "
+                  f"({response}) — polling-based TP-check remains as fallback.")
+        return order_id
+    except Exception as e:
+        print(f"    [WARN] Genuinely couldn't place resting TP-order ({e}) — "
+              f"polling-based TP-check in check_logic_c_reversal() remains as fallback.")
+        return None
+
+
 def _execute_logic_c_order(state, sym, side, price, ema_distance, products, candle_ts):
     """
     ---- NEW 2026-08-26: user's explicit request — genuinely rewrote
@@ -4535,6 +4572,12 @@ def _execute_logic_c_order(state, sym, side, price, ema_distance, products, cand
     tp_points = LOGIC_C_TP_POINTS.get(sym, price_for_calc * 0.01)  # genuinely-fallback ~1% if symbol not in the table
     target = price_for_calc + tp_points if side == "long" else price_for_calc - tp_points
 
+    # ---- NEW 2026-08-27: user's explicit request — "trade lagte hi TP
+    # bhi lag jaye" — genuinely places a REAL resting exchange-side TP
+    # order IMMEDIATELY, right here at entry, instead of relying solely
+    # on polling. ----
+    tp_order_id = place_resting_tp_order(product["id"], side, size, target)
+
     state["position"] = {
         "symbol": sym, "product_id": product["id"], "side": side,
         "size": size, "original_size": size,
@@ -4545,6 +4588,7 @@ def _execute_logic_c_order(state, sym, side, price, ema_distance, products, cand
         "exchange_safety_stop_active": False,
         "exchange_stop_synced": None,
         "bracket_sl_order_id": None,
+        "tp_order_id": tp_order_id,
     }
     save_state(state)
     log_trade_event(
@@ -4554,27 +4598,35 @@ def _execute_logic_c_order(state, sym, side, price, ema_distance, products, cand
         order_response=json.dumps(resp), strategy="C",
     )
     print(f"    Logic C ENTRY (genuinely 1:2-TP, no-SL): {side.upper()} {sym} size={size} "
-          f"@ {price_for_calc:.5f} — TP={target:.5f}, exits early on TP OR on crossover-reversal.")
+          f"@ {price_for_calc:.5f} — TP={target:.5f} (genuinely REAL resting order, id={tp_order_id}), "
+          f"exits early on TP OR on crossover-reversal.")
     return True
 
 
 def look_for_entry_c(state, symbol_data, bias_data, products):
     """
     ---- REWRITTEN 2026-08-26: user's explicit, complete redesign —
-    "sirf 15-minute timeframe par EMA9/20 crossover par trade le, up ya
-    down, jab dusra crossover ho turant reverse le" — genuinely a pure
-    Stop-And-Reverse strategy now. ALL previous filters (market-regime
-    gate, whipsaw-count, ADX, extension-distance, 1-hour bias,
-    consecutive-loss cooldown, OI-confirmation) are genuinely REMOVED
-    per explicit user confirmation — the ONLY signal left is the raw
-    15-min EMA9/EMA20 crossover itself. This function only handles the
-    FLAT-to-first-entry case; the REVERSE case (closing an opposite
-    Logic-C position and immediately re-entering) is genuinely handled
-    separately in manage_open_position() via check_logic_c_reversal(),
-    since that needs to run every loop even while a position is
-    already open — this function is only ever called when
-    state["position"] is None (see the caller's existing "if
-    state['position'] is None" guard). ----
+    "sirf EMA9/20 crossover par trade le, up ya down, jab dusra
+    crossover ho turant reverse le" — genuinely a pure Stop-And-Reverse
+    strategy now. ALL previous filters (market-regime gate, whipsaw-
+    count, ADX, extension-distance, 1-hour bias, consecutive-loss
+    cooldown, OI-confirmation) are genuinely REMOVED per explicit user
+    confirmation — the ONLY signal left is the raw EMA9/EMA20 crossover
+    itself. This function only handles the FLAT-to-first-entry case;
+    the REVERSE case (closing an opposite Logic-C position and
+    immediately re-entering) is genuinely handled separately in
+    manage_open_position() via check_logic_c_reversal().
+
+    ---- CHANGED 2026-08-27: user's explicit, important correction —
+    "jab koi trade nahi ho tab cross hone ka intezar kare, turant
+    trade nahi le" — genuinely FIXED a real gap: this used to check
+    the CURRENT EMA9-vs-EMA20 relationship and enter IMMEDIATELY
+    whenever flat, even if that relationship had genuinely been true
+    for a LONG time already (a stale, already-established trend, not
+    a fresh signal). Now it genuinely requires an ACTUAL crossover
+    EVENT (prev candle's EMA9/20 order flipping relative to the
+    current candle's) before entering from flat — waiting for a
+    genuinely fresh cross, exactly as the user described. ----
     """
     print("  --- Logic C entry scan detail (per coin) — PURE crossover, no other filters ---")
     for sym, df in symbol_data.items():
@@ -4584,10 +4636,11 @@ def look_for_entry_c(state, symbol_data, bias_data, products):
             continue
 
         fast_col, slow_col = f"ema_{EMA_FAST_C}", f"ema_{EMA_SLOW_C}"
+        prev_fast, prev_slow = df[fast_col].iloc[i - 1], df[slow_col].iloc[i - 1]
         curr_fast, curr_slow = df[fast_col].iloc[i], df[slow_col].iloc[i]
         price = df["close"].iloc[i]
 
-        if pd.isna(curr_fast) or pd.isna(curr_slow):
+        if pd.isna(prev_fast) or pd.isna(curr_slow):
             print(f"  {sym}: Logic C 1-hour indicators not ready yet")
             continue
 
@@ -4596,22 +4649,26 @@ def look_for_entry_c(state, symbol_data, bias_data, products):
         # 1:2-TP, instead of ATR. ----
         ema_distance = abs(curr_fast - curr_slow)
 
-        bullish_trend = curr_fast > curr_slow
-        bearish_trend = curr_fast < curr_slow
-        side = "long" if bullish_trend else ("short" if bearish_trend else None)
+        # ---- CHANGED 2026-08-27: genuinely a FRESH crossover only —
+        # not just "currently in this state" (which was the bug). ----
+        bullish_cross = prev_fast <= prev_slow and curr_fast > curr_slow
+        bearish_cross = prev_fast >= prev_slow and curr_fast < curr_slow
+        side = "long" if bullish_cross else ("short" if bearish_cross else None)
 
         candle_ts = str(df["timestamp"].iloc[i]) if "timestamp" in df.columns else None
         last_signal_candle = state.get("logic_c_last_signal_candle", {}).get(sym)
         print(f"  {sym}: 1h EMA{EMA_FAST_C}={curr_fast:.5f} EMA{EMA_SLOW_C}={curr_slow:.5f} "
-              f"(distance={ema_distance:.5f}) side={side}")
+              f"(distance={ema_distance:.5f}) fresh_cross={side}")
 
         if side is None:
+            print(f"    -> SKIP: {sym} genuinely no fresh crossover this candle — "
+                  f"waiting, not entering on an already-established trend.")
             continue
         if candle_ts is not None and last_signal_candle == candle_ts:
             print(f"    -> SKIP: {sym} already acted on this same 1-hour candle ({candle_ts}).")
             continue
 
-        print(f"    -> Logic C CONDITIONS MET: {side.upper()} entry (pure 1-hour crossover)")
+        print(f"    -> Logic C CONDITIONS MET: {side.upper()} entry (genuinely fresh 1-hour crossover)")
         if _execute_logic_c_order(state, sym, side, price, ema_distance, products, candle_ts):
             return True
     return False
